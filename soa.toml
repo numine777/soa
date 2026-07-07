@@ -1,0 +1,90 @@
+# soa — staged orchestration for local models.
+#
+# Pipeline: `soa run "task"` executes each [[stage]] in order. A stage sends
+# its rendered prompt to its model and loops on tool calls until the model
+# produces a final text answer, which becomes `{{previous}}` for the next
+# stage. The last stage's answer is printed to stdout.
+
+[settings]
+searxng_url = "http://localhost:8888"
+searxng_max_results = 8
+default_max_turns = 16
+request_timeout_secs = 600
+
+# ---------------------------------------------------------------------------
+# Providers: OpenAI-compatible chat-completions endpoints.
+# ---------------------------------------------------------------------------
+
+[providers.ollama]
+base_url = "http://localhost:11434/v1"
+
+[providers.lmstudio]
+base_url = "http://localhost:1234/v1"
+# api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment
+
+# ---------------------------------------------------------------------------
+# Models: a provider + model id + default sampling parameters.
+# ---------------------------------------------------------------------------
+
+[models.planner]
+provider = "ollama"
+model = "qwen3:32b"
+temperature = 0.7
+
+[models.coder]
+provider = "lmstudio"
+model = "qwen2.5-coder-32b-instruct"
+temperature = 0.2
+max_tokens = 8192
+
+# ---------------------------------------------------------------------------
+# MCP servers. transport = "stdio" spawns a process; "http" connects to a
+# streamable-HTTP endpoint. `readonly_tools` marks tools as safe for
+# read-only stages when the server doesn't annotate them with readOnlyHint.
+# ---------------------------------------------------------------------------
+
+[mcp.filesystem]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/scott/personal"]
+readonly_tools = ["read_file", "read_multiple_files", "list_directory", "search_files", "get_file_info", "directory_tree"]
+
+# [mcp.remote]
+# transport = "http"
+# url = "http://localhost:9000/mcp"
+# auth_token = "${REMOTE_MCP_TOKEN}"
+# headers = { "x-team" = "soa" }
+
+# ---------------------------------------------------------------------------
+# Stages, executed in order.
+#   mode = "read_only"  -> only read-only tools are exposed to the model
+#   mode = "read_write" -> all tools from the listed MCP servers
+# Prompt templates may use {{input}}, {{previous}}, and {{stage.<name>}}.
+# ---------------------------------------------------------------------------
+
+[[stage]]
+name = "research"
+model = "planner"
+mode = "read_only"
+mcp = ["filesystem"]
+web_search = true
+system_prompt = """
+You are a research assistant. Investigate the task using the available tools.
+Produce a concise briefing: relevant facts, relevant files, and a suggested
+approach. Do not make any changes.
+"""
+
+[[stage]]
+name = "implement"
+model = "coder"
+mode = "read_write"
+mcp = ["filesystem"]
+max_turns = 32
+system_prompt = "You are a careful engineer. Complete the task, then summarize what you changed."
+prompt = """
+# Task
+{{input}}
+
+# Research briefing
+{{stage.research}}
+"""

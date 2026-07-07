@@ -52,7 +52,13 @@ enum Command {
         /// Disable mouse capture (keeps the terminal's native text selection).
         #[arg(long)]
         no_mouse: bool,
+        /// Resume a saved session: `--resume` for the most recent,
+        /// `--resume <id>` for a specific one (see `soa sessions`).
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "latest")]
+        resume: Option<String>,
     },
+    /// List saved chat sessions.
+    Sessions,
 }
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
@@ -150,8 +156,26 @@ async fn main() -> Result<()> {
             }
             run_pipeline(&config, &task, stage.as_deref()).await
         }
-        Command::Chat { stage, no_mouse } => {
-            tui::run(config, stage.as_deref(), !no_mouse).await
+        Command::Chat { stage, no_mouse, resume } => {
+            tui::run(config, stage.as_deref(), !no_mouse, resume.as_deref()).await
+        }
+        Command::Sessions => {
+            let sessions = tui::store::list_sessions()?;
+            if sessions.is_empty() {
+                println!("no saved sessions ({})", tui::store::data_dir().display());
+                return Ok(());
+            }
+            for session in sessions {
+                println!(
+                    "{}  {}  [{}]  {}  ({})",
+                    session.id,
+                    tui::store::format_epoch(session.updated_at),
+                    session.stage,
+                    session.title,
+                    if session.cwd.is_empty() { "unknown dir" } else { &session.cwd },
+                );
+            }
+            Ok(())
         }
     }
 }

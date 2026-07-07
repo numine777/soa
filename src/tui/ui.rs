@@ -14,6 +14,7 @@ use ratatui::widgets::{
 };
 
 use super::app::{App, TranscriptItem, View, fmt_tokens};
+use super::store;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -39,6 +40,91 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_diffs(frame, app, diff_area);
             draw_status(frame, app, status_area);
         }
+        View::Sessions { .. } => {
+            let [list_area, status_area] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+            draw_sessions(frame, app, list_area);
+            draw_status(frame, app, status_area);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session picker
+// ---------------------------------------------------------------------------
+
+fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    let current_id = app.session_id().to_string();
+    let View::Sessions { selected, scroll } = &mut app.view else { return };
+    // Row 0 is the "start new session" entry; sessions follow.
+    let total_rows = app.session_list.len() + 1;
+    *selected = (*selected).min(total_rows - 1);
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+
+    let header = format!(
+        " sessions ({})   Enter select · j/k move · q close ",
+        store::current_cwd(),
+    );
+    frame.render_widget(
+        Paragraph::new(header).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        header_area,
+    );
+
+    // Keep the selection inside the window.
+    let viewport = body_area.height as usize;
+    if *selected < *scroll {
+        *scroll = *selected;
+    } else if *selected >= *scroll + viewport.max(1) {
+        *scroll = *selected + 1 - viewport.max(1);
+    }
+
+    let lines: Vec<Line> = (*scroll..total_rows.min(*scroll + viewport.max(1)))
+        .map(|row| {
+            let is_selected = row == *selected;
+            let marker = if is_selected { "▶" } else { " " };
+            let (text, is_current) = match row {
+                0 => (format!("{marker} + start new session"), false),
+                _ => {
+                    let session = &app.session_list[row - 1];
+                    let is_current = session.id == current_id;
+                    (
+                        format!(
+                            "{} {}  {}  [{}]  {}{}",
+                            marker,
+                            session.id,
+                            store::format_epoch(session.updated_at),
+                            session.stage,
+                            truncate_str(&session.title, 60),
+                            if is_current { "  (current)" } else { "" },
+                        ),
+                        is_current,
+                    )
+                }
+            };
+            let style = match (is_selected, is_current) {
+                (true, _) => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                (false, true) => Style::default().fg(Color::Green),
+                (false, false) => Style::default(),
+            };
+            Line::styled(text, style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body_area);
+}
+
+fn truncate_str(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max_chars).collect();
+        format!("{cut}…")
     }
 }
 

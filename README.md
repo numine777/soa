@@ -56,12 +56,34 @@ Slash commands:
 | `/clear` | Drop all conversation context. |
 | `/diff` | Open the diff viewer (also `Ctrl+D`). |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
+| `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
 
-Keys: `Enter` sends, `Alt+Enter` inserts a newline, `PgUp`/`PgDn` and the
-mouse wheel scroll the transcript, `Esc` cancels a running turn, `Ctrl+C`
-quits. In the diff viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel
-scroll, `q` closes.
+Keys: `Enter` sends, `Alt+Enter` inserts a newline, `Up`/`Down` recall
+previously submitted prompts (shell-style; `Up` on the input's first line,
+`Down` on its last), `PgUp`/`PgDn` and the mouse wheel scroll the
+transcript, `Esc` cancels a running turn, `Ctrl+C` quits. In the diff
+viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel scroll, `q` closes.
+
+**Sessions.** Every conversation is auto-saved (after each turn, compaction,
+or clear) to `$XDG_DATA_HOME/soa/sessions/` (default
+`~/.local/share/soa/sessions/`), including the transcript, model context,
+captured diffs, active stage, and the working directory it belongs to.
+
+- `/sessions` opens an in-TUI picker listing this directory's sessions,
+  with a "start new session" entry at the top (`Enter` selects — switching
+  saves the current session first; `n` is a shortcut for new;
+  `j`/`k`/arrows/wheel move, `q` closes).
+- `soa sessions` lists all sessions across directories.
+- `soa chat --resume` continues the most recent one; `--resume <id>` a
+  specific one. An explicit `--stage` overrides the resumed session's stage.
+- Switching restores the session's stage when it exists in the current
+  config; sessions saved before directory tracking show up everywhere.
+
+**Prompt history.** Submitted prompts (messages and slash commands) are
+appended to `~/.local/share/soa/prompt_history.jsonl` and shared across
+sessions — `Up`/`Down` in the input box scrolls through them, with your
+unsent draft restored when you scroll back past the newest entry.
 
 **Diff viewer.** When the model calls a non-read-only MCP tool, soa
 snapshots any file named by a path-like argument and records a unified diff

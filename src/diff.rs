@@ -24,7 +24,7 @@ const PATH_KEYS: &[&str] = &[
 /// Files larger than this are not snapshotted (diffing them is unhelpful).
 const MAX_SNAPSHOT_BYTES: u64 = 1_000_000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffEntry {
     /// Advertised name of the tool that made the change.
     pub tool: String,

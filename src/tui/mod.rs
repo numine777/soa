@@ -7,6 +7,7 @@
 //! keyboard protocol, which tmux does not pass through.
 
 mod app;
+pub mod store;
 mod ui;
 
 use std::collections::BTreeSet;
@@ -28,14 +29,35 @@ use crate::config::Config;
 use crate::mcp::McpManager;
 use app::App;
 
-pub async fn run(config: Config, stage_name: Option<&str>, mouse: bool) -> Result<()> {
+pub async fn run(
+    config: Config,
+    stage_name: Option<&str>,
+    mouse: bool,
+    resume: Option<&str>,
+) -> Result<()> {
+    let resumed = match resume {
+        None => None,
+        Some("latest") => {
+            let latest = store::load_latest_session()?;
+            if latest.is_none() {
+                eprintln!("no saved sessions found — starting fresh");
+            }
+            latest
+        }
+        Some(id) => Some(store::load_session(id)?),
+    };
+
+    // Explicit --stage wins; otherwise a resumed session restores its stage.
     let stage_index = match stage_name {
         Some(name) => config
             .stages
             .iter()
             .position(|s| s.name == name)
             .with_context(|| format!("no stage named `{name}`"))?,
-        None => 0,
+        None => resumed
+            .as_ref()
+            .and_then(|s| config.stages.iter().position(|st| st.name == s.stage))
+            .unwrap_or(0),
     };
 
     // Connect every server any stage references, so /stage can switch freely.
@@ -52,7 +74,7 @@ pub async fn run(config: Config, stage_name: Option<&str>, mouse: bool) -> Resul
     let mcp = Arc::new(McpManager::connect(servers, &config, true).await?);
 
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = App::new(Arc::new(config), Arc::clone(&mcp), stage_index, agent_tx);
+    let mut app = App::new(Arc::new(config), Arc::clone(&mcp), stage_index, agent_tx, resumed);
 
     setup_terminal(mouse)?;
     let original_hook = std::panic::take_hook();

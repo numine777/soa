@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
+use super::store::{self, PromptHistory, Session};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
@@ -23,6 +24,7 @@ constraints, decisions made, key facts (file paths, commands, URLs, code \
 identifiers), work completed, and work still pending. Write terse bullet \
 points. Output only the briefing.";
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
@@ -46,6 +48,8 @@ pub enum AgentEvent {
 pub enum View {
     Chat,
     Diffs { selected: usize, scroll: usize },
+    /// Session picker over `App::session_list`.
+    Sessions { selected: usize, scroll: usize },
 }
 
 pub struct App {
@@ -72,6 +76,20 @@ pub struct App {
     /// True while the running task is a compaction rather than a chat turn.
     compacting: bool,
     tx: UnboundedSender<AgentEvent>,
+    // Session persistence.
+    session_id: String,
+    started_at: u64,
+    cwd: String,
+    /// Sessions shown in the picker; loaded when it opens.
+    pub session_list: Vec<Session>,
+    /// Set once the user has submitted something; empty sessions aren't saved.
+    has_activity: bool,
+    // Prompt history (shell-style recall with Up/Down).
+    prompt_history: PromptHistory,
+    /// Position while browsing the prompt history; None = not browsing.
+    recall_index: Option<usize>,
+    /// The in-progress draft stashed when browsing starts.
+    recall_draft: String,
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -87,6 +105,7 @@ impl App {
         mcp: Arc<McpManager>,
         stage_index: usize,
         tx: UnboundedSender<AgentEvent>,
+        resumed: Option<Session>,
     ) -> App {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.settings.request_timeout_secs))
@@ -111,17 +130,95 @@ impl App {
             turn: None,
             compacting: false,
             tx,
+            session_id: store::new_session_id(),
+            started_at: store::now_epoch(),
+            cwd: store::current_cwd(),
+            session_list: Vec::new(),
+            has_activity: false,
+            prompt_history: PromptHistory::load(),
+            recall_index: None,
+            recall_draft: String::new(),
         };
         app.refresh_tool_count();
-        app.info(format!(
-            "soa chat — {}. Type /help for commands.",
-            app.stage_summary()
-        ));
+        match resumed {
+            // Stage restore already happened in mod.rs (respecting --stage),
+            // so don't let the session override it here.
+            Some(session) => {
+                app.apply_session(session, false);
+                app.info(format!(
+                    "resumed session {} (started {}, {}, ctx ~{})",
+                    app.session_id,
+                    store::format_epoch(app.started_at),
+                    app.stage_summary(),
+                    fmt_tokens(app.token_estimate()),
+                ));
+            }
+            None => app.info(format!(
+                "soa chat — {}. Type /help for commands.",
+                app.stage_summary()
+            )),
+        }
         app
+    }
+
+    /// Replace the conversation state with a saved session's. The saved
+    /// transcript already carries its original greeting.
+    fn apply_session(&mut self, session: Session, restore_stage: bool) {
+        if restore_stage
+            && let Some(index) =
+                self.config.stages.iter().position(|s| s.name == session.stage)
+        {
+            self.stage_index = index;
+            self.refresh_tool_count();
+        }
+        self.history = session.history;
+        self.transcript = session.transcript;
+        self.diffs = session.diffs;
+        self.session_id = session.id;
+        self.started_at = session.started_at;
+        self.has_activity = true;
+        self.scroll_from_bottom = 0;
+    }
+
+    /// Write the session to disk. Errors are shown once in the transcript
+    /// rather than crashing the conversation.
+    fn persist(&mut self) {
+        if !self.has_activity {
+            return;
+        }
+        let title = self
+            .transcript
+            .iter()
+            .find_map(|item| match item {
+                TranscriptItem::User(text) => {
+                    Some(text.lines().next().unwrap_or("").chars().take(80).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "(no prompt)".to_string());
+        let session = Session {
+            id: self.session_id.clone(),
+            started_at: self.started_at,
+            updated_at: store::now_epoch(),
+            stage: self.stage().name.clone(),
+            title,
+            cwd: self.cwd.clone(),
+            history: self.history.clone(),
+            transcript: self.transcript.clone(),
+            diffs: self.diffs.clone(),
+        };
+        if let Err(e) = store::save_session(&session) {
+            self.has_activity = false; // avoid an error loop
+            self.error(format!("failed to save session: {e:#}"));
+        }
     }
 
     pub fn stage(&self) -> &Stage {
         &self.config.stages[self.stage_index]
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     fn stage_summary(&self) -> String {
@@ -214,8 +311,99 @@ impl App {
 
         match self.view {
             View::Diffs { .. } => self.on_diff_key(key),
+            View::Sessions { .. } => self.on_sessions_key(key),
             View::Chat => self.on_chat_key(key),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Session picker
+    // ------------------------------------------------------------------
+
+    /// Open the picker with this working directory's sessions (legacy
+    /// sessions saved before cwd tracking are included). Row 0 is the
+    /// "start new session" entry; row i+1 is `session_list[i]`.
+    fn open_sessions(&mut self) {
+        let all = match store::list_sessions() {
+            Ok(all) => all,
+            Err(e) => return self.error(format!("cannot list sessions: {e:#}")),
+        };
+        let list: Vec<Session> = all
+            .into_iter()
+            .filter(|s| s.cwd == self.cwd || s.cwd.is_empty())
+            .collect();
+        let selected = list
+            .iter()
+            .position(|s| s.id == self.session_id)
+            .map_or(0, |index| index + 1);
+        self.session_list = list;
+        self.view = View::Sessions { selected, scroll: 0 };
+    }
+
+    fn on_sessions_key(&mut self, key: KeyEvent) {
+        let View::Sessions { selected: current, .. } = self.view else { return };
+        let last = self.session_list.len(); // rows = sessions + the new-session row
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.set_picker_selection(current.saturating_sub(1));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.set_picker_selection((current + 1).min(last));
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.set_picker_selection(0),
+            KeyCode::End | KeyCode::Char('G') => self.set_picker_selection(last),
+            KeyCode::Enter if current == 0 => self.start_new_session(),
+            KeyCode::Enter => self.switch_to_session(current - 1),
+            KeyCode::Char('n') => self.start_new_session(),
+            _ => {}
+        }
+    }
+
+    fn set_picker_selection(&mut self, index: usize) {
+        if let View::Sessions { selected, .. } = &mut self.view {
+            *selected = index;
+        }
+    }
+
+    fn switch_to_session(&mut self, index: usize) {
+        self.view = View::Chat;
+        let Some(session) = self.session_list.get(index).cloned() else { return };
+        if session.id == self.session_id {
+            return;
+        }
+        if self.is_running() {
+            return self.error("finish or cancel the running turn before switching sessions");
+        }
+        self.persist(); // save the session we're leaving
+        let id = session.id.clone();
+        self.apply_session(session, true);
+        self.info(format!(
+            "switched to session {} ({}, ctx ~{})",
+            id,
+            self.stage_summary(),
+            fmt_tokens(self.token_estimate()),
+        ));
+    }
+
+    fn start_new_session(&mut self) {
+        self.view = View::Chat;
+        if self.is_running() {
+            return self.error("finish or cancel the running turn before starting a new session");
+        }
+        self.persist();
+        self.history.clear();
+        self.transcript.clear();
+        self.diffs.clear();
+        self.session_id = store::new_session_id();
+        self.started_at = store::now_epoch();
+        self.has_activity = false;
+        self.scroll_from_bottom = 0;
+        self.info(format!(
+            "started new session {} — {}. Type /help for commands.",
+            self.session_id,
+            self.stage_summary(),
+        ));
     }
 
     fn on_chat_key(&mut self, key: KeyEvent) {
@@ -229,8 +417,61 @@ impl App {
             KeyCode::Enter => self.submit(),
             KeyCode::PageUp => self.scroll_up(self.chat_viewport.saturating_sub(1).max(1)),
             KeyCode::PageDown => self.scroll_down(self.chat_viewport.saturating_sub(1).max(1)),
+            // Shell-style prompt recall: Up on the input's first line goes
+            // back through history, Down on the last line comes forward.
+            KeyCode::Up
+                if key.modifiers.is_empty()
+                    && self.input.cursor().0 == 0
+                    && !self.prompt_history.entries.is_empty() =>
+            {
+                self.recall_prev();
+            }
+            KeyCode::Down
+                if key.modifiers.is_empty()
+                    && self.recall_index.is_some()
+                    && self.input.cursor().0 + 1 == self.input.lines().len() =>
+            {
+                self.recall_next();
+            }
             _ => {
                 self.input.input(tui_textarea::Input::from(key));
+            }
+        }
+    }
+
+    fn set_input_text(&mut self, text: &str) {
+        self.input = new_textarea();
+        self.input.insert_str(text);
+    }
+
+    fn recall_prev(&mut self) {
+        let entries = &self.prompt_history.entries;
+        let index = match self.recall_index {
+            None => {
+                self.recall_draft = self.input.lines().join("\n");
+                entries.len() - 1
+            }
+            Some(0) => return,
+            Some(current) => current - 1,
+        };
+        self.recall_index = Some(index);
+        let text = self.prompt_history.entries[index].clone();
+        self.set_input_text(&text);
+    }
+
+    fn recall_next(&mut self) {
+        match self.recall_index {
+            None => {}
+            Some(current) if current + 1 < self.prompt_history.entries.len() => {
+                self.recall_index = Some(current + 1);
+                let text = self.prompt_history.entries[current + 1].clone();
+                self.set_input_text(&text);
+            }
+            Some(_) => {
+                // Past the newest entry: restore the stashed draft.
+                self.recall_index = None;
+                let draft = std::mem::take(&mut self.recall_draft);
+                self.set_input_text(&draft);
             }
         }
     }
@@ -269,6 +510,13 @@ impl App {
                 *scroll = scroll.saturating_sub(3);
             }
             (View::Diffs { scroll, .. }, MouseEventKind::ScrollDown) => *scroll += 3,
+            (View::Sessions { selected, .. }, MouseEventKind::ScrollUp) => {
+                *selected = selected.saturating_sub(1);
+            }
+            (View::Sessions { selected, .. }, MouseEventKind::ScrollDown) => {
+                // rows = sessions + the new-session row at index 0
+                *selected = (*selected + 1).min(self.session_list.len());
+            }
             _ => {}
         }
     }
@@ -285,6 +533,7 @@ impl App {
     fn toggle_diff_view(&mut self) {
         match self.view {
             View::Diffs { .. } => self.view = View::Chat,
+            View::Sessions { .. } => {} // don't stack modal views
             View::Chat if self.diffs.is_empty() => self.info("no file changes captured yet"),
             View::Chat => {
                 self.view = View::Diffs { selected: self.diffs.len() - 1, scroll: 0 };
@@ -302,18 +551,29 @@ impl App {
             return;
         }
         if let Some(command) = text.strip_prefix('/') {
+            self.remember_prompt(&text);
             self.input = new_textarea();
             self.run_command(command.trim());
+            self.persist(); // commands like /clear change persisted state
             return;
         }
         if self.is_running() {
             return; // keep the draft; a turn is already in flight
         }
+        self.remember_prompt(&text);
+        self.has_activity = true;
         self.input = new_textarea();
         self.transcript.push(TranscriptItem::User(text.clone()));
         self.history.push(ChatMessage::User { content: text });
         self.scroll_from_bottom = 0;
         self.start_turn();
+        self.persist();
+    }
+
+    fn remember_prompt(&mut self, text: &str) {
+        self.prompt_history.push(text);
+        self.recall_index = None;
+        self.recall_draft.clear();
     }
 
     fn run_command(&mut self, command: &str) {
@@ -325,10 +585,13 @@ impl App {
                  /clear          drop all conversation context\n\
                  /diff           open the diff viewer (Ctrl+D)\n\
                  /stage <name>   switch the active stage\n\
+                 /sessions       open the session picker (switch or start new)\n\
                  /quit           exit (Ctrl+C)\n\
-                 keys: Enter send · Alt+Enter newline · PgUp/PgDn + mouse wheel scroll\n\
+                 keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\
+                 PgUp/PgDn + mouse wheel scroll\n\
                  diff view: Tab/Shift+Tab switch file · j/k scroll · q close",
             ),
+            "sessions" => self.open_sessions(),
             "clear" => {
                 if self.is_running() {
                     self.error("cannot clear while a turn is running (Esc to cancel it first)");
@@ -459,6 +722,13 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn on_agent_event(&mut self, event: AgentEvent) {
+        let should_save = matches!(
+            event,
+            AgentEvent::Turn { .. }
+                | AgentEvent::Compacted { .. }
+                | AgentEvent::Error(_)
+                | AgentEvent::Diff(_)
+        );
         match event {
             AgentEvent::ToolCall { name, args } => {
                 self.transcript.push(TranscriptItem::ToolCall { name, args });
@@ -506,6 +776,9 @@ impl App {
                 self.turn = None;
                 self.compacting = false;
             }
+        }
+        if should_save {
+            self.persist();
         }
     }
 }

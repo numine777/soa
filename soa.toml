@@ -10,16 +10,19 @@ searxng_url = "http://localhost:8888"
 searxng_max_results = 8
 default_max_turns = 16
 request_timeout_secs = 600
+# Tool results longer than this are truncated before entering the
+# conversation (a recursive directory tree can exceed the context window).
+max_tool_output_chars = 30000
 
 # ---------------------------------------------------------------------------
 # Providers: OpenAI-compatible chat-completions endpoints.
 # ---------------------------------------------------------------------------
 
-[providers.ollama]
-base_url = "http://localhost:11434/v1"
+[providers.spark]
+base_url = "http://192.168.6.7:8000/v1"
 
-[providers.lmstudio]
-base_url = "http://localhost:1234/v1"
+[providers.threadripper]
+base_url = "http://192.168.5.188:8000/v1"
 # api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment
 
 # ---------------------------------------------------------------------------
@@ -27,15 +30,20 @@ base_url = "http://localhost:1234/v1"
 # ---------------------------------------------------------------------------
 
 [models.planner]
-provider = "ollama"
-model = "qwen3:32b"
+provider = "spark"
+model = "qwen"
 temperature = 0.7
 
 [models.coder]
-provider = "lmstudio"
-model = "qwen2.5-coder-32b-instruct"
+provider = "threadripper"
+model = "qwen-haiku"
 temperature = 0.2
 max_tokens = 8192
+
+[models.reviewer]
+provider = "spark"
+model = "qwen"
+temperature = 0.7
 
 # ---------------------------------------------------------------------------
 # MCP servers. transport = "stdio" spawns a process; "http" connects to a
@@ -87,4 +95,24 @@ prompt = """
 
 # Research briefing
 {{stage.research}}
+
+# Latest input (plan or review feedback)
+{{previous}}
+"""
+
+# The reviewer can send work back: reprompting `implement` re-runs it with
+# the instructions as {{previous}}, and review runs again afterwards since
+# the pipeline resumes in declared order. `can_reprompt = ["review"]` also
+# lets it re-run itself (e.g. to re-inspect after reading more files).
+[[stage]]
+name = "review"
+model = "reviewer"
+mode = "read_only"
+mcp = ["filesystem"]
+can_reprompt = ["implement", "review"]
+system_prompt = """
+You are a code reviewer. Inspect the work described below using the
+read-only tools. If more work is required, call reprompt_stage with
+specific, actionable instructions for the `implement` stage. If the work is
+complete and correct, reply with a short summary of what was accomplished.
 """

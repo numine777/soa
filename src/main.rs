@@ -1,8 +1,10 @@
 mod config;
+mod diff;
 mod mcp;
 mod provider;
 mod stage;
 mod tools;
+mod tui;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -42,19 +44,45 @@ enum Command {
         #[arg(long)]
         stage: Option<String>,
     },
+    /// Interactive chat TUI using a stage's model, tools, and mode.
+    Chat {
+        /// Stage to chat with (default: the first stage).
+        #[arg(long)]
+        stage: Option<String>,
+        /// Disable mouse capture (keeps the terminal's native text selection).
+        #[arg(long)]
+        no_mouse: bool,
+    },
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "soa=info".into())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "soa=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // In chat mode the terminal belongs to the TUI, so logs go to a file.
+    if matches!(cli.command, Command::Chat { .. }) {
+        let log_path = std::env::temp_dir().join("soa-chat.log");
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("cannot open log file {}", log_path.display()))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .with_writer(std::sync::Arc::new(log_file))
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let config = Config::load(&cli.config)?;
 
     match cli.command {
@@ -91,7 +119,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Tools => {
-            let manager = McpManager::connect(config.mcp.keys().cloned(), &config).await?;
+            let manager = McpManager::connect(config.mcp.keys().cloned(), &config, false).await?;
             for name in config.mcp.keys() {
                 let connection = manager.get(name).expect("connected above");
                 println!("[{name}]");
@@ -122,56 +150,111 @@ async fn main() -> Result<()> {
             }
             run_pipeline(&config, &task, stage.as_deref()).await
         }
+        Command::Chat { stage, no_mouse } => {
+            tui::run(config, stage.as_deref(), !no_mouse).await
+        }
     }
 }
 
 async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> Result<()> {
-    let stages: Vec<(usize, &config::Stage)> = match only_stage {
-        Some(name) => {
-            let found = config
-                .stages
-                .iter()
-                .enumerate()
-                .find(|(_, s)| s.name == name)
-                .with_context(|| format!("no stage named `{name}`"))?;
-            vec![found]
-        }
-        None => config.stages.iter().enumerate().collect(),
-    };
-
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.settings.request_timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
 
-    let needed_servers: Vec<String> = stages
+    // Single-stage mode: one run, no reprompting.
+    if let Some(name) = only_stage {
+        let stage = config
+            .stages
+            .iter()
+            .find(|s| s.name == name)
+            .with_context(|| format!("no stage named `{name}`"))?;
+        let manager = McpManager::connect(stage.mcp.iter().cloned(), config, false).await?;
+        let context = stage::PipelineContext::new(task);
+        eprintln!("── stage {} ──", stage.name);
+        let result =
+            stage::run_stage(config, stage, true, &context, &manager, &http, &[]).await;
+        manager.shutdown().await;
+        return match result? {
+            stage::StageOutcome::Final(output) => {
+                println!("{output}");
+                Ok(())
+            }
+            stage::StageOutcome::Reprompt { .. } => unreachable!("no reprompt targets offered"),
+        };
+    }
+
+    let needed_servers: Vec<String> = config
+        .stages
         .iter()
-        .flat_map(|(_, s)| s.mcp.iter().cloned())
+        .flat_map(|s| s.mcp.iter().cloned())
         .collect();
-    let manager = McpManager::connect(needed_servers, config).await?;
+    let manager = McpManager::connect(needed_servers, config, false).await?;
 
     let mut context = stage::PipelineContext::new(task);
-    let total = stages.len();
+    let mut current = 0;
+    let mut runs = 0u32;
+    let mut last_output = None;
 
     let mut result = Ok(());
-    for (position, (index, stage)) in stages.iter().enumerate() {
-        eprintln!("── stage {}/{}: {} ──", position + 1, total, stage.name);
-        match stage::run_stage(config, stage, *index == 0, &context, &manager, &http).await {
-            Ok(output) => {
-                // Intermediate outputs go to stderr; only the final stage's
-                // answer lands on stdout so `soa run` is pipe-friendly.
-                if position + 1 < total {
+    while current < config.stages.len() {
+        let stage = &config.stages[current];
+        runs += 1;
+        if runs > config.settings.max_stage_runs {
+            result = Err(anyhow::anyhow!(
+                "stopped after {} stage runs without finishing — likely a reprompt \
+                 loop; raise settings.max_stage_runs if this is intentional",
+                config.settings.max_stage_runs
+            ));
+            break;
+        }
+
+        eprintln!("── run {runs} · stage {} ──", stage.name);
+        let is_first = context.previous.is_none();
+        match stage::run_stage(
+            config,
+            stage,
+            is_first,
+            &context,
+            &manager,
+            &http,
+            &stage.can_reprompt,
+        )
+        .await
+        {
+            Ok(stage::StageOutcome::Final(output)) => {
+                context.record(&stage.name, output.clone());
+                current += 1;
+                // Intermediate outputs go to stderr; only the pipeline's
+                // final answer lands on stdout so `soa run` is pipe-friendly.
+                if current < config.stages.len() {
                     eprintln!("{output}\n");
-                } else {
-                    println!("{output}");
                 }
-                context.record(&stage.name, output);
+                last_output = Some(output);
+            }
+            Ok(stage::StageOutcome::Reprompt { target, instructions }) => {
+                eprintln!("↩ {} reprompts {}:", stage.name, target);
+                eprintln!("{instructions}\n");
+                // The handoff instructions become the sender's recorded
+                // output, so the target sees them as {{previous}}.
+                context.record(&stage.name, instructions);
+                current = config
+                    .stages
+                    .iter()
+                    .position(|s| s.name == target)
+                    .expect("can_reprompt targets are validated at config load");
             }
             Err(e) => {
                 result = Err(e);
                 break;
             }
         }
+    }
+
+    if result.is_ok()
+        && let Some(output) = last_output
+    {
+        println!("{output}");
     }
 
     manager.shutdown().await;

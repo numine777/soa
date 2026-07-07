@@ -36,10 +36,44 @@ soa stages             # list the configured pipeline
 soa tools              # connect to every MCP server, list tools with ro/rw markers
 soa run "task"         # run the pipeline (or: echo "task" | soa run)
 soa run --stage plan "task"   # run a single stage
+soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa -c other.toml …    # use a different config file
 ```
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
+
+## Interactive chat (`soa chat`)
+
+`soa chat` opens a TUI conversation that uses the active stage's model,
+system prompt, mode, and tools. Every MCP server referenced by any stage is
+connected at startup so `/stage` can switch freely mid-conversation.
+
+Slash commands:
+
+| command | effect |
+|---|---|
+| `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx ~N tok` estimate. |
+| `/clear` | Drop all conversation context. |
+| `/diff` | Open the diff viewer (also `Ctrl+D`). |
+| `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
+| `/help`, `/quit` | The obvious. |
+
+Keys: `Enter` sends, `Alt+Enter` inserts a newline, `PgUp`/`PgDn` and the
+mouse wheel scroll the transcript, `Esc` cancels a running turn, `Ctrl+C`
+quits. In the diff viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel
+scroll, `q` closes.
+
+**Diff viewer.** When the model calls a non-read-only MCP tool, soa
+snapshots any file named by a path-like argument and records a unified diff
+of what actually changed on disk. Changes show up inline in the transcript
+(`✎ path (+a −r)`) and in the full-screen viewer under `Ctrl+D`.
+
+**tmux.** The TUI works inside tmux: mouse-wheel scrolling uses standard
+mouse capture (run with `--no-mouse` if you prefer the terminal's native
+text selection), paste is bracketed so multi-line pastes don't auto-send,
+and no kitty-protocol keys are relied on. Logs go to
+`$TMPDIR/soa-chat.log` instead of the screen; spawned MCP servers' stderr
+is discarded so it cannot corrupt the display.
 
 ## Configuration
 
@@ -52,6 +86,8 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `searxng_url` | – | SearXNG base URL; required if any stage sets `web_search = true`. The instance must allow the JSON format. |
 | `searxng_max_results` | 8 | results returned per search |
 | `default_max_turns` | 16 | model round-trips per stage before erroring |
+| `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
+| `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls |
 
 ### `[providers.<name>]`
@@ -118,6 +154,39 @@ servers. In `read_only` mode a tool is only exposed if the server annotates
 it with `readOnlyHint = true` **or** you list it in that server's
 `readonly_tools`. Run `soa tools` to see how each tool is classified.
 MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
+
+## Reprompting: stages sending work back
+
+A stage with a `can_reprompt` list gets one extra tool, `reprompt_stage`,
+which lets its model hand control to another stage (or itself) instead of
+producing a final answer:
+
+```toml
+[[stage]]
+name = "review"
+model = "reviewer"
+mode = "read_only"
+mcp = ["filesystem"]
+can_reprompt = ["implement", "review"]
+system_prompt = "… If more work is required, call reprompt_stage with specific instructions …"
+```
+
+Semantics:
+
+- Calling `reprompt_stage(stage, instructions)` ends the current stage
+  immediately. The pipeline jumps to the target stage and then continues in
+  declared order — so when `review` reprompts `implement`, the flow is
+  `implement → review → implement → review → …` until review answers
+  normally.
+- The instructions become the sender's recorded output: the target sees
+  them as `{{previous}}` (and as `{{stage.review}}` etc.). Stages that run
+  with no explicit `prompt` automatically get the task plus that feedback.
+- Each reprompted stage starts fresh — feedback travels through the prompt,
+  not through shared conversation history.
+- `settings.max_stage_runs` (default 24) caps total stage executions per
+  run; a runaway reprompt loop aborts with an error instead of spinning.
+- The tool is only offered during full pipeline runs — not in
+  `soa run --stage` (single-stage) or `soa chat`.
 
 ## Building
 

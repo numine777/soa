@@ -19,12 +19,21 @@ pub struct McpConnection {
 }
 
 impl McpConnection {
-    pub async fn connect(name: &str, config: &McpServer) -> Result<McpConnection> {
+    /// `quiet` discards spawned servers' stderr instead of inheriting it —
+    /// required in TUI mode, where stray writes would corrupt the display.
+    pub async fn connect(name: &str, config: &McpServer, quiet: bool) -> Result<McpConnection> {
         let service = match config {
             McpServer::Stdio { command, args, env, .. } => {
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(args).envs(env);
-                let transport = TokioChildProcess::new(cmd)
+                let stderr = if quiet {
+                    std::process::Stdio::null()
+                } else {
+                    std::process::Stdio::inherit()
+                };
+                let (transport, _) = TokioChildProcess::builder(cmd)
+                    .stderr(stderr)
+                    .spawn()
                     .with_context(|| format!("mcp `{name}`: failed to spawn `{command}`"))?;
                 ()
                     .serve(transport)
@@ -125,6 +134,7 @@ impl McpManager {
     pub async fn connect(
         servers: impl IntoIterator<Item = String>,
         config: &crate::config::Config,
+        quiet: bool,
     ) -> Result<McpManager> {
         let mut manager = McpManager::default();
         for name in servers {
@@ -136,7 +146,7 @@ impl McpManager {
                 .get(&name)
                 .ok_or_else(|| anyhow!("unknown mcp server `{name}`"))?;
             tracing::info!(server = %name, "connecting to MCP server");
-            let connection = McpConnection::connect(&name, server_config).await?;
+            let connection = McpConnection::connect(&name, server_config, quiet).await?;
             tracing::info!(server = %name, tools = connection.tools.len(), "connected");
             manager.connections.insert(name, connection);
         }

@@ -37,6 +37,16 @@ pub struct Settings {
     /// Default cap on model round-trips per stage; stages can override with `max_turns`.
     #[serde(default = "default_max_turns")]
     pub default_max_turns: u32,
+    /// Total stage executions allowed in one `soa run`, including re-runs
+    /// caused by `reprompt_stage`. Guards against reprompt loops.
+    #[serde(default = "default_max_stage_runs")]
+    pub max_stage_runs: u32,
+    /// Tool results longer than this many characters are truncated before
+    /// they enter the conversation, so one oversized result (e.g. a
+    /// recursive directory tree) cannot blow the model's context window.
+    /// 0 disables truncation.
+    #[serde(default = "default_max_tool_output_chars")]
+    pub max_tool_output_chars: usize,
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
@@ -50,6 +60,8 @@ impl Default for Settings {
             searxng_url: None,
             searxng_max_results: default_search_results(),
             default_max_turns: default_max_turns(),
+            max_stage_runs: default_max_stage_runs(),
+            max_tool_output_chars: default_max_tool_output_chars(),
             request_timeout_secs: default_timeout(),
         }
     }
@@ -60,6 +72,12 @@ fn default_search_results() -> usize {
 }
 fn default_max_turns() -> u32 {
     16
+}
+fn default_max_stage_runs() -> u32 {
+    24
+}
+fn default_max_tool_output_chars() -> usize {
+    30_000
 }
 fn default_timeout() -> u64 {
     600
@@ -166,6 +184,12 @@ pub struct Stage {
     pub max_turns: Option<u32>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Stages this stage may hand control back to via the `reprompt_stage`
+    /// tool (may include itself). The pipeline resumes from the target stage
+    /// and continues in declared order, so a reviewer that reprompts an
+    /// earlier `implement` stage will run again afterwards.
+    #[serde(default)]
+    pub can_reprompt: Vec<String>,
 }
 
 impl Stage {
@@ -269,11 +293,20 @@ impl Config {
             errors.push("no [[stage]] entries defined".to_string());
         }
 
+        let all_stage_names: Vec<&str> = self.stages.iter().map(|s| s.name.as_str()).collect();
         let mut seen_stage_names: Vec<&str> = Vec::new();
         for (index, stage) in self.stages.iter().enumerate() {
             let name = &stage.name;
             if seen_stage_names.contains(&name.as_str()) {
                 errors.push(format!("duplicate stage name `{name}`"));
+            }
+
+            for target in &stage.can_reprompt {
+                if !all_stage_names.contains(&target.as_str()) {
+                    errors.push(format!(
+                        "stage `{name}` can_reprompt references unknown stage `{target}`"
+                    ));
+                }
             }
 
             if !self.models.contains_key(&stage.model) {
@@ -439,6 +472,22 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("stage.third"), "{err}");
+    }
+
+    #[test]
+    fn unknown_reprompt_target_rejected() {
+        let toml_str = MINIMAL.replace(
+            "name = \"answer\"",
+            "name = \"answer\"\ncan_reprompt = [\"answer\", \"nope\"]",
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("can_reprompt references unknown stage `nope`"), "{err}");
+        // Self-reference and any existing stage are fine.
+        let toml_str = MINIMAL.replace(
+            "name = \"answer\"",
+            "name = \"answer\"\ncan_reprompt = [\"answer\"]",
+        );
+        assert!(parse(&toml_str).is_ok());
     }
 
     #[test]

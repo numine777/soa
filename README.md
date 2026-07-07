@@ -54,7 +54,7 @@ Slash commands:
 |---|---|
 | `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx ~N tok` estimate. |
 | `/clear` | Drop all conversation context. |
-| `/diff` | Open the diff viewer (also `Ctrl+D`). |
+| `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
@@ -62,7 +62,10 @@ Slash commands:
 Keys: `Enter` sends, `Alt+Enter` inserts a newline, `Up`/`Down` recall
 previously submitted prompts (shell-style; `Up` on the input's first line,
 `Down` on its last), `PgUp`/`PgDn` and the mouse wheel scroll the
-transcript, `Esc` cancels a running turn, `Ctrl+C` quits. In the diff
+transcript, `Esc` or `Ctrl+C` cancels a running turn (`Ctrl+C` clears the
+input when idle), and `Ctrl+D` on an empty prompt quits (shell-style EOF;
+with text in the input it deletes forward — `Ctrl+Q` and `/quit` always
+quit). In the diff
 viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel scroll, `q` closes.
 
 **Sessions.** Every conversation is auto-saved (after each turn, compaction,
@@ -88,7 +91,7 @@ unsent draft restored when you scroll back past the newest entry.
 **Diff viewer.** When the model calls a non-read-only MCP tool, soa
 snapshots any file named by a path-like argument and records a unified diff
 of what actually changed on disk. Changes show up inline in the transcript
-(`✎ path (+a −r)`) and in the full-screen viewer under `Ctrl+D`.
+(`✎ path (+a −r)`) and in the full-screen viewer under `Ctrl+G`.
 
 **tmux.** The TUI works inside tmux: mouse-wheel scrolling uses standard
 mouse capture (run with `--no-mouse` if you prefer the terminal's native

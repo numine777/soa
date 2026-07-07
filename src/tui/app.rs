@@ -298,12 +298,36 @@ impl App {
 
         // Global bindings.
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('q') if ctrl => {
+            KeyCode::Char('q') if ctrl => {
                 self.quit = true;
                 return;
             }
             KeyCode::Char('d') if ctrl => {
+                let input_empty = self.input.lines().iter().all(|line| line.is_empty());
+                if matches!(self.view, View::Chat) && !input_empty {
+                    // Readline behavior: on a non-empty input Ctrl+D deletes
+                    // the character under the cursor; EOF-quit needs an
+                    // empty prompt.
+                    self.input.input(tui_textarea::Input::from(key));
+                } else {
+                    self.quit = true;
+                }
+                return;
+            }
+            KeyCode::Char('g') if ctrl => {
                 self.toggle_diff_view();
+                return;
+            }
+            KeyCode::Char('c') if ctrl => {
+                if self.is_running() {
+                    self.cancel_turn();
+                } else if self.input.lines().iter().any(|line| !line.is_empty()) {
+                    self.input = new_textarea();
+                    self.recall_index = None;
+                    self.recall_draft.clear();
+                } else {
+                    self.info("use Ctrl+D or /quit to exit");
+                }
                 return;
             }
             _ => {}
@@ -534,7 +558,9 @@ impl App {
         match self.view {
             View::Diffs { .. } => self.view = View::Chat,
             View::Sessions { .. } => {} // don't stack modal views
-            View::Chat if self.diffs.is_empty() => self.info("no file changes captured yet"),
+            View::Chat if self.diffs.is_empty() => {
+                self.info("no file changes captured yet");
+            }
             View::Chat => {
                 self.view = View::Diffs { selected: self.diffs.len() - 1, scroll: 0 };
             }
@@ -583,10 +609,10 @@ impl App {
                 "commands:\n\
                  /compact        summarize the conversation and shrink context\n\
                  /clear          drop all conversation context\n\
-                 /diff           open the diff viewer (Ctrl+D)\n\
+                 /diff           open the diff viewer (Ctrl+G)\n\
                  /stage <name>   switch the active stage\n\
                  /sessions       open the session picker (switch or start new)\n\
-                 /quit           exit (Ctrl+C)\n\
+                 /quit           exit (Ctrl+D on an empty prompt)\n\
                  keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\
                  PgUp/PgDn + mouse wheel scroll\n\
                  diff view: Tab/Shift+Tab switch file · j/k scroll · q close",
@@ -737,7 +763,7 @@ impl App {
                 self.transcript.push(TranscriptItem::ToolDone { preview });
             }
             AgentEvent::Diff(entry) => {
-                self.info(format!("✎ {} — Ctrl+D to view", entry.title()));
+                self.info(format!("✎ {} — Ctrl+G to view", entry.title()));
                 self.diffs.push(entry);
             }
             AgentEvent::Turn { history, text } => {

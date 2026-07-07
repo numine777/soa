@@ -295,7 +295,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     ));
     if !app.diffs.is_empty() {
         spans.push(Span::styled(
-            format!(" · {} diff(s) ^D", app.diffs.len()),
+            format!(" · {} diff(s) ^G", app.diffs.len()),
             dim,
         ));
     }

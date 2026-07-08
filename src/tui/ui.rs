@@ -313,8 +313,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut spans: Vec<Span> = Vec::new();
     if app.is_running() {
+        let queued = match app.queued_count() {
+            0 => String::new(),
+            n => format!(" · {n} queued"),
+        };
         spans.push(Span::styled(
-            format!(" {} {} · Esc to cancel", SPINNER[app.spinner % SPINNER.len()], app.status_word()),
+            format!(
+                " {} {}{queued} · Esc to cancel",
+                SPINNER[app.spinner % SPINNER.len()],
+                app.status_word()
+            ),
             Style::default().fg(Color::Yellow),
         ));
     } else {

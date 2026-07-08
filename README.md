@@ -76,6 +76,12 @@ Slash commands:
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
 
+**Steering.** The input stays live while a turn runs: submitting a message
+queues it (the status bar shows the count) and it is delivered to the model
+after the current tool round — correct course without cancelling. Anything
+still queued when the turn finishes is sent as the next turn, and a
+cancelled or failed turn keeps queued messages in context.
+
 Keys: `Enter` sends, `Alt+Enter` inserts a newline, `Up`/`Down` recall
 previously submitted prompts (shell-style; `Up` on the input's first line,
 `Down` on its last), `PgUp`/`PgDn` and the mouse wheel scroll the

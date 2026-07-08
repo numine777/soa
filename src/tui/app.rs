@@ -94,6 +94,14 @@ pub struct App {
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
     compacting: bool,
+    /// Messages submitted while a turn is running, shared with the worker,
+    /// which injects them into the conversation between tool rounds.
+    steer_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Everything queued during the current turn. The worker's history clone
+    /// is discarded when a turn fails or is cancelled, so these are
+    /// re-appended to the surviving history — same as the turn's original
+    /// message, which is pushed before the worker starts.
+    steered_this_turn: Vec<String>,
     tx: UnboundedSender<AgentEvent>,
     // Session persistence.
     session_id: String,
@@ -153,6 +161,8 @@ impl App {
             quit: false,
             turn: None,
             compacting: false,
+            steer_queue: Arc::default(),
+            steered_this_turn: Vec::new(),
             tx,
             session_id: store::new_session_id(),
             started_at: store::now_epoch(),
@@ -685,8 +695,8 @@ impl App {
             self.persist(); // commands like /clear change persisted state
             return;
         }
-        if self.is_running() {
-            return; // keep the draft; a turn is already in flight
+        if self.is_running() && self.compacting {
+            return self.error("compacting — send again when it finishes");
         }
         self.remember_prompt(&text);
         self.has_activity = true;
@@ -703,8 +713,19 @@ impl App {
         for report in &reports {
             self.info(report.describe());
         }
-        self.history.push(ChatMessage::User { content: expanded });
         self.scroll_from_bottom = 0;
+
+        // Mid-turn steering: queue the message for the running worker, which
+        // delivers it to the model after the current tool round. Anything
+        // still queued when the turn ends becomes the next turn.
+        if self.is_running() {
+            self.info("↪ queued — delivered after the current tool round");
+            self.steered_this_turn.push(expanded.clone());
+            self.steer_queue.lock().unwrap().push_back(expanded);
+            return;
+        }
+
+        self.history.push(ChatMessage::User { content: expanded });
         self.start_turn();
         self.persist();
     }
@@ -728,6 +749,8 @@ impl App {
                  /sessions       open the session picker (switch or start new)\n\
                  /quit           exit (Ctrl+D on an empty prompt)\n\
                  mention files with @path (@src/main.rs, @\"has spaces.txt\", @somedir)\n\
+                 typing while a turn runs queues the message: it is delivered to the\n\
+                 model after the current tool round (or becomes the next turn)\n\
                  keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\
                  PgUp/PgDn + mouse wheel scroll\n\
                  diff view: Tab/Shift+Tab switch file · j/k scroll · q close",
@@ -827,6 +850,8 @@ impl App {
             .collect();
         let max_turns = stage.max_turns.unwrap_or(self.config.settings.default_max_turns);
 
+        self.steer_queue.lock().unwrap().clear();
+        self.steered_this_turn.clear();
         let worker = turn_worker(
             client,
             definitions,
@@ -841,6 +866,7 @@ impl App {
             (stage.require_approval, stage.auto_approve.clone()),
             Arc::clone(&self.approvals),
             stage.model.clone(),
+            Arc::clone(&self.steer_queue),
         );
         self.compacting = false;
         self.turn = Some(tokio::spawn(worker));
@@ -917,8 +943,24 @@ impl App {
             self.compacting = false;
             self.pending_approval = None; // dropped responder reads as deny
             self.flush_stream_buffer();
+            self.preserve_steered();
             self.info("cancelled");
         }
+    }
+
+    /// A failed or cancelled turn discards the worker's history clone, and
+    /// any steered messages with it — keep them in the surviving history so
+    /// the next turn still sees them.
+    fn preserve_steered(&mut self) {
+        self.steer_queue.lock().unwrap().clear();
+        let queued = std::mem::take(&mut self.steered_this_turn);
+        if queued.is_empty() {
+            return;
+        }
+        for content in queued {
+            self.history.push(ChatMessage::User { content });
+        }
+        self.info("queued message(s) kept in context for the next turn");
     }
 
     pub fn abort_turn(&mut self) {
@@ -929,6 +971,11 @@ impl App {
 
     pub fn status_word(&self) -> &'static str {
         if self.compacting { "compacting" } else { "thinking" }
+    }
+
+    /// Steered messages waiting to be delivered to the running turn.
+    pub fn queued_count(&self) -> usize {
+        self.steer_queue.lock().unwrap().len()
     }
 
     // ------------------------------------------------------------------
@@ -973,7 +1020,20 @@ impl App {
                     self.transcript.push(TranscriptItem::Assistant(text));
                 }
                 self.turn = None;
-                self.maybe_auto_compact();
+                // Steered messages the worker never got to (the reply had no
+                // further tool rounds) become the next turn immediately.
+                let leftovers: Vec<String> =
+                    self.steer_queue.lock().unwrap().drain(..).collect();
+                self.steered_this_turn.clear();
+                if leftovers.is_empty() {
+                    self.maybe_auto_compact();
+                } else {
+                    for content in leftovers {
+                        self.history.push(ChatMessage::User { content });
+                    }
+                    self.info("↪ sending queued message(s)");
+                    self.start_turn();
+                }
             }
             AgentEvent::Compacted { summary } => {
                 let before = self.token_estimate();
@@ -1003,6 +1063,7 @@ impl App {
                 self.error(message);
                 self.turn = None;
                 self.compacting = false;
+                self.preserve_steered();
             }
         }
         if should_save {
@@ -1028,6 +1089,7 @@ async fn turn_worker(
     (require_approval, auto_approve): (bool, Vec<String>),
     approvals: Arc<Approvals>,
     model_name: String,
+    steer: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let delta_tx = tx.clone();
     let on_delta = move |fragment: &str| {
@@ -1130,6 +1192,19 @@ async fn turn_worker(
                 .collect();
             let _ = tx.send(AgentEvent::ToolDone { preview });
             history.push(ChatMessage::Tool { content: output, tool_call_id: call.id });
+        }
+
+        // Steering: deliver messages the user typed during this round before
+        // the model's next request.
+        let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
+        if !steered.is_empty() {
+            let _ = tx.send(AgentEvent::Notice(format!(
+                "↪ delivered {} queued message(s) to the model",
+                steered.len()
+            )));
+            for content in steered {
+                history.push(ChatMessage::User { content });
+            }
         }
     }
 

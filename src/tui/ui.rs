@@ -434,7 +434,7 @@ fn draw_diffs(frame: &mut Frame, app: &mut App, area: Rect) {
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
 
     let header = format!(
-        " diff {}/{} · {} · via {}   Tab/Shift-Tab file · j/k scroll · q close ",
+        " diff {}/{} · {} · via {}   Tab/Shift-Tab file · j/k scroll · r restore · q close ",
         *selected + 1,
         app.diffs.len(),
         entry.title(),

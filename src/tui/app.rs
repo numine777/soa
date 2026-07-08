@@ -720,6 +720,12 @@ impl App {
     }
 
     fn on_diff_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('r')
+            && let View::Diffs { selected, .. } = &self.view
+        {
+            let index = *selected;
+            return self.restore_diff(index);
+        }
         let View::Diffs { selected, scroll } = &mut self.view else { return };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
@@ -852,6 +858,7 @@ impl App {
                  /clear          drop all conversation context\n\
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
+                 /rewind         restore every touched file to its session-start state\n\
                  /stage <name>   switch the active stage\n\
                  /model <name>   override the model for this session (/model default reverts)\n\
                  /reload         re-read the config file (MCP changes need a restart)\n\
@@ -864,7 +871,7 @@ impl App {
                  model after the current tool round (or becomes the next turn)\n\
                  keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\
                  PgUp/PgDn + mouse wheel scroll\n\
-                 diff view: Tab/Shift+Tab switch file · j/k scroll · q close",
+                 diff view: Tab/Shift+Tab switch file · j/k scroll · r restore · q close",
             ),
             "sessions" => self.open_sessions(),
             "clear" => {
@@ -891,6 +898,7 @@ impl App {
                 ));
             }
             "diff" => self.toggle_diff_view(),
+            "rewind" => self.rewind_all(),
             "stage" => self.switch_stage(arg),
             "model" => self.switch_model(arg),
             "reload" => self.reload_config(),
@@ -1183,6 +1191,75 @@ impl App {
             self.flush_stream_buffer();
             self.preserve_steered();
             self.info("cancelled");
+        }
+    }
+
+    /// Restore one captured change (diff viewer `r`): put the file back
+    /// into that entry's pre-change state. The reverse entry is recorded so
+    /// the restore itself can be undone.
+    fn restore_diff(&mut self, index: usize) {
+        if self.is_running() {
+            return self.error("cannot restore while a turn is running (Esc to cancel it first)");
+        }
+        let Some(entry) = self.diffs.get(index).cloned() else { return };
+        match diff::restore(&entry) {
+            Ok(Some(reverse)) => {
+                self.info(format!(
+                    "restored {} to its state before `{}` — undo via the new rewind entry",
+                    entry.path, entry.tool
+                ));
+                self.diffs.push(reverse);
+                self.persist();
+            }
+            Ok(None) => self.info(format!(
+                "{} already matches the state recorded before `{}`",
+                entry.path, entry.tool
+            )),
+            Err(message) => self.error(message),
+        }
+    }
+
+    /// `/rewind`: return every touched file to its earliest recorded state
+    /// (how it looked before this session first changed it). Each restore
+    /// is captured as a `rewind` diff entry, so a rewind can be re-applied
+    /// forward from the diff viewer if it went too far.
+    fn rewind_all(&mut self) {
+        if self.is_running() {
+            return self.error("cannot rewind while a turn is running (Esc to cancel it first)");
+        }
+        // The earliest restorable entry per path is the session-start state.
+        let mut targets: Vec<DiffEntry> = Vec::new();
+        for entry in &self.diffs {
+            if entry.restorable() && !targets.iter().any(|t| t.path == entry.path) {
+                targets.push(entry.clone());
+            }
+        }
+        if targets.is_empty() {
+            return self.info("nothing to rewind — no restorable file changes recorded");
+        }
+        let (mut restored, mut errors) = (Vec::new(), Vec::new());
+        for entry in targets {
+            match diff::restore(&entry) {
+                Ok(Some(reverse)) => {
+                    restored.push(entry.path.clone());
+                    self.diffs.push(reverse);
+                }
+                Ok(None) => {} // already at the session-start state
+                Err(message) => errors.push(message),
+            }
+        }
+        for message in errors {
+            self.error(message);
+        }
+        if restored.is_empty() {
+            self.info("nothing to rewind — all files already match their session-start state");
+        } else {
+            self.info(format!(
+                "rewound {} file(s) to their session-start state:\n  {}\nCtrl+G shows the rewind entries (select one and press r to re-apply forward)",
+                restored.len(),
+                restored.join("\n  "),
+            ));
+            self.persist();
         }
     }
 

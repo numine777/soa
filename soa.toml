@@ -173,6 +173,26 @@ of what was accomplished.
 """
 
 # ---------------------------------------------------------------------------
+# Hooks: shell commands bound to tool-call events. `match` uses the same
+# `*`-wildcard descriptors as auto_approve (`edit_file *`, `shell cargo *`,
+# `agent__researcher`). A pre_tool hook that exits non-zero blocks the call
+# (before any approval prompt); a post_tool hook that exits non-zero has
+# its output appended to the tool result so the model sees it. Hooks get a
+# JSON payload on stdin and SOA_EVENT / SOA_TOOL / SOA_DESCRIPTOR /
+# SOA_PATHS in the environment.
+# ---------------------------------------------------------------------------
+
+# [[hooks]]
+# event = "post_tool"                 # lint after every native file edit
+# match = "edit_file *"
+# command = "cargo fmt --check 2>&1 | head -20"
+
+# [[hooks]]
+# event = "pre_tool"                  # protect a directory from writes
+# match = "write_file secrets/*"
+# command = "echo 'secrets/ is off limits' >&2; exit 1"
+
+# ---------------------------------------------------------------------------
 # Workflows: named pipelines over the stage library. `soa run` uses the
 # workflow named "default" (or settings.default_workflow); pick another
 # with `soa run -w quickfix "task"`. `soa stages` lists them.

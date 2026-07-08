@@ -2,6 +2,7 @@ mod approval;
 mod config;
 mod diff;
 mod files;
+mod hooks;
 mod mcp;
 mod mentions;
 mod provider;
@@ -127,13 +128,14 @@ async fn main() -> Result<()> {
                 skills::compose_system(&config, &format!("agent `{name}`"), system, &agent.skills)?;
             }
             println!(
-                "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s)",
+                "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s), {} hook(s)",
                 config.providers.len(),
                 config.models.len(),
                 config.mcp.len(),
                 config.agents.len(),
                 config.stages.len(),
-                config.workflows.len()
+                config.workflows.len(),
+                config.hooks.len()
             );
             if config.project_contexts.is_empty() {
                 let candidates: Vec<String> = config

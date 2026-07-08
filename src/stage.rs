@@ -385,8 +385,17 @@ pub async fn dispatch_tool_call(
     depth: u32,
     policy: &CallPolicy<'_>,
 ) -> Result<String> {
+    let described = call_descriptor(binding, arguments_json);
+
+    // pre_tool hooks run before the approval prompt: a call a hook is
+    // going to block should never interrupt the user.
+    if let Some(blocked) =
+        crate::hooks::pre_tool(config, &described.descriptor, arguments_json).await
+    {
+        return Ok(blocked);
+    }
+
     if policy.require_approval {
-        let described = call_descriptor(binding, arguments_json);
         let pre_approved = policy
             .auto_approve
             .iter()
@@ -429,6 +438,8 @@ pub async fn dispatch_tool_call(
     let output =
         dispatch_tool_call_inner(binding, arguments_json, config, mcp, http, depth, policy)
             .await?;
+    let output =
+        crate::hooks::post_tool(config, &described.descriptor, arguments_json, output).await;
     Ok(clamp_tool_output(output, config.settings.max_tool_output_chars))
 }
 

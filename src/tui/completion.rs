@@ -18,6 +18,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("model", "override the model for this session"),
     ("quit", "exit"),
     ("reload", "re-read the config file"),
+    ("rewind", "restore touched files to their session-start state"),
     ("sessions", "open the session picker"),
     ("stage", "switch the active stage"),
     ("usage", "cumulative token usage per model"),

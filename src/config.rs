@@ -27,6 +27,9 @@ pub struct Config {
     pub workflows: BTreeMap<String, Workflow>,
     #[serde(default, rename = "stage")]
     pub stages: Vec<Stage>,
+    /// Shell commands bound to tool-call events (see [`Hook`]).
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
 
     /// Directory containing the config file; relative paths (e.g.
     /// `system_prompt_file`) resolve against it. Set by [`Config::load`].
@@ -168,6 +171,41 @@ fn default_provider_retries() -> u32 {
 }
 fn default_timeout() -> u64 {
     600
+}
+
+/// A user-configured shell command bound to a tool-call event.
+///
+/// `pre_tool` hooks run before a call is dispatched (before any approval
+/// prompt); a non-zero exit blocks the call and the hook's output is fed
+/// to the model. `post_tool` hooks run after; a non-zero exit appends the
+/// hook's output to the tool result as feedback (e.g. lint errors).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    pub event: HookEvent,
+    /// `*`-wildcard pattern matched against the same call descriptor that
+    /// approvals use: `edit_file *`, `shell cargo *`, `fs__write_file`,
+    /// `agent__researcher`. Default: every call.
+    #[serde(rename = "match", default = "default_hook_match")]
+    pub pattern: String,
+    /// Command run with `sh -c` in the working directory. Receives a JSON
+    /// payload on stdin and SOA_EVENT / SOA_TOOL / SOA_DESCRIPTOR /
+    /// SOA_PATHS in the environment.
+    pub command: String,
+    /// Kill the hook after this many seconds (default:
+    /// `settings.shell_timeout_secs`).
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    PreTool,
+    PostTool,
+}
+
+fn default_hook_match() -> String {
+    "*".to_string()
 }
 
 /// An OpenAI-compatible chat-completions endpoint (Ollama, LM Studio,
@@ -482,6 +520,12 @@ impl Config {
 
         if self.stages.is_empty() {
             errors.push("no [[stage]] entries defined".to_string());
+        }
+
+        for (index, hook) in self.hooks.iter().enumerate() {
+            if hook.command.trim().is_empty() {
+                errors.push(format!("hooks[{index}] has an empty command"));
+            }
         }
 
         if !(0.0..=1.0).contains(&self.settings.auto_compact_threshold) {

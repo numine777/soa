@@ -72,6 +72,7 @@ Slash commands:
 | `/clear` | Drop all conversation context. |
 | `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
+| `/rewind` | Restore every file the session touched to its state before the first change. Each restore is recorded as a `rewind` diff entry, so a rewind can be undone (re-applied forward) from the diff viewer. |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
 | `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
 | `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
@@ -99,7 +100,12 @@ transcript, `Esc` or `Ctrl+C` cancels a running turn (`Ctrl+C` clears the
 input when idle), and `Ctrl+D` on an empty prompt quits (shell-style EOF;
 with text in the input it deletes forward — `Ctrl+Q` and `/quit` always
 quit). In the diff
-viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel scroll, `q` closes.
+viewer: `Tab`/`Shift+Tab` switch files, `j`/`k`/wheel scroll, `r` restores
+the selected change (the file returns to its state before that tool call —
+a `rewind` entry is added so the restore is itself undoable), `q` closes.
+Diff entries store the pre-change content, so restores work even after the
+model has made several later edits; entries saved by older soa versions
+lack restore data and report as such.
 
 **Sessions.** Every conversation is auto-saved (after each turn, compaction,
 or clear) to `$XDG_DATA_HOME/soa/sessions/` (default
@@ -296,6 +302,37 @@ directory (paths that escape it are rejected), `glob`/`grep` skip `.git`,
 one call can't flood the context. Writes participate in approvals
 (`require_approval`, patterns like `edit_file *`) and chat diff capture
 like any other mutating tool. No MCP filesystem server required.
+
+## Hooks
+
+`[[hooks]]` entries bind shell commands to tool-call events, so behaviors
+can be added without touching soa itself:
+
+```toml
+[[hooks]]
+event = "post_tool"                  # lint after every native file edit
+match = "edit_file *"
+command = "cargo fmt --check 2>&1 | head -20"
+
+[[hooks]]
+event = "pre_tool"                   # protect a directory from writes
+match = "write_file secrets/*"
+command = "echo 'secrets/ is off limits' >&2; exit 1"
+```
+
+`match` is a `*`-wildcard over the same call descriptors approvals use
+(`edit_file src/x.rs`, `shell cargo test`, `fs__write_file`,
+`agent__researcher`); it defaults to `*`. A `pre_tool` hook that exits
+non-zero **blocks the call** — before any approval prompt — with the
+hook's output fed to the model; timeouts and spawn failures also block
+(fail closed). A `post_tool` hook that exits non-zero has its output
+appended to the tool result, which is how lint feedback reaches the model;
+exit 0 stays silent. Hooks apply everywhere tools are dispatched — stages,
+subagents, and chat — and receive a JSON payload
+(`{event, tool, descriptor, arguments, output}`) on stdin plus
+`SOA_EVENT`, `SOA_TOOL`, `SOA_DESCRIPTOR`, and `SOA_PATHS` (newline-joined
+file paths from the arguments) in the environment. `timeout_secs`
+overrides `settings.shell_timeout_secs` per hook.
 
 ## Shell tool
 

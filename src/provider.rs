@@ -124,6 +124,78 @@ impl Usage {
     }
 }
 
+pub fn fmt_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k tok", tokens as f64 / 1000.0)
+    } else {
+        format!("{tokens} tok")
+    }
+}
+
+/// Cumulative per-model token accounting for this process. Every
+/// [`ChatClient`] records its successful round-trips here, so stage loops,
+/// subagents, compaction, and chat turns are all counted without threading
+/// a collector through every call chain.
+pub mod usage_stats {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::Usage;
+
+    /// Totals for one model, keyed by its config name.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct ModelUsage {
+        /// Successful round-trips (retries of a request are not counted).
+        pub requests: u64,
+        pub prompt_tokens: u64,
+        pub completion_tokens: u64,
+    }
+
+    static TOTALS: Mutex<BTreeMap<String, ModelUsage>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn record(label: &str, usage: Option<Usage>) {
+        let mut totals = TOTALS.lock().unwrap();
+        let entry = totals.entry(label.to_string()).or_default();
+        entry.requests += 1;
+        if let Some(usage) = usage {
+            entry.prompt_tokens += usage.prompt_tokens;
+            entry.completion_tokens += usage.completion_tokens;
+        }
+    }
+
+    /// Per-model totals recorded so far, sorted by model name.
+    pub fn snapshot() -> BTreeMap<String, ModelUsage> {
+        TOTALS.lock().unwrap().clone()
+    }
+
+    /// One line per model, plus a total when several models were used.
+    /// Empty when no requests completed.
+    pub fn report_lines() -> Vec<String> {
+        let totals = snapshot();
+        let mut lines = Vec::new();
+        let mut sum = ModelUsage::default();
+        for (model, usage) in &totals {
+            sum.requests += usage.requests;
+            sum.prompt_tokens += usage.prompt_tokens;
+            sum.completion_tokens += usage.completion_tokens;
+            lines.push(format!("{model}: {}", describe(usage)));
+        }
+        if totals.len() > 1 {
+            lines.push(format!("total: {}", describe(&sum)));
+        }
+        lines
+    }
+
+    fn describe(usage: &ModelUsage) -> String {
+        format!(
+            "{} request(s), {} in + {} out",
+            usage.requests,
+            super::fmt_tokens(usage.prompt_tokens),
+            super::fmt_tokens(usage.completion_tokens),
+        )
+    }
+}
+
 /// What the model returned for one round-trip.
 #[derive(Debug)]
 pub struct AssistantTurn {
@@ -256,6 +328,8 @@ pub struct ChatClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    /// Config-level model name, used to attribute [`usage_stats`].
+    label: String,
     params: SamplingParams,
     stream: bool,
     /// Additional attempts after a transient failure (network error,
@@ -316,11 +390,13 @@ fn novel_suffix(fragment: &str, cumulative_before: usize, emitted: usize) -> Opt
 }
 
 impl ChatClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         http: reqwest::Client,
         base_url: &str,
         api_key: Option<String>,
         model: &str,
+        label: &str,
         params: SamplingParams,
         stream: bool,
         retries: u32,
@@ -330,6 +406,7 @@ impl ChatClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model: model.to_string(),
+            label: label.to_string(),
             params,
             stream,
             retries,
@@ -363,7 +440,10 @@ impl ChatClient {
         let mut attempt = 0u32;
         loop {
             match self.attempt_chat(messages, tools, on_delta, &mut emitted).await {
-                Ok(turn) => return Ok(turn),
+                Ok(turn) => {
+                    usage_stats::record(&self.label, turn.usage);
+                    return Ok(turn);
+                }
                 Err(error) if error.retryable && attempt < self.retries => {
                     let delay = error.retry_after.unwrap_or_else(|| backoff_delay(attempt));
                     attempt += 1;
@@ -545,6 +625,25 @@ mod tests {
         let usage = turn.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.context_tokens(), 120);
+    }
+
+    #[test]
+    fn usage_stats_accumulate_per_model() {
+        let usage = |p, c| Some(Usage { prompt_tokens: p, completion_tokens: c });
+        usage_stats::record("stats-test-a", usage(100, 10));
+        usage_stats::record("stats-test-a", usage(200, 20));
+        // A server that reports no usage still counts the request.
+        usage_stats::record("stats-test-a", None);
+        usage_stats::record("stats-test-b", usage(5, 1));
+
+        let totals = usage_stats::snapshot();
+        let a = totals["stats-test-a"];
+        assert_eq!((a.requests, a.prompt_tokens, a.completion_tokens), (3, 300, 30));
+        assert_eq!(totals["stats-test-b"].requests, 1);
+
+        let report = usage_stats::report_lines().join("\n");
+        assert!(report.contains("stats-test-a: 3 request(s), 300 tok in + 30 tok out"));
+        assert!(report.contains("total: "), "{report}");
     }
 
     #[test]

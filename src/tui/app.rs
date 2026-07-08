@@ -15,7 +15,7 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
-use crate::provider::{ChatClient, ChatMessage, ToolFunction, Usage};
+use crate::provider::{ChatClient, ChatMessage, ToolFunction, Usage, fmt_tokens, usage_stats};
 use crate::stage::{
     CallPolicy, ToolBinding, assemble_tools, build_client, context_pressure,
     dispatch_tool_call, shed_context,
@@ -722,6 +722,7 @@ impl App {
                 "commands:\n\
                  /compact        summarize the conversation and shrink context\n\
                  /clear          drop all conversation context\n\
+                 /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
                  /stage <name>   switch the active stage\n\
                  /sessions       open the session picker (switch or start new)\n\
@@ -743,6 +744,18 @@ impl App {
                 self.info(format!("context cleared (freed ~{})", fmt_tokens(freed as u64)));
             }
             "compact" => self.start_compact(),
+            "usage" => {
+                let lines = usage_stats::report_lines();
+                if lines.is_empty() {
+                    self.info("no model requests completed yet");
+                    return;
+                }
+                let (context, _) = self.context_status();
+                self.info(format!(
+                    "token usage since launch:\n  {}\n  {context}",
+                    lines.join("\n  "),
+                ));
+            }
             "diff" => self.toggle_diff_view(),
             "stage" => self.switch_stage(arg),
             "quit" | "exit" => self.quit = true,
@@ -995,14 +1008,6 @@ impl App {
         if should_save {
             self.persist();
         }
-    }
-}
-
-pub fn fmt_tokens(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{:.1}k tok", tokens as f64 / 1000.0)
-    } else {
-        format!("{tokens} tok")
     }
 }
 

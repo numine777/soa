@@ -661,6 +661,7 @@ pub fn build_client(
         &provider.base_url,
         provider.api_key.clone(),
         &model.model,
+        model_name,
         SamplingParams {
             temperature: temperature.or(model.temperature),
             top_p: model.top_p,

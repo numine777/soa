@@ -407,6 +407,7 @@ async fn run_pipeline(
         )
         .await;
         manager.shutdown().await;
+        print_usage_summary();
         return match result? {
             stage::StageOutcome::Final(output) => {
                 eprintln!();
@@ -563,6 +564,7 @@ async fn run_workflow(
         Err(_) => eprintln!("✗ run interrupted — continue it with `soa run --resume`"),
     }
 
+    print_usage_summary();
     if result.is_ok()
         && let Some(output) = last_output
     {
@@ -571,6 +573,19 @@ async fn run_workflow(
 
     manager.shutdown().await;
     result
+}
+
+/// Per-model token totals for this run, on stderr with the other progress
+/// output. Resumed runs only count the resumed portion.
+fn print_usage_summary() {
+    let lines = provider::usage_stats::report_lines();
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!("── token usage ──");
+    for line in lines {
+        eprintln!("{line}");
+    }
 }
 
 /// Sync the checkpoint with the loop's progress and persist it. A failed

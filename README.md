@@ -26,7 +26,10 @@ model's first plain-text reply is the stage's output. That output becomes
 `{{previous}}` for the next stage and `{{stage.<name>}}` for all later ones.
 
 Intermediate stage output and logs go to stderr; only the final stage's
-answer is printed to stdout, so `soa run` composes with pipes.
+answer is printed to stdout, so `soa run` composes with pipes. Every run
+(including failed ones) ends with a `── token usage ──` summary on stderr:
+per-model requests and prompt/completion token totals, covering stage
+loops, subagents, and retried requests alike.
 
 ## Commands
 
@@ -67,6 +70,7 @@ Slash commands:
 |---|---|
 | `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx` gauge: real provider-reported token usage when available (with percentage of the model's `context_tokens`), otherwise a `~` estimate. This also happens automatically when usage crosses `settings.auto_compact_threshold` — see [Configuration](#configuration). |
 | `/clear` | Drop all conversation context. |
+| `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |

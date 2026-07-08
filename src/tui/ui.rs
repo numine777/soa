@@ -54,7 +54,91 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_sessions(frame, app, list_area);
             draw_status(frame, app, status_area);
         }
+        View::Rewind { .. } => {
+            let [list_area, status_area] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+            draw_rewind(frame, app, list_area);
+            draw_status(frame, app, status_area);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rewind picker
+// ---------------------------------------------------------------------------
+
+fn draw_rewind(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Row text per checkpoint (newest first), computed before borrowing the
+    // view: the message preview and how much would be undone.
+    let mut rows: Vec<String> = app
+        .checkpoints
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, checkpoint)| {
+            let preview = match app.transcript.get(checkpoint.transcript_index) {
+                Some(TranscriptItem::User(text)) => text.lines().next().unwrap_or(""),
+                _ => "(message unavailable)",
+            };
+            let undone = crate::diff::earliest_restorable_since(&app.diffs, checkpoint.diff_len)
+                .len();
+            format!(
+                "#{}  {}{}",
+                index + 1,
+                truncate_str(preview, 70),
+                match undone {
+                    0 => String::new(),
+                    n => format!("  · undoes {n} file change(s)"),
+                },
+            )
+        })
+        .collect();
+    let start_undone = crate::diff::earliest_restorable_since(&app.diffs, 0).len();
+    rows.push(format!(
+        "⏮ session start{}",
+        match start_undone {
+            0 => String::new(),
+            n => format!("  · undoes {n} file change(s)"),
+        },
+    ));
+
+    let View::Rewind { selected, scroll } = &mut app.view else { return };
+    *selected = (*selected).min(rows.len() - 1);
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(
+            " rewind — conversation returns to before the message, touched files are restored   Enter rewind · j/k move · q close ",
+        )
+        .style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        header_area,
+    );
+
+    let viewport = body_area.height as usize;
+    if *selected < *scroll {
+        *scroll = *selected;
+    } else if *selected >= *scroll + viewport.max(1) {
+        *scroll = *selected + 1 - viewport.max(1);
+    }
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(*scroll)
+        .take(viewport.max(1))
+        .map(|(row, text)| {
+            let is_selected = row == *selected;
+            let marker = if is_selected { "▶" } else { " " };
+            let style = if is_selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("{marker} {text}"), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body_area);
 }
 
 // ---------------------------------------------------------------------------

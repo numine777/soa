@@ -116,6 +116,19 @@ pub fn restore(entry: &DiffEntry) -> Result<Option<DiffEntry>, String> {
     Ok(Some(reverse))
 }
 
+/// The set of entries to restore to undo everything from `from` onward:
+/// for each path first touched at or after `diffs[from]`, the earliest
+/// restorable entry — whose `before` is that file's state at that moment.
+pub fn earliest_restorable_since(diffs: &[DiffEntry], from: usize) -> Vec<DiffEntry> {
+    let mut targets: Vec<DiffEntry> = Vec::new();
+    for entry in diffs.iter().skip(from) {
+        if entry.restorable() && !targets.iter().any(|t| t.path == entry.path) {
+            targets.push(entry.clone());
+        }
+    }
+    targets
+}
+
 /// Pull candidate file paths out of a tool call's JSON arguments.
 pub fn extract_paths(arguments_json: &str) -> Vec<String> {
     let Ok(Value::Object(args)) = serde_json::from_str::<Value>(arguments_json) else {
@@ -244,6 +257,35 @@ mod tests {
         assert_eq!(entry.added, 2);
         assert_eq!(entry.removed, 0);
         assert_eq!(entry.before, Snapshot::Absent);
+    }
+
+    #[test]
+    fn earliest_restorable_since_dedups_by_path() {
+        let entry = |path: &str, before: Snapshot| DiffEntry {
+            tool: "t".into(),
+            path: path.into(),
+            unified: String::new(),
+            added: 0,
+            removed: 0,
+            before,
+        };
+        let diffs = vec![
+            entry("a", Snapshot::Content("a0".into())),
+            entry("b", Snapshot::Unavailable),
+            entry("a", Snapshot::Content("a1".into())),
+            entry("b", Snapshot::Content("b1".into())),
+        ];
+        // From the start: a's first entry wins; b's Unavailable entry is
+        // skipped in favor of its later restorable one.
+        let all = earliest_restorable_since(&diffs, 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].before, Snapshot::Content("a0".into()));
+        assert_eq!(all[1].before, Snapshot::Content("b1".into()));
+        // From index 2: only the later entries are considered.
+        let since = earliest_restorable_since(&diffs, 2);
+        assert_eq!(since[0].before, Snapshot::Content("a1".into()));
+        // Past the end: nothing.
+        assert!(earliest_restorable_since(&diffs, 4).is_empty());
     }
 
     #[test]

@@ -87,6 +87,22 @@ pub fn new_session_id() -> String {
     id
 }
 
+/// A conversation checkpoint taken when a user message starts a turn:
+/// positions into the transcript, model history, and diff log at that
+/// moment, so `/rewind` can return to it. Compaction and `/clear` rewrite
+/// the history and invalidate existing checkpoints.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct Checkpoint {
+    /// Index of the user message's `TranscriptItem` (everything from here
+    /// on is dropped by a rewind).
+    pub transcript_index: usize,
+    /// `history.len()` before the user message was pushed.
+    pub history_len: usize,
+    /// `diffs.len()` at that moment: file changes recorded at or after
+    /// this index are undone by a rewind.
+    pub diff_len: usize,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -103,6 +119,9 @@ pub struct Session {
     pub history: Vec<ChatMessage>,
     pub transcript: Vec<TranscriptItem>,
     pub diffs: Vec<DiffEntry>,
+    /// Rewind targets (empty on sessions saved by older soa versions).
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
@@ -234,11 +253,17 @@ mod tests {
                 history: vec![ChatMessage::User { content: "hi".to_string() }],
                 transcript: vec![TranscriptItem::User("hi".to_string())],
                 diffs: vec![],
+                checkpoints: vec![Checkpoint {
+                    transcript_index: 0,
+                    history_len: 0,
+                    diff_len: 0,
+                }],
             };
             save_session(&session).unwrap();
             let loaded = load_session("20260707-120000").unwrap();
             assert_eq!(loaded.title, "fix the widget");
             assert_eq!(loaded.history.len(), 1);
+            assert_eq!(loaded.checkpoints.len(), 1);
             let latest = load_latest_session().unwrap().unwrap();
             assert_eq!(latest.id, session.id);
         });

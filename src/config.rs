@@ -81,6 +81,11 @@ pub struct Settings {
     /// 0 disables. Only applies to models that declare `context_tokens`.
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold: f64,
+    /// Dispatch a round's tool calls concurrently when every call in it is
+    /// read-only. Rounds containing writes, approvals, or control tools
+    /// always run sequentially regardless.
+    #[serde(default = "default_parallel_tools")]
+    pub parallel_tools: bool,
     /// How many times a failed provider request is retried (with
     /// exponential backoff) before the turn errors. Covers network
     /// failures, 408/429/5xx responses, and interrupted streams.
@@ -130,6 +135,7 @@ impl Default for Settings {
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
             auto_compact_threshold: default_auto_compact_threshold(),
+            parallel_tools: default_parallel_tools(),
             provider_retries: default_provider_retries(),
             request_timeout_secs: default_timeout(),
             shell_timeout_secs: default_shell_timeout(),
@@ -168,6 +174,9 @@ fn default_auto_compact_threshold() -> f64 {
 }
 fn default_provider_retries() -> u32 {
     3
+}
+fn default_parallel_tools() -> bool {
+    true
 }
 fn default_timeout() -> u64 {
     600

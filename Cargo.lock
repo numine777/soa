@@ -1589,6 +1589,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "futures-util",
  "http",
  "ratatui",
  "regex",

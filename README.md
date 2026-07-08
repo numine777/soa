@@ -72,7 +72,7 @@ Slash commands:
 | `/clear` | Drop all conversation context. |
 | `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
-| `/rewind` | Restore every file the session touched to its state before the first change. Each restore is recorded as a `rewind` diff entry, so a rewind can be undone (re-applied forward) from the diff viewer. |
+| `/rewind` | Open the checkpoint picker: every turn-starting message is a rewind target (newest first, plus a session-start row). Selecting one restores every file touched afterwards to its state at that moment, truncates the conversation back to before the message, and puts the message text back in the input for editing. File restores are recorded as `rewind` diff entries, so a rewind can be re-applied forward from the diff viewer. Compaction and `/clear` rewrite the history, so checkpoints from before them are dropped. |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
 | `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
 | `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
@@ -187,6 +187,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `context_files` | `["SOA.md"]` | project-instruction files, each discovered by walking up from the working directory and sourced into every system prompt in the listed order (see below) |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
+| `parallel_tools` | true | when a model emits several tool calls in one round and every one is read-only, dispatch them concurrently. Rounds containing writes, approval-gated calls, or `reprompt_stage` always run sequentially. Results are recorded in call order either way. |
 | `provider_retries` | 3 | how many times a failed provider request is retried with exponential backoff (500ms doubling, capped at 10s; a `Retry-After` header is honored). Covers network failures, 408/429/5xx responses, and interrupted streams; other errors fail immediately. 0 disables. |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls (per attempt) |
 

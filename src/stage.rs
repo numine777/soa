@@ -320,6 +320,21 @@ impl<'a> CallPolicy<'a> {
     }
 }
 
+/// True when a round's tool calls may dispatch concurrently: several
+/// calls, every one resolving to a read-only tool. Writes could conflict,
+/// approval prompts must stay sequential, and control tools
+/// (`reprompt_stage`) or unknown names take the sequential path, which
+/// knows how to answer them.
+pub fn parallel_round(
+    enabled: bool,
+    calls: &[crate::provider::ToolCall],
+    read_only_of: impl Fn(&str) -> Option<bool>,
+) -> bool {
+    enabled
+        && calls.len() > 1
+        && calls.iter().all(|call| read_only_of(&call.function.name) == Some(true))
+}
+
 /// How a call is presented to the approver and matched against patterns.
 pub struct CallDescriptor {
     pub descriptor: String,
@@ -622,6 +637,46 @@ pub fn run_agent<'a>(
                 tool_calls: Some(reply.tool_calls),
             });
 
+            if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
+                bindings.get(name).map(|t| t.read_only)
+            }) {
+                tracing::info!(agent = %agent_name, calls = tool_calls.len(), "parallel tool round");
+                let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
+                    let tool = bindings[call.function.name.as_str()];
+                    let policy = CallPolicy::for_tool(
+                        agent.require_approval,
+                        &agent.auto_approve,
+                        approvals,
+                        tool.read_only,
+                    );
+                    async move {
+                        tracing::info!(
+                            agent = %agent_name, tool = %call.function.name,
+                            args = %truncate(&call.function.arguments, 200),
+                            "agent tool call"
+                        );
+                        dispatch_tool_call(
+                            &tool.binding,
+                            &call.function.arguments,
+                            config,
+                            mcp,
+                            http,
+                            depth,
+                            &policy,
+                        )
+                        .await
+                    }
+                }))
+                .await;
+                for (call, output) in tool_calls.iter().zip(outputs) {
+                    messages.push(ChatMessage::Tool {
+                        content: output?,
+                        tool_call_id: call.id.clone(),
+                    });
+                }
+                continue;
+            }
+
             for call in tool_calls {
                 tracing::info!(
                     agent = %agent_name, tool = %call.function.name,
@@ -804,6 +859,46 @@ pub async fn run_stage(
             content: reply.content,
             tool_calls: Some(reply.tool_calls),
         });
+
+        if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
+            bindings.get(name).map(|t| t.read_only)
+        }) {
+            tracing::info!(stage = %stage.name, calls = tool_calls.len(), "parallel tool round");
+            let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
+                let tool = bindings[call.function.name.as_str()];
+                let policy = CallPolicy::for_tool(
+                    stage.require_approval,
+                    &stage.auto_approve,
+                    approvals,
+                    tool.read_only,
+                );
+                async move {
+                    tracing::info!(
+                        stage = %stage.name, tool = %call.function.name,
+                        args = %truncate(&call.function.arguments, 200),
+                        "tool call"
+                    );
+                    dispatch_tool_call(
+                        &tool.binding,
+                        &call.function.arguments,
+                        config,
+                        mcp,
+                        http,
+                        0,
+                        &policy,
+                    )
+                    .await
+                }
+            }))
+            .await;
+            for (call, output) in tool_calls.iter().zip(outputs) {
+                messages.push(ChatMessage::Tool {
+                    content: output?,
+                    tool_call_id: call.id.clone(),
+                });
+            }
+            continue;
+        }
 
         for call in tool_calls {
             tracing::info!(
@@ -1000,6 +1095,27 @@ mod tests {
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
         let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
         assert!(at_cap.is_empty());
+    }
+
+    #[test]
+    fn parallel_round_requires_all_read_only() {
+        let call = |name: &str| crate::provider::ToolCall {
+            id: "x".into(),
+            kind: "function".into(),
+            function: crate::provider::FunctionCall { name: name.into(), arguments: "{}".into() },
+        };
+        let read_only = |name: &str| match name {
+            "read" => Some(true),
+            "write" => Some(false),
+            _ => None,
+        };
+        let reads = [call("read"), call("read")];
+        assert!(parallel_round(true, &reads, read_only));
+        // Disabled by config, single call, any write, or any unknown tool.
+        assert!(!parallel_round(false, &reads, read_only));
+        assert!(!parallel_round(true, &reads[..1], read_only));
+        assert!(!parallel_round(true, &[call("read"), call("write")], read_only));
+        assert!(!parallel_round(true, &[call("read"), call("reprompt_stage")], read_only));
     }
 
     #[test]

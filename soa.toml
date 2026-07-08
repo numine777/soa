@@ -18,6 +18,9 @@ max_tool_output_chars = 30000
 # older tool results. 0 disables; only applies to models that declare
 # `context_tokens`.
 auto_compact_threshold = 0.8
+# All-read-only tool rounds dispatch concurrently (writes and approvals
+# always stay sequential). Set false to serialize everything.
+parallel_tools = true
 # Transient provider failures (network errors, 408/429/5xx, interrupted
 # streams) are retried this many times with exponential backoff before a
 # turn errors — local servers restart and swap models often. 0 disables.

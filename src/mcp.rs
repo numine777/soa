@@ -17,7 +17,12 @@ pub struct McpConnection {
     /// on the next tool call.
     server_config: McpServer,
     quiet: bool,
-    service: tokio::sync::Mutex<RunningService<RoleClient, ()>>,
+    /// RwLock so concurrent tool calls proceed in parallel (read);
+    /// reconnecting swaps the service exclusively (write).
+    service: tokio::sync::RwLock<RunningService<RoleClient, ()>>,
+    /// Bumped on every reconnect, so concurrent failures don't each
+    /// respawn the server.
+    generation: std::sync::atomic::AtomicU64,
     pub tools: Vec<Tool>,
     readonly_overrides: HashSet<String>,
 }
@@ -36,7 +41,8 @@ impl McpConnection {
             name: name.to_string(),
             server_config: config.clone(),
             quiet,
-            service: tokio::sync::Mutex::new(service),
+            service: tokio::sync::RwLock::new(service),
+            generation: std::sync::atomic::AtomicU64::new(0),
             tools,
             readonly_overrides: config.readonly_tools().iter().cloned().collect(),
         })
@@ -108,6 +114,7 @@ impl McpConnection {
     /// A protocol-level failure (typically a crashed stdio server) triggers
     /// one transparent reconnect-and-retry before giving up.
     pub async fn call(&self, tool_name: &str, arguments: JsonObject) -> Result<String> {
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
         let result = match self.try_call(tool_name, arguments.clone()).await {
             Ok(result) => result,
             Err(e) => {
@@ -115,7 +122,7 @@ impl McpConnection {
                     server = %self.name, tool = %tool_name, error = format!("{e:#}"),
                     "mcp call failed; reconnecting and retrying"
                 );
-                self.reconnect().await.with_context(|| {
+                self.reconnect(generation).await.with_context(|| {
                     format!("mcp `{}`: reconnect after failed call also failed", self.name)
                 })?;
                 self.try_call(tool_name, arguments).await.with_context(|| {
@@ -149,7 +156,7 @@ impl McpConnection {
         tool_name: &str,
         arguments: JsonObject,
     ) -> Result<rmcp::model::CallToolResult> {
-        let service = self.service.lock().await;
+        let service = self.service.read().await;
         service
             .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
             .await
@@ -157,11 +164,18 @@ impl McpConnection {
     }
 
     /// Replace the dead service with a freshly connected one (respawning
-    /// the process for stdio servers).
-    async fn reconnect(&self) -> Result<()> {
+    /// the process for stdio servers). `observed` is the generation the
+    /// caller saw before its call failed: when several concurrent calls
+    /// fail together, only the first respawns and the rest reuse it.
+    async fn reconnect(&self, observed: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut service = self.service.write().await;
+        if self.generation.load(Ordering::Acquire) != observed {
+            return Ok(()); // another caller already reconnected
+        }
         let fresh = Self::establish(&self.name, &self.server_config, self.quiet).await?;
-        let mut service = self.service.lock().await;
         let dead = std::mem::replace(&mut *service, fresh);
+        self.generation.fetch_add(1, Ordering::Release);
         drop(service);
         let _ = dead.cancel().await; // reap the old child, ignore its state
         tracing::info!(server = %self.name, "mcp server reconnected");

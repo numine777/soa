@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use super::completion::{self, Completion};
-use super::store::{self, PromptHistory, Session};
+use super::store::{self, Checkpoint, PromptHistory, Session};
 use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
@@ -61,6 +61,9 @@ pub enum View {
     Diffs { selected: usize, scroll: usize },
     /// Session picker over `App::session_list`.
     Sessions { selected: usize, scroll: usize },
+    /// Rewind picker over `App::checkpoints` (newest first, plus a
+    /// session-start row at the bottom).
+    Rewind { selected: usize, scroll: usize },
 }
 
 pub struct App {
@@ -73,6 +76,9 @@ pub struct App {
     pub history: Vec<ChatMessage>,
     pub transcript: Vec<TranscriptItem>,
     pub diffs: Vec<DiffEntry>,
+    /// Rewind targets: one per turn-starting user message, invalidated by
+    /// compaction and `/clear` (both rewrite the history they index into).
+    pub checkpoints: Vec<Checkpoint>,
     pub view: View,
     pub input: TextArea<'static>,
     /// 0 = pinned to the bottom (auto-follow); larger = scrolled up.
@@ -158,6 +164,7 @@ impl App {
             history: Vec::new(),
             transcript: Vec::new(),
             diffs: Vec::new(),
+            checkpoints: Vec::new(),
             view: View::Chat,
             input: new_textarea(),
             scroll_from_bottom: 0,
@@ -222,6 +229,7 @@ impl App {
         self.history = session.history;
         self.transcript = session.transcript;
         self.diffs = session.diffs;
+        self.checkpoints = session.checkpoints;
         self.session_id = session.id;
         self.started_at = session.started_at;
         self.has_activity = true;
@@ -255,6 +263,7 @@ impl App {
             history: self.history.clone(),
             transcript: self.transcript.clone(),
             diffs: self.diffs.clone(),
+            checkpoints: self.checkpoints.clone(),
         };
         if let Err(e) = store::save_session(&session) {
             self.has_activity = false; // avoid an error loop
@@ -469,6 +478,7 @@ impl App {
         match self.view {
             View::Diffs { .. } => self.on_diff_key(key),
             View::Sessions { .. } => self.on_sessions_key(key),
+            View::Rewind { .. } => self.on_rewind_key(key),
             View::Chat => self.on_chat_key(key),
         }
     }
@@ -552,6 +562,7 @@ impl App {
         self.history.clear();
         self.transcript.clear();
         self.diffs.clear();
+        self.checkpoints.clear();
         self.session_id = store::new_session_id();
         self.started_at = store::now_epoch();
         self.has_activity = false;
@@ -766,6 +777,13 @@ impl App {
                 // rows = sessions + the new-session row at index 0
                 *selected = (*selected + 1).min(self.session_list.len());
             }
+            (View::Rewind { selected, .. }, MouseEventKind::ScrollUp) => {
+                *selected = selected.saturating_sub(1);
+            }
+            (View::Rewind { selected, .. }, MouseEventKind::ScrollDown) => {
+                // rows = checkpoints + the session-start row at the bottom
+                *selected = (*selected + 1).min(self.checkpoints.len());
+            }
             _ => {}
         }
     }
@@ -782,7 +800,7 @@ impl App {
     fn toggle_diff_view(&mut self) {
         match self.view {
             View::Diffs { .. } => self.view = View::Chat,
-            View::Sessions { .. } => {} // don't stack modal views
+            View::Sessions { .. } | View::Rewind { .. } => {} // don't stack modal views
             View::Chat if self.diffs.is_empty() => {
                 self.info("no file changes captured yet");
             }
@@ -814,6 +832,17 @@ impl App {
         self.remember_prompt(&text);
         self.has_activity = true;
         self.input = new_textarea();
+
+        // A turn-starting message is a rewind target: record where the
+        // transcript, history, and diff log stand right now. (Steered
+        // messages are not checkpoints — they land mid-turn.)
+        if !self.is_running() {
+            self.checkpoints.push(Checkpoint {
+                transcript_index: self.transcript.len(),
+                history_len: self.history.len(),
+                diff_len: self.diffs.len(),
+            });
+        }
 
         // @file mentions: the transcript keeps what was typed; the model
         // receives the message with file contents appended.
@@ -858,7 +887,7 @@ impl App {
                  /clear          drop all conversation context\n\
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
-                 /rewind         restore every touched file to its session-start state\n\
+                 /rewind         pick a past message to rewind to (conversation + files)\n\
                  /stage <name>   switch the active stage\n\
                  /model <name>   override the model for this session (/model default reverts)\n\
                  /reload         re-read the config file (MCP changes need a restart)\n\
@@ -881,6 +910,7 @@ impl App {
                 }
                 let freed = self.token_estimate();
                 self.history.clear();
+                self.checkpoints.clear(); // their history indexes are gone
                 self.last_usage = None;
                 self.info(format!("context cleared (freed ~{})", fmt_tokens(freed as u64)));
             }
@@ -898,7 +928,7 @@ impl App {
                 ));
             }
             "diff" => self.toggle_diff_view(),
-            "rewind" => self.rewind_all(),
+            "rewind" => self.open_rewind(),
             "stage" => self.switch_stage(arg),
             "model" => self.switch_model(arg),
             "reload" => self.reload_config(),
@@ -1219,24 +1249,65 @@ impl App {
         }
     }
 
-    /// `/rewind`: return every touched file to its earliest recorded state
-    /// (how it looked before this session first changed it). Each restore
-    /// is captured as a `rewind` diff entry, so a rewind can be re-applied
-    /// forward from the diff viewer if it went too far.
-    fn rewind_all(&mut self) {
+    /// `/rewind`: open the checkpoint picker (newest message first, plus a
+    /// session-start row).
+    fn open_rewind(&mut self) {
         if self.is_running() {
             return self.error("cannot rewind while a turn is running (Esc to cancel it first)");
         }
-        // The earliest restorable entry per path is the session-start state.
-        let mut targets: Vec<DiffEntry> = Vec::new();
-        for entry in &self.diffs {
-            if entry.restorable() && !targets.iter().any(|t| t.path == entry.path) {
-                targets.push(entry.clone());
+        if self.checkpoints.is_empty() && self.diffs.iter().all(|d| !d.restorable()) {
+            return self.info(
+                "nothing to rewind — no checkpoints this session and no restorable file changes",
+            );
+        }
+        self.view = View::Rewind { selected: 0, scroll: 0 };
+    }
+
+    fn on_rewind_key(&mut self, key: KeyEvent) {
+        let View::Rewind { selected, .. } = &mut self.view else { return };
+        let current = *selected;
+        let last = self.checkpoints.len(); // rows = checkpoints + session-start row
+        let select = |view: &mut View, index: usize| {
+            if let View::Rewind { selected, .. } = view {
+                *selected = index;
             }
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
+            KeyCode::Up | KeyCode::Char('k') => select(&mut self.view, current.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => select(&mut self.view, (current + 1).min(last)),
+            KeyCode::Home | KeyCode::Char('g') => select(&mut self.view, 0),
+            KeyCode::End | KeyCode::Char('G') => select(&mut self.view, last),
+            KeyCode::Enter => {
+                // Row k in 0..len is the (len-1-k)-th checkpoint (newest
+                // first); the last row is session start.
+                let target = self.checkpoints.len().checked_sub(current + 1);
+                self.rewind_to(target);
+            }
+            _ => {}
         }
-        if targets.is_empty() {
-            return self.info("nothing to rewind — no restorable file changes recorded");
+    }
+
+    /// Rewind to a checkpoint (`None` = session start): restore every file
+    /// touched afterwards to its state at that moment, truncate the
+    /// conversation, and put the rewound message back into the input.
+    /// File restores are recorded as `rewind` diff entries, so a rewind
+    /// that went too far can be re-applied forward from the diff viewer.
+    fn rewind_to(&mut self, index: Option<usize>) {
+        self.view = View::Chat;
+        if self.is_running() {
+            return self.error("cannot rewind while a turn is running (Esc to cancel it first)");
         }
+        let checkpoint = match index {
+            Some(i) => match self.checkpoints.get(i) {
+                Some(checkpoint) => *checkpoint,
+                None => return,
+            },
+            None => Checkpoint { transcript_index: 0, history_len: 0, diff_len: 0 },
+        };
+
+        // Files first: undo everything recorded at or after the checkpoint.
+        let targets = diff::earliest_restorable_since(&self.diffs, checkpoint.diff_len);
         let (mut restored, mut errors) = (Vec::new(), Vec::new());
         for entry in targets {
             match diff::restore(&entry) {
@@ -1244,23 +1315,42 @@ impl App {
                     restored.push(entry.path.clone());
                     self.diffs.push(reverse);
                 }
-                Ok(None) => {} // already at the session-start state
+                Ok(None) => {} // already at the checkpoint state
                 Err(message) => errors.push(message),
             }
         }
         for message in errors {
             self.error(message);
         }
-        if restored.is_empty() {
-            self.info("nothing to rewind — all files already match their session-start state");
-        } else {
-            self.info(format!(
-                "rewound {} file(s) to their session-start state:\n  {}\nCtrl+G shows the rewind entries (select one and press r to re-apply forward)",
-                restored.len(),
-                restored.join("\n  "),
-            ));
-            self.persist();
+
+        // Then the conversation: drop the rewound message and everything
+        // after it, and hand the message text back for editing.
+        let message = match self.transcript.get(checkpoint.transcript_index) {
+            Some(TranscriptItem::User(text)) => Some(text.clone()),
+            _ => None,
+        };
+        self.transcript.truncate(checkpoint.transcript_index);
+        self.history.truncate(checkpoint.history_len);
+        self.checkpoints.truncate(index.unwrap_or(0));
+        self.last_usage = None;
+        self.scroll_from_bottom = 0;
+        if let Some(text) = &message {
+            self.set_input_text(text);
         }
+
+        self.info(format!(
+            "rewound to {}{}{}",
+            match index {
+                Some(_) => "before the selected message",
+                None => "the start of the session",
+            },
+            match restored.len() {
+                0 => String::new(),
+                n => format!(" — restored {n} file(s): {}", restored.join(", ")),
+            },
+            if message.is_some() { " (the message is back in the input)" } else { "" },
+        ));
+        self.persist();
     }
 
     /// A failed or cancelled turn discards the worker's history clone, and
@@ -1352,6 +1442,8 @@ impl App {
             }
             AgentEvent::Compacted { summary } => {
                 let before = self.token_estimate();
+                // Checkpoints index into the history being replaced.
+                self.checkpoints.clear();
                 self.history = vec![
                     ChatMessage::User {
                         content: format!(
@@ -1453,6 +1545,63 @@ async fn turn_worker(
             content: reply.content,
             tool_calls: Some(reply.tool_calls),
         });
+
+        // An all-read-only round dispatches concurrently; results are
+        // reported and recorded in call order either way.
+        if crate::stage::parallel_round(config.settings.parallel_tools, &calls, |name| {
+            bindings.get(name).map(|(_, read_only)| *read_only)
+        }) {
+            for call in &calls {
+                let _ = tx.send(AgentEvent::ToolCall {
+                    name: call.function.name.clone(),
+                    args: call.function.arguments.clone(),
+                });
+            }
+            let (config, mcp, http) = (&config, &mcp, &http);
+            let outputs = futures_util::future::join_all(calls.iter().map(|call| {
+                let (binding, read_only) = &bindings[&call.function.name];
+                let policy =
+                    CallPolicy::for_tool(require_approval, &auto_approve, &approvals, *read_only);
+                async move {
+                    match dispatch_tool_call(
+                        binding,
+                        &call.function.arguments,
+                        config,
+                        mcp,
+                        http,
+                        0,
+                        &policy,
+                    )
+                    .await
+                    {
+                        Ok(output) => output,
+                        Err(e) => format!("ERROR: {e:#}"),
+                    }
+                }
+            }))
+            .await;
+            for (call, output) in calls.iter().zip(outputs) {
+                let preview: String =
+                    output.lines().next().unwrap_or("").chars().take(100).collect();
+                let _ = tx.send(AgentEvent::ToolDone { preview });
+                history.push(ChatMessage::Tool {
+                    content: output,
+                    tool_call_id: call.id.clone(),
+                });
+            }
+            // Steering: deliver messages typed during the parallel round.
+            let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
+            if !steered.is_empty() {
+                let _ = tx.send(AgentEvent::Notice(format!(
+                    "↪ delivered {} queued message(s) to the model",
+                    steered.len()
+                )));
+                for content in steered {
+                    history.push(ChatMessage::User { content });
+                }
+            }
+            continue;
+        }
 
         for call in calls {
             let name = call.function.name.clone();

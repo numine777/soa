@@ -332,7 +332,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
     }
     spans.push(Span::styled(
-        format!("  {} · {} · {} tool(s) · ", stage.name, stage.model, app.tool_count),
+        format!("  {} · {} · {} tool(s) · ", stage.name, app.active_model(), app.tool_count),
         dim,
     ));
     let (context_text, pressure) = app.context_status();

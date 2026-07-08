@@ -13,8 +13,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("clear", "drop all conversation context"),
     ("compact", "summarize the conversation and shrink context"),
     ("diff", "open the diff viewer"),
+    ("export", "write the transcript to a markdown file"),
     ("help", "list commands and keys"),
+    ("model", "override the model for this session"),
     ("quit", "exit"),
+    ("reload", "re-read the config file"),
     ("sessions", "open the session picker"),
     ("stage", "switch the active stage"),
     ("usage", "cumulative token usage per model"),
@@ -51,6 +54,7 @@ pub fn compute(
     first_line: bool,
     cwd: &Path,
     stage_names: &[String],
+    model_names: &[String],
 ) -> Option<Completion> {
     let chars: Vec<char> = line.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -71,22 +75,30 @@ pub fn compute(
                 .collect();
             return build(items, 1);
         }
-        // `/stage <partial>`: complete stage names.
-        if let Some(partial) = token.strip_prefix("stage ")
-            && !partial.contains(' ')
-        {
-            let items = stage_names
-                .iter()
-                .filter(|name| name.starts_with(partial))
-                .map(|name| Item {
-                    label: name.clone(),
-                    detail: String::new(),
-                    insert: name.clone(),
-                })
-                .collect();
-            return build(items, cursor - partial.chars().count());
+        // `/stage <partial>` and `/model <partial>`: complete the argument.
+        let (partial, candidates): (&str, Vec<&str>) =
+            if let Some(partial) = token.strip_prefix("stage ") {
+                (partial, stage_names.iter().map(String::as_str).collect())
+            } else if let Some(partial) = token.strip_prefix("model ") {
+                let mut names: Vec<&str> = model_names.iter().map(String::as_str).collect();
+                names.push("default");
+                (partial, names)
+            } else {
+                return None;
+            };
+        if partial.contains(' ') {
+            return None;
         }
-        return None;
+        let items = candidates
+            .into_iter()
+            .filter(|name| name.starts_with(partial))
+            .map(|name| Item {
+                label: name.to_string(),
+                detail: String::new(),
+                insert: name.to_string(),
+            })
+            .collect();
+        return build(items, cursor - partial.chars().count());
     }
 
     // `@path` mentions anywhere in the input.
@@ -169,7 +181,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn compute_at(line: &str, cwd: &Path) -> Option<Completion> {
-        compute(line, line.chars().count(), true, cwd, &["research".into(), "review".into()])
+        compute(
+            line,
+            line.chars().count(),
+            true,
+            cwd,
+            &["research".into(), "review".into()],
+            &["planner".into(), "coder".into()],
+        )
     }
 
     #[test]
@@ -195,9 +214,16 @@ mod tests {
         );
         assert_eq!(c.replace_from, "/stage ".len());
 
+        // `/model` completes model names plus the `default` reset.
+        let c = compute_at("/model ", &cwd).unwrap();
+        assert_eq!(
+            c.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            vec!["planner", "coder", "default"]
+        );
+
         // Unknown prefixes and non-first lines don't pop up.
         assert!(compute_at("/zzz", &cwd).is_none());
-        assert!(compute("/c", 2, false, &cwd, &[]).is_none());
+        assert!(compute("/c", 2, false, &cwd, &[], &[]).is_none());
         // Other commands take no arguments.
         assert!(compute_at("/help me", &cwd).is_none());
     }

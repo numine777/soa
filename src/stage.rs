@@ -63,6 +63,8 @@ pub enum ToolBinding {
     /// Run the call's `command` with `sh -c`, restricted to the owning
     /// context's allowlist patterns (empty = unrestricted).
     Shell { allow: Vec<String> },
+    /// A built-in file tool, rooted at the working directory.
+    File { op: crate::files::FileOp },
 }
 
 pub struct StageTool {
@@ -83,6 +85,7 @@ pub struct ToolProfile<'a> {
     pub subagents: &'a [String],
     pub shell: bool,
     pub shell_allow: &'a [String],
+    pub files: bool,
 }
 
 impl crate::config::Stage {
@@ -95,6 +98,7 @@ impl crate::config::Stage {
             subagents: &self.subagents,
             shell: self.shell,
             shell_allow: &self.shell_allow,
+            files: self.files,
         }
     }
 }
@@ -109,6 +113,7 @@ impl crate::config::Agent {
             subagents: &self.subagents,
             shell: self.shell,
             shell_allow: &self.shell_allow,
+            files: self.files,
         }
     }
 }
@@ -221,6 +226,20 @@ pub fn assemble_tools(
             binding: ToolBinding::Shell { allow: profile.shell_allow.to_vec() },
             read_only: false,
         });
+    }
+
+    // `files = true` exposes the built-in file tools; the mode decides
+    // whether the write tools are included.
+    if profile.files {
+        for (definition, op, read_only) in
+            crate::files::definitions(profile.mode == Mode::ReadWrite)
+        {
+            stage_tools.push(StageTool {
+                definition,
+                binding: ToolBinding::File { op },
+                read_only,
+            });
+        }
     }
 
     if depth < config.settings.max_agent_depth {
@@ -341,6 +360,14 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
                 descriptor: format!("agent__{agent}"),
                 detail: truncate(task, 200),
                 always_pattern: format!("agent__{agent}"),
+            }
+        }
+        ToolBinding::File { op } => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
+            CallDescriptor {
+                descriptor: format!("{} {}", op.tool_name(), truncate(path, 160)),
+                detail: truncate(arguments_json, 200),
+                always_pattern: format!("{} *", op.tool_name()),
             }
         }
     }
@@ -503,6 +530,10 @@ async fn dispatch_tool_call_inner(
                 std::time::Duration::from_secs(config.settings.shell_timeout_secs),
             )
             .await)
+        }
+        ToolBinding::File { op } => {
+            tracing::info!(tool = op.tool_name(), args = %truncate(arguments_json, 200), "file tool");
+            Ok(crate::files::dispatch(*op, &arguments))
         }
     }
 }
@@ -958,6 +989,50 @@ mod tests {
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
         let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
         assert!(at_cap.is_empty());
+    }
+
+    #[test]
+    fn file_tools_gated_by_mode() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "reader"
+            model = "m"
+            files = true
+
+            [[stage]]
+            name = "writer"
+            model = "m"
+            mode = "read_write"
+            files = true
+
+            [[stage]]
+            name = "none"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let mcp = McpManager::default();
+        let names = |index: usize| -> Vec<String> {
+            assemble_tools(&config.stages[index].tool_profile(), &config, &mcp, 0)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.definition.name)
+                .collect()
+        };
+        assert_eq!(names(0), vec!["read_file", "list_dir", "glob", "grep"]);
+        assert_eq!(
+            names(1),
+            vec!["read_file", "list_dir", "glob", "grep", "write_file", "edit_file"]
+        );
+        assert!(names(2).is_empty());
     }
 
     #[test]

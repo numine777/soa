@@ -32,6 +32,7 @@ use app::App;
 
 pub async fn run(
     config: Config,
+    config_path: std::path::PathBuf,
     stage_name: Option<&str>,
     mouse: bool,
     resume: Option<&str>,
@@ -80,6 +81,7 @@ pub async fn run(
     let approvals = Arc::new(crate::approval::Approvals::new(approval_tx));
     let mut app = App::new(
         Arc::new(config),
+        config_path,
         Arc::clone(&mcp),
         stage_index,
         agent_tx,

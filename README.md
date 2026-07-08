@@ -73,6 +73,9 @@ Slash commands:
 | `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
+| `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
+| `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
+| `/export [path]` | Write the transcript to a markdown file (default `soa-session-<id>.md`); refuses to overwrite. |
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
 
@@ -247,6 +250,7 @@ name = "research"
 model = "planner"            # key into [models]
 mode = "read_only"           # or "read_write" (default: read_only)
 mcp = ["filesystem"]         # keys into [mcp]
+files = true                 # built-in file tools (see "File tools")
 web_search = true            # expose the SearXNG web_search tool
 system_prompt = "..."        # or system_prompt_file = "prompts/research.md"
 prompt = "{{input}}"         # user-message template (see below)
@@ -261,11 +265,37 @@ earlier stage. If `prompt` is omitted, the first stage gets `{{input}}` and
 later stages get the task plus the previous stage's output. References to
 unknown variables or not-yet-run stages are rejected at config load.
 
+**Resilience.** If an MCP server dies mid-session (a crashed stdio process,
+a restarted HTTP endpoint), the next tool call reconnects — respawning the
+process for stdio servers — and retries once before reporting an error.
+
 **Modes.** In `read_write` mode a stage sees every tool from its MCP
 servers. In `read_only` mode a tool is only exposed if the server annotates
 it with `readOnlyHint = true` **or** you list it in that server's
 `readonly_tools`. Run `soa tools` to see how each tool is classified.
 MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
+
+## File tools
+
+Stages and agents opt into built-in file tools with `files = true`:
+
+```toml
+[[stage]]
+name = "implement"
+mode = "read_write"
+files = true
+```
+
+`read_file` (with optional line windows), `list_dir`, `glob`, and `grep`
+(regex, `path:line:` output) are always included; `write_file` and
+`edit_file` only in `read_write` mode. `edit_file` replaces an exact
+string and insists on a unique match — far more reliable for small local
+models than whole-file rewrites. Everything is rooted at the working
+directory (paths that escape it are rejected), `glob`/`grep` skip `.git`,
+`node_modules`, `target`, and hidden entries, and results are capped so
+one call can't flood the context. Writes participate in approvals
+(`require_approval`, patterns like `edit_file *`) and chat diff capture
+like any other mutating tool. No MCP filesystem server required.
 
 ## Shell tool
 

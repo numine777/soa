@@ -123,6 +123,10 @@ approach. Do not make any changes.
 name = "implement"
 model = "coder"
 mode = "read_write"
+# Built-in file tools rooted at the working directory: read_file, list_dir,
+# glob, grep, plus write_file and edit_file in read_write mode. No MCP
+# server needed for file access.
+files = true
 mcp = ["filesystem"]
 subagents = ["researcher"]
 skills = ["careful-editing"]     # from skills/ next to this file (settings.skills_dir)

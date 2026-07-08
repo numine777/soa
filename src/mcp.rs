@@ -13,7 +13,11 @@ use crate::config::McpServer;
 
 pub struct McpConnection {
     pub name: String,
-    service: RunningService<RoleClient, ()>,
+    /// Kept for respawning: a crashed server is reconnected transparently
+    /// on the next tool call.
+    server_config: McpServer,
+    quiet: bool,
+    service: tokio::sync::Mutex<RunningService<RoleClient, ()>>,
     pub tools: Vec<Tool>,
     readonly_overrides: HashSet<String>,
 }
@@ -22,6 +26,27 @@ impl McpConnection {
     /// `quiet` discards spawned servers' stderr instead of inheriting it —
     /// required in TUI mode, where stray writes would corrupt the display.
     pub async fn connect(name: &str, config: &McpServer, quiet: bool) -> Result<McpConnection> {
+        let service = Self::establish(name, config, quiet).await?;
+        let tools = service
+            .list_all_tools()
+            .await
+            .with_context(|| format!("mcp `{name}`: tools/list failed"))?;
+
+        Ok(McpConnection {
+            name: name.to_string(),
+            server_config: config.clone(),
+            quiet,
+            service: tokio::sync::Mutex::new(service),
+            tools,
+            readonly_overrides: config.readonly_tools().iter().cloned().collect(),
+        })
+    }
+
+    async fn establish(
+        name: &str,
+        config: &McpServer,
+        quiet: bool,
+    ) -> Result<RunningService<RoleClient, ()>> {
         let service = match config {
             McpServer::Stdio { command, args, env, .. } => {
                 let mut cmd = tokio::process::Command::new(command);
@@ -65,18 +90,7 @@ impl McpConnection {
                     .with_context(|| format!("mcp `{name}`: initialize handshake failed for {url}"))?
             }
         };
-
-        let tools = service
-            .list_all_tools()
-            .await
-            .with_context(|| format!("mcp `{name}`: tools/list failed"))?;
-
-        Ok(McpConnection {
-            name: name.to_string(),
-            service,
-            tools,
-            readonly_overrides: config.readonly_tools().iter().cloned().collect(),
-        })
+        Ok(service)
     }
 
     /// A tool is read-only if the server annotates it `readOnlyHint = true`
@@ -91,12 +105,24 @@ impl McpConnection {
 
     /// Call a tool and flatten the result to text for the model.
     /// Tool-level failures are returned as `Ok` text so the model can react.
+    /// A protocol-level failure (typically a crashed stdio server) triggers
+    /// one transparent reconnect-and-retry before giving up.
     pub async fn call(&self, tool_name: &str, arguments: JsonObject) -> Result<String> {
-        let result = self
-            .service
-            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
-            .await
-            .with_context(|| format!("mcp `{}`: call to `{tool_name}` failed", self.name))?;
+        let result = match self.try_call(tool_name, arguments.clone()).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    server = %self.name, tool = %tool_name, error = format!("{e:#}"),
+                    "mcp call failed; reconnecting and retrying"
+                );
+                self.reconnect().await.with_context(|| {
+                    format!("mcp `{}`: reconnect after failed call also failed", self.name)
+                })?;
+                self.try_call(tool_name, arguments).await.with_context(|| {
+                    format!("mcp `{}`: `{tool_name}` failed again after reconnect", self.name)
+                })?
+            }
+        };
 
         let mut text: String = result
             .content
@@ -118,8 +144,32 @@ impl McpConnection {
         Ok(text)
     }
 
+    async fn try_call(
+        &self,
+        tool_name: &str,
+        arguments: JsonObject,
+    ) -> Result<rmcp::model::CallToolResult> {
+        let service = self.service.lock().await;
+        service
+            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
+            .await
+            .with_context(|| format!("mcp `{}`: call to `{tool_name}` failed", self.name))
+    }
+
+    /// Replace the dead service with a freshly connected one (respawning
+    /// the process for stdio servers).
+    async fn reconnect(&self) -> Result<()> {
+        let fresh = Self::establish(&self.name, &self.server_config, self.quiet).await?;
+        let mut service = self.service.lock().await;
+        let dead = std::mem::replace(&mut *service, fresh);
+        drop(service);
+        let _ = dead.cancel().await; // reap the old child, ignore its state
+        tracing::info!(server = %self.name, "mcp server reconnected");
+        Ok(())
+    }
+
     pub async fn shutdown(self) {
-        let _ = self.service.cancel().await;
+        let _ = self.service.into_inner().cancel().await;
     }
 }
 

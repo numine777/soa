@@ -206,7 +206,7 @@ pub struct Model {
     pub context_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
 pub enum McpServer {
     /// Spawn a local process speaking MCP over stdio.
@@ -281,6 +281,10 @@ pub struct Agent {
     /// Restrict shell commands to these `*`-wildcard patterns.
     #[serde(default)]
     pub shell_allow: Vec<String>,
+    /// Offer the built-in file tools, rooted at the working directory
+    /// (write tools only in read_write mode).
+    #[serde(default)]
+    pub files: bool,
     /// Pause non-read-only tool calls for interactive approval.
     #[serde(default)]
     pub require_approval: bool,
@@ -375,6 +379,11 @@ pub struct Stage {
     /// (e.g. `["cargo *", "git status"]`). Empty = unrestricted.
     #[serde(default)]
     pub shell_allow: Vec<String>,
+    /// Offer the built-in file tools (read_file, list_dir, glob, grep, and
+    /// — in read_write mode — write_file and edit_file), rooted at the
+    /// working directory.
+    #[serde(default)]
+    pub files: bool,
     /// Pause non-read-only tool calls for interactive approval (y/n/always).
     /// Without an interactive approver (piped runs), gated calls are denied.
     #[serde(default)]

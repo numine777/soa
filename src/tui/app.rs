@@ -1,6 +1,7 @@
 //! Chat TUI state, input handling, and the background agent worker.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::{
@@ -91,6 +92,11 @@ pub struct App {
     /// Autocomplete popup for slash commands and @file mentions,
     /// recomputed after every input keystroke.
     pub completion: Option<Completion>,
+    /// Where the config was loaded from, for `/reload`.
+    config_path: PathBuf,
+    /// Session-level model override (`/model <name>`), applied to every
+    /// stage until cleared with `/model default`.
+    model_override: Option<String>,
     /// Real token usage from the most recent turn, when the server reports
     /// it; None falls back to the character estimate.
     pub last_usage: Option<Usage>,
@@ -133,6 +139,7 @@ fn new_textarea() -> TextArea<'static> {
 impl App {
     pub fn new(
         config: Arc<Config>,
+        config_path: PathBuf,
         mcp: Arc<McpManager>,
         stage_index: usize,
         tx: UnboundedSender<AgentEvent>,
@@ -162,6 +169,8 @@ impl App {
             pending_approval: None,
             approvals,
             completion: None,
+            config_path,
+            model_override: None,
             last_usage: None,
             quit: false,
             turn: None,
@@ -261,12 +270,19 @@ impl App {
         &self.session_id
     }
 
+    /// The model requests actually use: the `/model` override when set,
+    /// otherwise the active stage's model.
+    pub fn active_model(&self) -> &str {
+        self.model_override.as_deref().unwrap_or(&self.stage().model)
+    }
+
     fn stage_summary(&self) -> String {
         let stage = self.stage();
         format!(
-            "stage `{}` · model `{}` · {} · {} tool(s)",
+            "stage `{}` · model `{}`{} · {} · {} tool(s)",
             stage.name,
-            stage.model,
+            self.active_model(),
+            if self.model_override.is_some() { " (override)" } else { "" },
             match stage.mode {
                 Mode::ReadOnly => "read_only",
                 Mode::ReadWrite => "read_write",
@@ -291,7 +307,7 @@ impl App {
     }
 
     pub fn context_capacity(&self) -> Option<u64> {
-        self.config.models.get(&self.stage().model).and_then(|m| m.context_tokens)
+        self.config.models.get(self.active_model()).and_then(|m| m.context_tokens)
     }
 
     /// Status-bar context gauge: text plus a pressure level
@@ -622,12 +638,14 @@ impl App {
         let line = self.input.lines().get(row).cloned().unwrap_or_default();
         let stage_names: Vec<String> =
             self.config.stages.iter().map(|s| s.name.clone()).collect();
+        let model_names: Vec<String> = self.config.models.keys().cloned().collect();
         self.completion = completion::compute(
             &line,
             col,
             row == 0,
             std::path::Path::new(&self.cwd),
             &stage_names,
+            &model_names,
         );
     }
 
@@ -835,6 +853,9 @@ impl App {
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
                  /stage <name>   switch the active stage\n\
+                 /model <name>   override the model for this session (/model default reverts)\n\
+                 /reload         re-read the config file (MCP changes need a restart)\n\
+                 /export [path]  write the transcript to a markdown file\n\
                  /sessions       open the session picker (switch or start new)\n\
                  /quit           exit (Ctrl+D on an empty prompt)\n\
                  mention files with @path (@src/main.rs, @\"has spaces.txt\", @somedir)\n\
@@ -871,8 +892,134 @@ impl App {
             }
             "diff" => self.toggle_diff_view(),
             "stage" => self.switch_stage(arg),
+            "model" => self.switch_model(arg),
+            "reload" => self.reload_config(),
+            "export" => self.export_transcript(arg),
             "quit" | "exit" => self.quit = true,
             other => self.error(format!("unknown command `/{other}` — try /help")),
+        }
+    }
+
+    fn switch_model(&mut self, name: &str) {
+        match name {
+            "" => {
+                let available: Vec<&str> =
+                    self.config.models.keys().map(String::as_str).collect();
+                self.info(format!(
+                    "model: `{}`{} (stage default `{}`)\n\
+                     available: {}\n\
+                     usage: /model <name> · /model default",
+                    self.active_model(),
+                    if self.model_override.is_some() { " (override)" } else { "" },
+                    self.stage().model,
+                    available.join(", "),
+                ));
+            }
+            "default" => {
+                self.model_override = None;
+                self.info(format!(
+                    "model override cleared — using the stage default `{}`",
+                    self.stage().model
+                ));
+            }
+            _ if self.config.models.contains_key(name) => {
+                self.model_override = Some(name.to_string());
+                self.info(format!(
+                    "model set to `{name}` for every stage in this session (/model default reverts)"
+                ));
+            }
+            _ => {
+                let available: Vec<&str> =
+                    self.config.models.keys().map(String::as_str).collect();
+                self.error(format!(
+                    "no model named `{name}` — available: {}",
+                    available.join(", ")
+                ));
+            }
+        }
+    }
+
+    /// Re-read the config file in place: models, stages, prompts, settings,
+    /// and project instructions. MCP topology stays as connected at startup.
+    fn reload_config(&mut self) {
+        if self.is_running() {
+            return self.error("busy — wait for the current turn to finish");
+        }
+        let stage_name = self.stage().name.clone();
+        match Config::load(&self.config_path) {
+            Ok(config) => {
+                self.config = Arc::new(config);
+                self.stage_index = self
+                    .config
+                    .stages
+                    .iter()
+                    .position(|s| s.name == stage_name)
+                    .unwrap_or_else(|| {
+                        self.info(format!(
+                            "stage `{stage_name}` is gone — switched to `{}`",
+                            self.config.stages[0].name
+                        ));
+                        0
+                    });
+                if let Some(model) = &self.model_override
+                    && !self.config.models.contains_key(model)
+                {
+                    self.info(format!("model override `{model}` no longer exists — cleared"));
+                    self.model_override = None;
+                }
+                self.refresh_tool_count();
+                self.info(format!(
+                    "config reloaded: {} stage(s), {} model(s), {} project instruction file(s) \
+                     — MCP server changes need a restart",
+                    self.config.stages.len(),
+                    self.config.models.len(),
+                    self.config.project_contexts.len(),
+                ));
+            }
+            Err(e) => self.error(format!("reload failed, config unchanged: {e:#}")),
+        }
+    }
+
+    /// Write the transcript as markdown; refuses to overwrite.
+    fn export_transcript(&mut self, arg: &str) {
+        let name = if arg.is_empty() {
+            format!("soa-session-{}.md", self.session_id)
+        } else {
+            arg.to_string()
+        };
+        let path = std::path::Path::new(&self.cwd).join(&name);
+        if path.exists() {
+            return self.error(format!("{} already exists — pass a different path", name));
+        }
+
+        let mut out = format!(
+            "# soa session {}\n\n_started {} · exported {} · {}_\n",
+            self.session_id,
+            store::format_epoch(self.started_at),
+            store::format_epoch(store::now_epoch()),
+            self.stage_summary(),
+        );
+        for item in &self.transcript {
+            match item {
+                TranscriptItem::User(text) => out.push_str(&format!("\n## user\n\n{text}\n")),
+                TranscriptItem::Assistant(text) => {
+                    out.push_str(&format!("\n## assistant\n\n{text}\n"));
+                }
+                TranscriptItem::ToolCall { name, args } => {
+                    let args: String = args.chars().take(200).collect();
+                    out.push_str(&format!("\n> ⚒ `{name}` {args}\n"));
+                }
+                TranscriptItem::ToolDone { .. } => {}
+                TranscriptItem::Info(text) | TranscriptItem::Error(text) => {
+                    for line in text.lines() {
+                        out.push_str(&format!("> {line}\n"));
+                    }
+                }
+            }
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => self.info(format!("transcript exported to {}", path.display())),
+            Err(e) => self.error(format!("cannot write {}: {e}", path.display())),
         }
     }
 
@@ -901,10 +1048,11 @@ impl App {
         // Borrow the stage through the Arc, not through `self`, so the
         // fields below stay assignable.
         let config = Arc::clone(&self.config);
+        let model_name = self.active_model().to_string();
         let stage = &config.stages[self.stage_index];
         let client = match build_client(
             &self.config,
-            &stage.model,
+            &model_name,
             stage.temperature,
             stage.max_tokens,
             &self.http,
@@ -955,7 +1103,7 @@ impl App {
             self.tx.clone(),
             (stage.require_approval, stage.auto_approve.clone()),
             Arc::clone(&self.approvals),
-            stage.model.clone(),
+            model_name,
             Arc::clone(&self.steer_queue),
         );
         self.compacting = false;
@@ -972,7 +1120,7 @@ impl App {
         let stage = self.stage();
         let client = match build_client(
             &self.config,
-            &stage.model,
+            self.active_model(),
             stage.temperature,
             stage.max_tokens,
             &self.http,
@@ -1240,7 +1388,9 @@ async fn turn_worker(
                 None => format!("ERROR: unknown tool `{name}`"),
                 Some((binding, read_only)) => {
                     // Snapshot files a write tool might touch, for the diff viewer.
-                    let snapshots = if !read_only && matches!(binding, ToolBinding::Mcp { .. }) {
+                    let snapshots = if !read_only
+                        && matches!(binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
+                    {
                         diff::snapshot(&diff::extract_paths(&call.function.arguments))
                     } else {
                         Vec::new()

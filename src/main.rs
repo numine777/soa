@@ -1,6 +1,7 @@
 mod approval;
 mod config;
 mod diff;
+mod files;
 mod mcp;
 mod mentions;
 mod provider;
@@ -295,7 +296,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Chat { stage, no_mouse, resume } => {
-            tui::run(config, stage.as_deref(), !no_mouse, resume.as_deref()).await
+            tui::run(config, cli.config.clone(), stage.as_deref(), !no_mouse, resume.as_deref())
+                .await
         }
         Command::Sessions => {
             let sessions = tui::store::list_sessions()?;

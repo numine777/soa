@@ -37,12 +37,23 @@ soa tools              # connect to every MCP server, list tools with ro/rw mark
 soa run "task"         # run the default workflow (or: echo "task" | soa run)
 soa run -w quickfix "task"    # run a named workflow
 soa run --stage plan "task"   # run a single stage
+soa run --resume       # continue this directory's interrupted run (--resume <id> for a specific one)
+soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
 soa -c other.toml …    # use a different config file
 ```
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
+
+**Checkpoints.** Pipeline runs are checkpointed to `<data dir>/runs/` after
+every completed stage: the task, each stage's output, and the position in
+the workflow (including reprompt jumps). If a run fails or is interrupted,
+`soa run --resume` picks it up at the first incomplete stage instead of
+starting over — completed stages are not re-run. Mid-stage progress isn't
+checkpointed (the interrupted stage restarts from its prompt), stage names
+must still exist in the config, and the checkpoint is deleted when the
+pipeline finishes. Single-stage runs (`--stage`) are not checkpointed.
 
 ## Interactive chat (`soa chat`)
 
@@ -129,7 +140,8 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
-| `request_timeout_secs` | 600 | HTTP timeout for provider calls |
+| `provider_retries` | 3 | how many times a failed provider request is retried with exponential backoff (500ms doubling, capped at 10s; a `Retry-After` header is honored). Covers network failures, 408/429/5xx responses, and interrupted streams; other errors fail immediately. 0 disables. |
+| `request_timeout_secs` | 600 | HTTP timeout for provider calls (per attempt) |
 
 ### `[providers.<name>]`
 

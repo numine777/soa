@@ -18,6 +18,10 @@ max_tool_output_chars = 30000
 # older tool results. 0 disables; only applies to models that declare
 # `context_tokens`.
 auto_compact_threshold = 0.8
+# Transient provider failures (network errors, 408/429/5xx, interrupted
+# streams) are retried this many times with exponential backoff before a
+# turn errors — local servers restart and swap models often. 0 disables.
+provider_retries = 3
 
 # ---------------------------------------------------------------------------
 # Providers: OpenAI-compatible chat-completions endpoints.

@@ -667,6 +667,7 @@ pub fn build_client(
             max_tokens: max_tokens.or(model.max_tokens),
         },
         provider.stream,
+        config.settings.provider_retries,
     ))
 }
 

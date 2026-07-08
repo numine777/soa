@@ -1,6 +1,8 @@
 //! Minimal OpenAI-compatible chat-completions client with tool-call support.
 
-use anyhow::{Context, Result, anyhow, bail};
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -150,6 +152,7 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -179,6 +182,9 @@ struct StreamAccumulator {
     content: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<Usage>,
+    /// The generation reached a `finish_reason`, so connection EOF is a
+    /// normal end of stream rather than a mid-generation drop.
+    finished: bool,
 }
 
 impl StreamAccumulator {
@@ -190,6 +196,9 @@ impl StreamAccumulator {
             self.usage = chunk.usage;
         }
         for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finished = true;
+            }
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
             {
@@ -249,6 +258,61 @@ pub struct ChatClient {
     model: String,
     params: SamplingParams,
     stream: bool,
+    /// Additional attempts after a transient failure (network error,
+    /// 408/429/5xx, or an interrupted stream).
+    retries: u32,
+}
+
+/// One failed request attempt, classified for the retry loop.
+struct AttemptError {
+    source: anyhow::Error,
+    retryable: bool,
+    /// Server-requested delay (`Retry-After`), which overrides backoff.
+    retry_after: Option<Duration>,
+}
+
+impl AttemptError {
+    fn fatal(source: anyhow::Error) -> Self {
+        Self { source, retryable: false, retry_after: None }
+    }
+
+    fn transient(source: anyhow::Error) -> Self {
+        Self { source, retryable: true, retry_after: None }
+    }
+}
+
+/// Exponential backoff: 500ms doubling per attempt, capped at 10s.
+fn backoff_delay(attempt: u32) -> Duration {
+    Duration::from_millis((500u64 << attempt.min(5)).min(10_000))
+}
+
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = value.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds.min(30)))
+}
+
+/// The part of `fragment` beyond the first `emitted` content bytes, given
+/// that `cumulative_before` bytes of content preceded this fragment. Used
+/// to avoid re-emitting deltas a caller already saw before a mid-stream
+/// retry. Byte offsets are nudged to a char boundary (a retried generation
+/// may diverge from the failed one, so the seam is best-effort; the
+/// returned turn's full content is always authoritative).
+fn novel_suffix(fragment: &str, cumulative_before: usize, emitted: usize) -> Option<&str> {
+    let mut skip = emitted.saturating_sub(cumulative_before);
+    if skip == 0 {
+        return Some(fragment);
+    }
+    while skip < fragment.len() && !fragment.is_char_boundary(skip) {
+        skip += 1;
+    }
+    (skip < fragment.len()).then(|| &fragment[skip..])
 }
 
 impl ChatClient {
@@ -259,6 +323,7 @@ impl ChatClient {
         model: &str,
         params: SamplingParams,
         stream: bool,
+        retries: u32,
     ) -> Self {
         Self {
             http,
@@ -267,6 +332,7 @@ impl ChatClient {
             model: model.to_string(),
             params,
             stream,
+            retries,
         }
     }
 
@@ -282,12 +348,46 @@ impl ChatClient {
     /// One round-trip. With streaming enabled (the provider default),
     /// `on_delta` is invoked with each content fragment as it arrives; with
     /// it disabled, `on_delta` fires once with the complete text.
+    ///
+    /// Transient failures (network errors, 408/429/5xx, interrupted
+    /// streams) are retried with exponential backoff up to
+    /// `settings.provider_retries` times. Content already delivered to
+    /// `on_delta` before a mid-stream failure is not re-emitted.
     pub async fn chat_streamed(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolFunction],
         on_delta: Option<DeltaHandler<'_>>,
     ) -> Result<AssistantTurn> {
+        let mut emitted = 0usize;
+        let mut attempt = 0u32;
+        loop {
+            match self.attempt_chat(messages, tools, on_delta, &mut emitted).await {
+                Ok(turn) => return Ok(turn),
+                Err(error) if error.retryable && attempt < self.retries => {
+                    let delay = error.retry_after.unwrap_or_else(|| backoff_delay(attempt));
+                    attempt += 1;
+                    tracing::warn!(
+                        attempt,
+                        retries = self.retries,
+                        delay_ms = delay.as_millis() as u64,
+                        error = format!("{:#}", error.source),
+                        "provider request failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error.source),
+            }
+        }
+    }
+
+    async fn attempt_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolFunction],
+        on_delta: Option<DeltaHandler<'_>>,
+        emitted: &mut usize,
+    ) -> std::result::Result<AssistantTurn, AttemptError> {
         let request = ChatRequest {
             model: &self.model,
             messages,
@@ -310,29 +410,43 @@ impl ChatClient {
             builder = builder.bearer_auth(key);
         }
 
-        let mut response = builder
-            .send()
-            .await
-            .with_context(|| format!("request to {url} failed"))?;
+        let mut response = match builder.send().await {
+            Ok(response) => response,
+            // Connection, DNS, and timeout failures are transient; a
+            // request that couldn't be built (e.g. bad header) is not.
+            Err(e) => {
+                let retryable = !e.is_builder();
+                let source = anyhow::Error::new(e).context(format!("request to {url} failed"));
+                return Err(AttemptError { source, retryable, retry_after: None });
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after(&response);
             let body = response.text().await.unwrap_or_default();
-            bail!("provider returned {status} from {url}: {body}");
+            return Err(AttemptError {
+                source: anyhow!("provider returned {status} from {url}: {body}"),
+                retryable: retryable_status(status),
+                retry_after,
+            });
         }
 
         if !self.stream {
             let body = response.text().await.unwrap_or_default();
-            let parsed: ChatResponse = serde_json::from_str(&body)
-                .with_context(|| format!("unexpected response from {url}: {body}"))?;
-            let choice = parsed
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("provider returned no choices from {url}"))?;
+            let parsed: ChatResponse = serde_json::from_str(&body).map_err(|e| {
+                AttemptError::fatal(
+                    anyhow::Error::new(e)
+                        .context(format!("unexpected response from {url}: {body}")),
+                )
+            })?;
+            let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+                AttemptError::fatal(anyhow!("provider returned no choices from {url}"))
+            })?;
             if let (Some(handler), Some(content)) = (on_delta, choice.message.content.as_deref())
+                && let Some(novel) = novel_suffix(content, 0, *emitted)
             {
-                handler(content);
+                handler(novel);
             }
             return Ok(AssistantTurn {
                 content: choice.message.content,
@@ -346,11 +460,25 @@ impl ChatClient {
         // split across network chunks can't be corrupted.
         let mut accumulator = StreamAccumulator::default();
         let mut buffer: Vec<u8> = Vec::new();
-        'stream: while let Some(chunk) = response
-            .chunk()
-            .await
-            .with_context(|| format!("stream from {url} was interrupted"))?
-        {
+        'stream: loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                // EOF without `[DONE]` or a finish_reason means the server
+                // died mid-generation (a clean close looks identical to a
+                // finished body); treat it like an interrupted stream.
+                Ok(None) if accumulator.finished => break,
+                Ok(None) => {
+                    return Err(AttemptError::transient(anyhow!(
+                        "stream from {url} ended before the generation finished"
+                    )));
+                }
+                Err(e) => {
+                    return Err(AttemptError::transient(
+                        anyhow::Error::new(e)
+                            .context(format!("stream from {url} was interrupted")),
+                    ));
+                }
+            };
             buffer.extend_from_slice(&chunk);
             while let Some(newline) = buffer.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=newline).collect();
@@ -361,12 +489,20 @@ impl ChatClient {
                 if data == "[DONE]" {
                     break 'stream;
                 }
-                let parsed: StreamChunk = serde_json::from_str(data)
-                    .with_context(|| format!("unexpected stream chunk from {url}: {data}"))?;
-                if let Some(fragment) = accumulator.apply(parsed)
-                    && let Some(handler) = on_delta
-                {
-                    handler(&fragment);
+                let parsed: StreamChunk = serde_json::from_str(data).map_err(|e| {
+                    AttemptError::fatal(
+                        anyhow::Error::new(e)
+                            .context(format!("unexpected stream chunk from {url}: {data}")),
+                    )
+                })?;
+                let before = accumulator.content.len();
+                if let Some(fragment) = accumulator.apply(parsed) {
+                    if let Some(handler) = on_delta
+                        && let Some(novel) = novel_suffix(&fragment, before, *emitted)
+                    {
+                        handler(novel);
+                    }
+                    *emitted = (*emitted).max(before + fragment.len());
                 }
             }
         }
@@ -394,8 +530,11 @@ mod tests {
             acc.apply(chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#)),
             Some("lo".to_string())
         );
-        // Finish chunks with empty deltas produce no fragment.
+        // Finish chunks with empty deltas produce no fragment, but mark the
+        // generation complete so a missing [DONE] isn't treated as a drop.
+        assert!(!acc.finished);
         assert_eq!(acc.apply(chunk(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)), None);
+        assert!(acc.finished);
         // Final usage chunk (empty choices) is captured.
         acc.apply(chunk(
             r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
@@ -406,6 +545,42 @@ mod tests {
         let usage = turn.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.context_tokens(), 120);
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_delay(0), Duration::from_millis(500));
+        assert_eq!(backoff_delay(1), Duration::from_millis(1000));
+        assert_eq!(backoff_delay(2), Duration::from_millis(2000));
+        // Capped at 10s, including for absurd attempt counts.
+        assert_eq!(backoff_delay(5), Duration::from_secs(10));
+        assert_eq!(backoff_delay(63), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn transient_statuses_classified() {
+        use reqwest::StatusCode;
+        for code in [500, 502, 503, 504, 429, 408] {
+            assert!(retryable_status(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [400, 401, 403, 404, 422] {
+            assert!(!retryable_status(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+    }
+
+    #[test]
+    fn novel_suffix_skips_already_emitted_content() {
+        // Nothing emitted yet: whole fragment is novel.
+        assert_eq!(novel_suffix("hello", 0, 0), Some("hello"));
+        // Fragment starts past the emitted point: all novel.
+        assert_eq!(novel_suffix("lo", 3, 3), Some("lo"));
+        // Fragment straddles the emitted point: only the tail is novel.
+        assert_eq!(novel_suffix("hello", 0, 3), Some("lo"));
+        // Fragment entirely within already-emitted content: nothing.
+        assert_eq!(novel_suffix("hel", 0, 3), None);
+        assert_eq!(novel_suffix("hel", 0, 10), None);
+        // A skip landing mid-character nudges forward to a boundary.
+        assert_eq!(novel_suffix("héllo", 0, 2), Some("llo"));
     }
 
     #[test]

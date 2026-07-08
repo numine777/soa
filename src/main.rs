@@ -4,6 +4,7 @@ mod diff;
 mod mcp;
 mod mentions;
 mod provider;
+mod runs;
 mod skills;
 mod stage;
 mod tools;
@@ -50,7 +51,14 @@ enum Command {
         /// workflow named `default`, or every stage in declaration order).
         #[arg(short, long)]
         workflow: Option<String>,
+        /// Resume an interrupted run from its last completed stage:
+        /// `--resume` for this directory's most recent, `--resume <ID>`
+        /// for a specific one (see `soa runs`).
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "latest")]
+        resume: Option<String>,
     },
+    /// List interrupted pipeline runs that can be resumed.
+    Runs,
     /// Interactive chat TUI using a stage's model, tools, and mode.
     Chat {
         /// Stage to chat with (default: the first stage).
@@ -208,7 +216,23 @@ async fn main() -> Result<()> {
             manager.shutdown().await;
             Ok(())
         }
-        Command::Run { task, stage, workflow } => {
+        Command::Run { task, stage, workflow, resume } => {
+            if let Some(resume) = resume {
+                if !task.is_empty() || stage.is_some() || workflow.is_some() {
+                    bail!(
+                        "--resume continues a checkpointed run; it cannot be combined \
+                         with a task, --stage, or --workflow"
+                    );
+                }
+                let state = if resume == "latest" {
+                    runs::latest_run_for(&tui::store::current_cwd())?.context(
+                        "no interrupted run to resume in this directory (see `soa runs`)",
+                    )?
+                } else {
+                    runs::load_run(&resume)?
+                };
+                return resume_pipeline(&config, state).await;
+            }
             let task = if task.is_empty() {
                 let mut buffer = String::new();
                 std::io::stdin()
@@ -229,6 +253,30 @@ async fn main() -> Result<()> {
                 eprintln!("• {}", report.describe());
             }
             run_pipeline(&config, &task, stage.as_deref(), workflow.as_deref()).await
+        }
+        Command::Runs => {
+            let states = runs::list_runs()?;
+            if states.is_empty() {
+                println!(
+                    "no interrupted runs ({})",
+                    tui::store::data_dir().join("runs").display()
+                );
+                return Ok(());
+            }
+            for state in states {
+                let title: String = state.task.lines().next().unwrap_or("").chars().take(60).collect();
+                println!(
+                    "{}  {}  next stage {}/{} [{}]  {}  ({})",
+                    state.id,
+                    tui::store::format_epoch(state.updated_at),
+                    state.position + 1,
+                    state.stage_names.len(),
+                    state.stage_names.get(state.position).map_or("?", |s| s.as_str()),
+                    title,
+                    if state.cwd.is_empty() { "unknown dir" } else { &state.cwd },
+                );
+            }
+            Ok(())
         }
         Command::Chat { stage, no_mouse, resume } => {
             tui::run(config, stage.as_deref(), !no_mouse, resume.as_deref()).await
@@ -358,7 +406,51 @@ async fn run_pipeline(
     if order.is_empty() {
         bail!("nothing to run: the selected workflow is empty");
     }
+    let stage_names: Vec<String> =
+        order.iter().map(|&i| config.stages[i].name.clone()).collect();
+    let state = runs::RunState::new(task, stage_names);
+    run_workflow(config, &http, order, state).await
+}
 
+/// Continue a checkpointed pipeline run from its first incomplete stage.
+async fn resume_pipeline(config: &Config, state: runs::RunState) -> Result<()> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.settings.request_timeout_secs))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    // The checkpoint stores stage names, so a reordered config can't
+    // silently change what the resumed run does — but every recorded
+    // stage must still exist.
+    let order: Vec<usize> = state
+        .stage_names
+        .iter()
+        .map(|name| {
+            config.stages.iter().position(|s| s.name == *name).with_context(|| {
+                format!("run {} uses stage `{name}`, which is no longer configured", state.id)
+            })
+        })
+        .collect::<Result<_>>()?;
+    let next = state.stage_names.get(state.position).map_or("?", |s| s.as_str());
+    eprintln!(
+        "resuming run {} ({} of {} stage(s) done, {} run(s) used) at stage {next}",
+        state.id,
+        state.position,
+        state.stage_names.len(),
+        state.runs,
+    );
+    run_workflow(config, &http, order, state).await
+}
+
+/// Execute a workflow from the point described by `state`, checkpointing
+/// after every completed stage. The checkpoint is removed when the
+/// pipeline finishes.
+async fn run_workflow(
+    config: &Config,
+    http: &reqwest::Client,
+    order: Vec<usize>,
+    mut state: runs::RunState,
+) -> Result<()> {
     // Agents can be reached from any stage, so connect their servers too.
     let needed_servers: Vec<String> = order
         .iter()
@@ -371,10 +463,18 @@ async fn run_pipeline(
     let workflow_stage_names: Vec<&str> =
         order.iter().map(|&i| config.stages[i].name.as_str()).collect();
 
-    let mut context = stage::PipelineContext::new(task);
-    let mut position = 0;
-    let mut runs = 0u32;
+    let mut context = stage::PipelineContext {
+        input: state.task.clone(),
+        previous: state.previous.clone(),
+        outputs: state.outputs.clone(),
+    };
+    let mut position = state.position;
+    let mut runs = state.runs;
     let mut last_output = None;
+
+    // Checkpoint the fresh run too, so a crash inside the first stage
+    // still leaves the task resumable.
+    checkpoint(&mut state, position, runs, &context);
 
     let mut result = Ok(());
     while position < order.len() {
@@ -404,7 +504,7 @@ async fn run_pipeline(
             is_first,
             &context,
             &manager,
-            &http,
+            http,
             &reprompt_targets,
             Some(&stream_to_stderr),
             &approvals,
@@ -414,6 +514,7 @@ async fn run_pipeline(
             Ok(stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
                 position += 1;
+                checkpoint(&mut state, position, runs, &context);
                 // The output already streamed to stderr; just separate stages.
                 eprintln!("\n");
                 last_output = Some(output);
@@ -428,12 +529,22 @@ async fn run_pipeline(
                     .iter()
                     .position(|name| *name == target)
                     .expect("reprompt targets are filtered to the active workflow");
+                checkpoint(&mut state, position, runs, &context);
             }
             Err(e) => {
                 result = Err(e);
                 break;
             }
         }
+    }
+
+    match &result {
+        Ok(()) => {
+            if let Err(e) = runs::remove_run(&state.id) {
+                eprintln!("⚠ cannot remove finished run checkpoint: {e:#}");
+            }
+        }
+        Err(_) => eprintln!("✗ run interrupted — continue it with `soa run --resume`"),
     }
 
     if result.is_ok()
@@ -444,4 +555,23 @@ async fn run_pipeline(
 
     manager.shutdown().await;
     result
+}
+
+/// Sync the checkpoint with the loop's progress and persist it. A failed
+/// write warns rather than killing the run: the pipeline is still useful
+/// without resumability.
+fn checkpoint(
+    state: &mut runs::RunState,
+    position: usize,
+    runs: u32,
+    context: &stage::PipelineContext,
+) {
+    state.position = position;
+    state.runs = runs;
+    state.previous = context.previous.clone();
+    state.outputs = context.outputs.clone();
+    state.updated_at = tui::store::now_epoch();
+    if let Err(e) = runs::save_run(state) {
+        eprintln!("⚠ cannot write run checkpoint: {e:#}");
+    }
 }

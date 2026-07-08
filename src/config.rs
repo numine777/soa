@@ -65,6 +65,12 @@ pub struct Settings {
     /// 0 disables. Only applies to models that declare `context_tokens`.
     #[serde(default = "default_auto_compact_threshold")]
     pub auto_compact_threshold: f64,
+    /// How many times a failed provider request is retried (with
+    /// exponential backoff) before the turn errors. Covers network
+    /// failures, 408/429/5xx responses, and interrupted streams.
+    /// 0 disables retries.
+    #[serde(default = "default_provider_retries")]
+    pub provider_retries: u32,
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
@@ -102,6 +108,7 @@ impl Default for Settings {
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
             auto_compact_threshold: default_auto_compact_threshold(),
+            provider_retries: default_provider_retries(),
             request_timeout_secs: default_timeout(),
             shell_timeout_secs: default_shell_timeout(),
             skills_dir: None,
@@ -131,6 +138,9 @@ fn default_max_agent_depth() -> u32 {
 }
 fn default_auto_compact_threshold() -> f64 {
     0.8
+}
+fn default_provider_retries() -> u32 {
+    3
 }
 fn default_timeout() -> u64 {
     600

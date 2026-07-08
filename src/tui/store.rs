@@ -69,14 +69,15 @@ pub fn format_epoch(secs: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02} UTC")
 }
 
-fn session_id_for(secs: u64) -> String {
+/// A timestamp-derived id, shared by sessions and pipeline-run checkpoints.
+pub fn timestamp_id(secs: u64) -> String {
     let (y, mo, d, h, mi, s) = civil(secs);
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
 /// A unique id for a session started now (suffixed on same-second collision).
 pub fn new_session_id() -> String {
-    let base = session_id_for(now_epoch());
+    let base = timestamp_id(now_epoch());
     let mut id = base.clone();
     let mut n = 1;
     while sessions_dir().join(format!("{id}.json")).exists() {
@@ -216,7 +217,7 @@ mod tests {
     fn epoch_formatting() {
         // 2026-07-07 18:30:05 UTC
         assert_eq!(format_epoch(1_783_449_005), "2026-07-07 18:30 UTC");
-        assert_eq!(session_id_for(1_783_449_005), "20260707-183005");
+        assert_eq!(timestamp_id(1_783_449_005), "20260707-183005");
         assert_eq!(format_epoch(0), "1970-01-01 00:00 UTC");
     }
 

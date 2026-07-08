@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use super::app::{App, TranscriptItem, View};
@@ -38,6 +38,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
             draw_status(frame, app, status_area);
             draw_input(frame, app, input_area);
+            if app.pending_approval.is_none() {
+                draw_completion(frame, app, input_area);
+            }
         }
         View::Diffs { .. } => {
             let [diff_area, status_area] =
@@ -364,6 +367,54 @@ fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
             .title(title),
     );
     frame.render_widget(&app.input, area);
+}
+
+/// Autocomplete popup, floating just above the input box. Tab or Enter
+/// accepts, Up/Down navigate, Esc closes.
+fn draw_completion(frame: &mut Frame, app: &App, input_area: Rect) {
+    let Some(completion) = &app.completion else { return };
+    let label_width =
+        completion.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0);
+    let line_width = completion
+        .items
+        .iter()
+        .map(|i| {
+            label_width + if i.detail.is_empty() { 0 } else { 2 + i.detail.chars().count() }
+        })
+        .max()
+        .unwrap_or(10);
+
+    let height = (completion.items.len() as u16).min(input_area.y);
+    let width = (line_width as u16 + 2).min(input_area.width.saturating_sub(2));
+    let popup = Rect {
+        x: input_area.x + 1,
+        y: input_area.y.saturating_sub(height),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let lines: Vec<Line> = completion
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let (item_style, detail_style) = if index == completion.selected {
+                let selected = Style::default().bg(Color::DarkGray);
+                (selected.add_modifier(Modifier::BOLD), selected.fg(Color::Gray))
+            } else {
+                (Style::default(), Style::default().fg(Color::DarkGray))
+            };
+            let mut spans =
+                vec![Span::styled(format!(" {:label_width$}", item.label), item_style)];
+            if !item.detail.is_empty() {
+                spans.push(Span::styled(format!("  {}", item.detail), detail_style));
+            }
+            spans.push(Span::styled(" ", item_style));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), popup);
 }
 
 // ---------------------------------------------------------------------------

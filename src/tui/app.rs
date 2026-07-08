@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
+use super::completion::{self, Completion};
 use super::store::{self, PromptHistory, Session};
 use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
@@ -87,6 +88,9 @@ pub struct App {
     /// while this is set.
     pub pending_approval: Option<ApprovalRequest>,
     approvals: Arc<Approvals>,
+    /// Autocomplete popup for slash commands and @file mentions,
+    /// recomputed after every input keystroke.
+    pub completion: Option<Completion>,
     /// Real token usage from the most recent turn, when the server reports
     /// it; None falls back to the character estimate.
     pub last_usage: Option<Usage>,
@@ -157,6 +161,7 @@ impl App {
             stream_buffer: String::new(),
             pending_approval: None,
             approvals,
+            completion: None,
             last_usage: None,
             quit: false,
             turn: None,
@@ -360,6 +365,7 @@ impl App {
             Event::Paste(text) => {
                 if matches!(self.view, View::Chat) {
                     self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+                    self.refresh_completion();
                 }
             }
             _ => {}
@@ -543,6 +549,40 @@ impl App {
     }
 
     fn on_chat_key(&mut self, key: KeyEvent) {
+        // The completion popup captures navigation keys while visible.
+        if let Some(state) = &mut self.completion {
+            let count = state.items.len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.completion = None;
+                    return;
+                }
+                KeyCode::Up if key.modifiers.is_empty() => {
+                    state.selected = state.selected.checked_sub(1).unwrap_or(count - 1);
+                    return;
+                }
+                KeyCode::Down if key.modifiers.is_empty() => {
+                    state.selected = (state.selected + 1) % count;
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.accept_completion();
+                    return;
+                }
+                // Enter accepts only when it would change the input; a
+                // fully typed command or path submits as usual.
+                KeyCode::Enter
+                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                {
+                    if self.completion_changes_input() {
+                        self.accept_completion();
+                        return;
+                    }
+                    self.completion = None;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => self.cancel_turn(),
             KeyCode::Enter
@@ -573,6 +613,55 @@ impl App {
                 self.input.input(tui_textarea::Input::from(key));
             }
         }
+        self.refresh_completion();
+    }
+
+    /// Recompute the autocomplete popup for the token under the cursor.
+    fn refresh_completion(&mut self) {
+        let (row, col) = self.input.cursor();
+        let line = self.input.lines().get(row).cloned().unwrap_or_default();
+        let stage_names: Vec<String> =
+            self.config.stages.iter().map(|s| s.name.clone()).collect();
+        self.completion = completion::compute(
+            &line,
+            col,
+            row == 0,
+            std::path::Path::new(&self.cwd),
+            &stage_names,
+        );
+    }
+
+    /// Whether applying the selected completion would alter the input.
+    fn completion_changes_input(&self) -> bool {
+        let Some(state) = &self.completion else { return false };
+        let item = &state.items[state.selected];
+        let (row, col) = self.input.cursor();
+        let line: Vec<char> =
+            self.input.lines().get(row).map(|l| l.chars().collect()).unwrap_or_default();
+        let from = state.replace_from.min(line.len());
+        let replaced: String = line[from..col.min(line.len())].iter().collect();
+        replaced != item.insert
+    }
+
+    /// Splice the selected completion into the input, then recompute (so
+    /// accepting a directory descends into it).
+    fn accept_completion(&mut self) {
+        let Some(state) = &self.completion else { return };
+        let item = state.items[state.selected].clone();
+        let (row, col) = self.input.cursor();
+        let mut lines: Vec<String> = self.input.lines().to_vec();
+        let Some(line) = lines.get(row).cloned() else { return };
+        let chars: Vec<char> = line.chars().collect();
+        let from = state.replace_from.min(chars.len());
+        let before: String = chars[..from].iter().collect();
+        let after: String = chars[col.min(chars.len())..].iter().collect();
+        lines[row] = format!("{before}{}{after}", item.insert);
+        let new_col = from + item.insert.chars().count();
+
+        self.set_input_text(&lines.join("\n"));
+        self.input
+            .move_cursor(tui_textarea::CursorMove::Jump(row as u16, new_col as u16));
+        self.refresh_completion();
     }
 
     fn set_input_text(&mut self, text: &str) {
@@ -749,6 +838,7 @@ impl App {
                  /sessions       open the session picker (switch or start new)\n\
                  /quit           exit (Ctrl+D on an empty prompt)\n\
                  mention files with @path (@src/main.rs, @\"has spaces.txt\", @somedir)\n\
+                 typing / or @ pops up completions: Up/Down select · Tab/Enter accept\n\
                  typing while a turn runs queues the message: it is delivered to the\n\
                  model after the current tool round (or becomes the next turn)\n\
                  keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\

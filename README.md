@@ -76,6 +76,13 @@ Slash commands:
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
 
+**Autocomplete.** Typing `/` pops up the command palette and `@` pops up
+file completions for the token under the cursor (directories complete with
+a trailing `/` and descend; names with spaces insert quoted; `/stage `
+completes stage names). `Up`/`Down` select, `Tab` accepts, `Enter` accepts
+— or submits when the input is already complete — and `Esc` closes the
+popup.
+
 **Steering.** The input stays live while a turn runs: submitting a message
 queues it (the status bar shows the count) and it is delivered to the model
 after the current tool round — correct course without cancelling. Anything

@@ -7,6 +7,7 @@
 //! keyboard protocol, which tmux does not pass through.
 
 mod app;
+mod completion;
 pub mod store;
 mod ui;
 

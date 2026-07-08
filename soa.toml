@@ -22,6 +22,11 @@ auto_compact_threshold = 0.8
 # streams) are retried this many times with exponential backoff before a
 # turn errors — local servers restart and swap models often. 0 disables.
 provider_retries = 3
+# Project instructions: each file is discovered by walking up from the
+# working directory and appended to every stage and agent system prompt.
+# All candidates that exist are sourced in the listed order; missing ones
+# are skipped.
+# context_files = ["AGENTS.md", "SOA.md"]     # default: ["SOA.md"]
 
 # ---------------------------------------------------------------------------
 # Providers: OpenAI-compatible chat-completions endpoints.

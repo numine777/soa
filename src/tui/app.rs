@@ -788,7 +788,7 @@ impl App {
         };
         let system = match stage.resolve_system_prompt(&self.config.base_dir).and_then(
             |system| {
-                crate::skills::apply_skills(
+                crate::skills::compose_system(
                     &config,
                     &format!("stage `{}`", stage.name),
                     system,

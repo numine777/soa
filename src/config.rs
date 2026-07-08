@@ -32,6 +32,19 @@ pub struct Config {
     /// `system_prompt_file`) resolve against it. Set by [`Config::load`].
     #[serde(skip)]
     pub base_dir: PathBuf,
+
+    /// Project instructions (`settings.context_files`, default `SOA.md`)
+    /// appended to every stage and agent system prompt, in order. Set by
+    /// [`Config::load`].
+    #[serde(skip)]
+    pub project_contexts: Vec<ProjectContext>,
+}
+
+/// One project-instructions file discovered near the working directory.
+#[derive(Debug, Clone)]
+pub struct ProjectContext {
+    pub path: PathBuf,
+    pub content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +97,12 @@ pub struct Settings {
     /// Workflow used by `soa run` when none is passed. Falls back to a
     /// workflow literally named `default`, then to the [[stage]] order.
     pub default_workflow: Option<String>,
+    /// Project-instruction files appended to every stage and agent system
+    /// prompt. Each entry is discovered by walking up from the working
+    /// directory (absolute paths are read directly); the files that exist
+    /// are sourced in the listed order, missing ones are skipped.
+    #[serde(default = "default_context_files")]
+    pub context_files: Vec<PathBuf>,
 }
 
 /// A named pipeline over the stage library.
@@ -113,8 +132,13 @@ impl Default for Settings {
             shell_timeout_secs: default_shell_timeout(),
             skills_dir: None,
             default_workflow: None,
+            context_files: default_context_files(),
         }
     }
+}
+
+fn default_context_files() -> Vec<PathBuf> {
+    vec![PathBuf::from("SOA.md")]
 }
 
 fn default_shell_timeout() -> u64 {
@@ -392,6 +416,8 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."));
         config.expand_env()?;
         config.validate()?;
+        let cwd = std::env::current_dir().unwrap_or_default();
+        config.project_contexts = resolve_context_files(&config.settings.context_files, &cwd);
         Ok(config)
     }
 
@@ -647,6 +673,33 @@ impl Config {
     }
 }
 
+/// Resolve `settings.context_files` against a working directory: each
+/// entry is read from `cwd` or the nearest ancestor that has it (so runs
+/// from a subdirectory of a project still pick up its instructions);
+/// absolute entries are read directly. Files that exist are returned in
+/// the listed order; missing or blank ones are skipped, and two entries
+/// resolving to the same file are sourced once.
+fn resolve_context_files(entries: &[PathBuf], cwd: &Path) -> Vec<ProjectContext> {
+    let mut seen = std::collections::BTreeSet::new();
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let found = if entry.is_absolute() {
+                let content = std::fs::read_to_string(entry).ok()?;
+                ProjectContext { path: entry.clone(), content }
+            } else {
+                cwd.ancestors().find_map(|dir| {
+                    let path = dir.join(entry);
+                    let content = std::fs::read_to_string(&path).ok()?;
+                    Some(ProjectContext { path, content })
+                })?
+            };
+            (!found.content.trim().is_empty() && seen.insert(found.path.clone()))
+                .then_some(found)
+        })
+        .collect()
+}
+
 /// Replace `${VAR}` with the value of the environment variable `VAR`.
 /// A reference to an unset variable is an error.
 pub fn expand_env(input: &str) -> Result<String> {
@@ -711,6 +764,43 @@ mod tests {
         assert_eq!(config.stages.len(), 1);
         assert_eq!(config.stages[0].mode, Mode::ReadOnly);
         assert_eq!(config.settings.default_max_turns, 16);
+    }
+
+    #[test]
+    fn resolves_context_files_in_order_walking_up() {
+        let root = std::env::temp_dir().join(format!("soa-ctx-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let entries =
+            |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        // Walk-up discovery: found in an ancestor of the working directory.
+        std::fs::write(root.join("SOA.md"), "top instructions").unwrap();
+        let found = resolve_context_files(&entries(&["SOA.md"]), &nested);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content, "top instructions");
+        assert_eq!(found[0].path, root.join("SOA.md"));
+
+        // The nearest file wins for each entry independently.
+        std::fs::write(nested.join("SOA.md"), "near instructions").unwrap();
+        let found = resolve_context_files(&entries(&["SOA.md"]), &nested);
+        assert_eq!(found[0].content, "near instructions");
+
+        // Multiple entries source in the listed order, not discovery depth;
+        // missing and blank ones are skipped; duplicates source once.
+        std::fs::write(root.join("AGENTS.md"), "agent instructions").unwrap();
+        std::fs::write(nested.join("BLANK.md"), "  \n").unwrap();
+        let found = resolve_context_files(
+            &entries(&["AGENTS.md", "BLANK.md", "MISSING.md", "SOA.md", "AGENTS.md"]),
+            &nested,
+        );
+        assert_eq!(
+            found.iter().map(|c| c.content.as_str()).collect::<Vec<_>>(),
+            vec!["agent instructions", "near instructions"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

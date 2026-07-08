@@ -113,26 +113,33 @@ fn parse_skill(name: &str, raw: &str, path: PathBuf) -> Skill {
     skill
 }
 
-/// Append the named skills to a system prompt. `owner` is used in errors.
-pub fn apply_skills(
+/// Compose the final system prompt for a stage or agent: the base prompt,
+/// then the named skills, then any project-instruction files
+/// (`settings.context_files`) in their configured order. `owner` is used
+/// in errors.
+pub fn compose_system(
     config: &Config,
     owner: &str,
     system: Option<String>,
     skill_names: &[String],
 ) -> Result<Option<String>> {
-    if skill_names.is_empty() {
-        return Ok(system);
-    }
     let mut composed = system.unwrap_or_default();
-    for name in skill_names {
-        let skill =
-            load_skill(config, name).with_context(|| format!("`{owner}` requires skills"))?;
+    let mut append = |section: String| {
         if !composed.is_empty() {
             composed.push_str("\n\n");
         }
-        composed.push_str(&format!("# Skill: {}\n\n{}", skill.name, skill.body));
+        composed.push_str(&section);
+    };
+    for name in skill_names {
+        let skill =
+            load_skill(config, name).with_context(|| format!("`{owner}` requires skills"))?;
+        append(format!("# Skill: {}\n\n{}", skill.name, skill.body));
     }
-    Ok(Some(composed))
+    for context in &config.project_contexts {
+        let name = context.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        append(format!("# Project instructions ({name})\n\n{}", context.content.trim_end()));
+    }
+    Ok((!composed.is_empty()).then_some(composed))
 }
 
 #[cfg(test)]
@@ -190,9 +197,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("flat.md"), "---\ndescription: flat skill\n---\nFLAT BODY").unwrap();
         std::fs::write(dir.join("nested/SKILL.md"), "NESTED BODY").unwrap();
-        let config = config_with_skills_dir(&dir);
+        let mut config = config_with_skills_dir(&dir);
 
-        let composed = apply_skills(
+        let composed = compose_system(
             &config,
             "stage `s`",
             Some("Base prompt.".to_string()),
@@ -205,10 +212,36 @@ mod tests {
         assert!(composed.contains("# Skill: nested\n\nNESTED BODY"));
 
         // Missing skill errors with the owner named.
-        let err = apply_skills(&config, "stage `s`", None, &["ghost".to_string()])
+        let err = compose_system(&config, "stage `s`", None, &["ghost".to_string()])
             .unwrap_err()
             .to_string();
         assert!(err.contains("stage `s`"), "{err}");
+
+        // Project instructions are appended after the skills, in order.
+        config.project_contexts = vec![
+            crate::config::ProjectContext {
+                path: PathBuf::from("/proj/AGENTS.md"),
+                content: "Agent conventions.\n".to_string(),
+            },
+            crate::config::ProjectContext {
+                path: PathBuf::from("/proj/SOA.md"),
+                content: "Use rebase, not merge.\n".to_string(),
+            },
+        ];
+        let with_context =
+            compose_system(&config, "stage `s`", Some("Base.".to_string()), &["flat".to_string()])
+                .unwrap()
+                .unwrap();
+        assert!(with_context.starts_with("Base.\n\n# Skill: flat"));
+        assert!(with_context.contains(
+            "# Project instructions (AGENTS.md)\n\nAgent conventions.\n\n\
+             # Project instructions (SOA.md)\n\nUse rebase, not merge."
+        ));
+        // Context alone still yields a system prompt; nothing at all yields None.
+        let alone = compose_system(&config, "stage `s`", None, &[]).unwrap().unwrap();
+        assert!(alone.starts_with("# Project instructions"));
+        config.project_contexts = Vec::new();
+        assert!(compose_system(&config, "stage `s`", None, &[]).unwrap().is_none());
 
         let listed = list_skills(&config);
         assert_eq!(

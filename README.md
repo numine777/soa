@@ -122,6 +122,26 @@ and no kitty-protocol keys are relied on. Logs go to
 `$TMPDIR/soa-chat.log` instead of the screen; spawned MCP servers' stderr
 is discarded so it cannot corrupt the display.
 
+## Project instructions (`SOA.md`)
+
+Put a `SOA.md` in your project root and its contents are appended to every
+stage and agent system prompt as a `# Project instructions` section —
+conventions, build commands, architecture notes, anything every model
+should know without repeating it in each stage's `system_prompt`. Each
+file is discovered by walking up from the working directory (so runs from
+a subdirectory still find it). The candidate list is configurable:
+
+```toml
+[settings]
+context_files = ["AGENTS.md", "SOA.md"]   # default: ["SOA.md"]
+```
+
+Every candidate that exists is sourced, as its own section, in the listed
+order — so a shared `AGENTS.md` can be combined with soa-specific
+instructions. Missing and blank files are skipped, absolute paths are read
+as-is, and `soa check` reports what was found. Files are read once at
+startup — restart `soa chat` to pick up edits.
+
 ## Configuration
 
 See [soa.toml](soa.toml) for a complete annotated example.
@@ -139,6 +159,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `auto_compact_threshold` | 0.8 | when real token usage crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results (0 disables; needs `context_tokens` on the model) |
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
+| `context_files` | `["SOA.md"]` | project-instruction files, each discovered by walking up from the working directory and sourced into every system prompt in the listed order (see below) |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
 | `provider_retries` | 3 | how many times a failed provider request is retried with exponential backoff (500ms doubling, capped at 10s; a `Retry-After` header is honored). Covers network failures, 408/429/5xx responses, and interrupted streams; other errors fail immediately. 0 disables. |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls (per attempt) |

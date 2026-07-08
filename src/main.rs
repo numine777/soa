@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
             // and referenced skills resolve.
             for stage in &config.stages {
                 let system = stage.resolve_system_prompt(&config.base_dir)?;
-                skills::apply_skills(
+                skills::compose_system(
                     &config,
                     &format!("stage `{}`", stage.name),
                     system,
@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
             }
             for (name, agent) in &config.agents {
                 let system = agent.resolve_system_prompt(&config.base_dir)?;
-                skills::apply_skills(&config, &format!("agent `{name}`"), system, &agent.skills)?;
+                skills::compose_system(&config, &format!("agent `{name}`"), system, &agent.skills)?;
             }
             println!(
                 "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s)",
@@ -134,6 +134,22 @@ async fn main() -> Result<()> {
                 config.stages.len(),
                 config.workflows.len()
             );
+            if config.project_contexts.is_empty() {
+                let candidates: Vec<String> = config
+                    .settings
+                    .context_files
+                    .iter()
+                    .map(|f| f.display().to_string())
+                    .collect();
+                println!("project instructions: none (searched for {})", candidates.join(", "));
+            }
+            for context in &config.project_contexts {
+                println!(
+                    "project instructions: {} ({} chars)",
+                    context.path.display(),
+                    context.content.len()
+                );
+            }
             Ok(())
         }
         Command::Stages => {

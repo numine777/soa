@@ -536,7 +536,7 @@ pub fn run_agent<'a>(
             .map(|t| (t.definition.name.as_str(), t))
             .collect();
 
-        let system = crate::skills::apply_skills(
+        let system = crate::skills::compose_system(
             config,
             &format!("agent `{agent_name}`"),
             agent.resolve_system_prompt(&config.base_dir)?,
@@ -708,7 +708,7 @@ pub async fn run_stage(
         &context.outputs,
     )?;
 
-    let system = crate::skills::apply_skills(
+    let system = crate::skills::compose_system(
         config,
         &format!("stage `{}`", stage.name),
         stage.resolve_system_prompt(&config.base_dir)?,

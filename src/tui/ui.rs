@@ -22,7 +22,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     match app.view {
         View::Chat => {
-            let input_height = (app.input.lines().len().clamp(1, 6) as u16) + 2;
+            let wrap_width = area.width.saturating_sub(2).max(1) as usize;
+            let input_layout = layout_input(app.input.lines(), app.input.cursor(), wrap_width);
+            let input_height = (input_layout.rows.len().clamp(1, 8) as u16) + 2;
             let approval_height = if app.pending_approval.is_some() { 2 } else { 0 };
             let [transcript_area, approval_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(3),
@@ -37,7 +39,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_approval(frame, app, approval_area);
             }
             draw_status(frame, app, status_area);
-            draw_input(frame, app, input_area);
+            draw_input(frame, app, input_area, input_layout);
             if app.pending_approval.is_none() {
                 draw_completion(frame, app, input_area);
             }
@@ -507,18 +509,106 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
+/// The input box's soft-wrap layout: visual rows plus the cursor's visual
+/// position. tui-textarea cannot soft-wrap (long lines scroll sideways),
+/// so the box renders its text itself and the TextArea stays the editing
+/// engine underneath.
+struct InputLayout {
+    rows: Vec<String>,
+    /// (visual row, x column) of the cursor within `rows`.
+    cursor: (usize, u16),
+}
+
+fn layout_input(lines: &[String], cursor: (usize, usize), width: usize) -> InputLayout {
+    let (cursor_row, cursor_col) = cursor;
+    let mut rows = Vec::new();
+    let mut cursor_visual = (0, 0);
+    for (index, line) in lines.iter().enumerate() {
+        let start = rows.len();
+        let target = (index == cursor_row).then_some(cursor_col);
+        if let Some((row, x)) = wrap_line(line, width, &mut rows, target) {
+            cursor_visual = (start + row, x);
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    InputLayout { rows, cursor: cursor_visual }
+}
+
+/// Append one logical line to `rows`, soft-wrapped at `width` display
+/// columns (character-level breaks, wide chars counted properly). When
+/// `cursor` (a char index into the line, possibly one past the end) is
+/// given, returns its visual position; a cursor sitting at the edge of a
+/// full row spills onto a fresh row, which is materialized so the box has
+/// somewhere to draw it.
+fn wrap_line(
+    line: &str,
+    width: usize,
+    rows: &mut Vec<String>,
+    cursor: Option<usize>,
+) -> Option<(usize, u16)> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let start = rows.len();
+    rows.push(String::new());
+    let mut x = 0usize;
+    let mut placed = None;
+    let mut chars = 0usize;
+    for (index, ch) in line.chars().enumerate() {
+        chars += 1;
+        let w = ch.width().unwrap_or(0);
+        if x + w > width && x > 0 {
+            rows.push(String::new());
+            x = 0;
+        }
+        if cursor == Some(index) {
+            placed = Some((rows.len() - 1 - start, x as u16));
+        }
+        rows.last_mut().expect("pushed above").push(ch);
+        x += w;
+    }
+    if let Some(target) = cursor
+        && target >= chars
+        && placed.is_none()
+    {
+        if x >= width {
+            rows.push(String::new());
+            x = 0;
+        }
+        placed = Some((rows.len() - 1 - start, x as u16));
+    }
+    placed
+}
+
+fn draw_input(frame: &mut Frame, app: &App, area: Rect, layout: InputLayout) {
     let title = if app.is_running() {
         " drafting next message (turn in progress) "
     } else {
         " message "
     };
-    app.input.set_block(
-        Block::bordered()
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(title),
-    );
-    frame.render_widget(&app.input, area);
+    let block = Block::bordered()
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+
+    let empty = app.input.lines().len() == 1 && app.input.lines()[0].is_empty();
+    let (cursor_row, cursor_x) = layout.cursor;
+    let viewport = area.height.saturating_sub(2).max(1) as usize;
+    // Keep the cursor's visual row inside the box when the text is taller
+    // than the (clamped) box height.
+    let scroll = (cursor_row + 1).saturating_sub(viewport);
+
+    let paragraph = if empty {
+        Paragraph::new(app.input.placeholder_text())
+            .style(Style::default().fg(Color::DarkGray))
+    } else {
+        Paragraph::new(layout.rows.iter().map(|row| Line::from(row.as_str())).collect::<Vec<_>>())
+    };
+    frame.render_widget(paragraph.block(block).scroll((scroll as u16, 0)), area);
+    frame.set_cursor_position((
+        area.x + 1 + cursor_x.min(area.width.saturating_sub(2)),
+        area.y + 1 + (cursor_row - scroll) as u16,
+    ));
 }
 
 /// Autocomplete popup, floating just above the input box. Tab or Enter
@@ -653,4 +743,51 @@ fn style_unified_diff(unified: &str) -> Vec<Line<'static>> {
             Line::styled(line.to_string(), style)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(lines: &[&str], cursor: (usize, usize), width: usize) -> InputLayout {
+        let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        layout_input(&lines, cursor, width)
+    }
+
+    #[test]
+    fn wraps_long_lines_and_tracks_the_cursor() {
+        // 10 chars at width 4: rows of 4/4/2; cursor at char 5 is row 1, x 1.
+        let l = layout(&["abcdefghij"], (0, 5), 4);
+        assert_eq!(l.rows, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(l.cursor, (1, 1));
+
+        // Cursor at the very end of a partial row.
+        assert_eq!(layout(&["abcdefghij"], (0, 10), 4).cursor, (2, 2));
+        // Cursor at the edge of a FULL row spills onto a materialized row.
+        let l = layout(&["abcdefgh"], (0, 8), 4);
+        assert_eq!(l.rows, vec!["abcd", "efgh", ""]);
+        assert_eq!(l.cursor, (2, 0));
+    }
+
+    #[test]
+    fn counts_wide_chars_by_display_width() {
+        // '你' is 2 columns: three of them at width 4 wrap after two.
+        let l = layout(&["你你你"], (0, 2), 4);
+        assert_eq!(l.rows, vec!["你你", "你"]);
+        assert_eq!(l.cursor, (1, 0));
+        // Cursor mid-row lands at the char's display column, not char index.
+        assert_eq!(layout(&["你a"], (0, 1), 10).cursor, (0, 2));
+    }
+
+    #[test]
+    fn multiple_logical_lines_stack_their_wrapped_rows() {
+        let l = layout(&["abcdef", "x", ""], (2, 0), 4);
+        assert_eq!(l.rows, vec!["abcd", "ef", "x", ""]);
+        assert_eq!(l.cursor, (3, 0));
+
+        // Empty input: one empty row, cursor at the origin.
+        let l = layout(&[""], (0, 0), 4);
+        assert_eq!(l.rows, vec![""]);
+        assert_eq!(l.cursor, (0, 0));
+    }
 }

@@ -140,10 +140,11 @@ pub struct App {
     recall_draft: String,
 }
 
+// The TextArea is the editing engine only; ui::draw_input renders the text
+// itself (soft-wrapped) and places the terminal cursor.
 fn new_textarea() -> TextArea<'static> {
     let mut input = TextArea::default();
     input.set_placeholder_text("Message soa — Enter sends, Alt+Enter newline, /help for commands");
-    input.set_cursor_line_style(ratatui::style::Style::default());
     input
 }
 

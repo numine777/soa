@@ -27,8 +27,13 @@ const MAX_WALK_ENTRIES: usize = 50_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOp {
     Read,
+    /// `read_file` with `LINE:HASH|` anchor prefixes, exposed instead of
+    /// plain `Read` when the edit tools are available.
+    ReadAnchored,
     Write,
     Edit,
+    /// Anchor-addressed line edits (see [`edit_lines`]).
+    EditLines,
     List,
     Glob,
     Grep,
@@ -37,9 +42,10 @@ pub enum FileOp {
 impl FileOp {
     pub fn tool_name(self) -> &'static str {
         match self {
-            FileOp::Read => "read_file",
+            FileOp::Read | FileOp::ReadAnchored => "read_file",
             FileOp::Write => "write_file",
             FileOp::Edit => "edit_file",
+            FileOp::EditLines => "edit_lines",
             FileOp::List => "list_dir",
             FileOp::Glob => "glob",
             FileOp::Grep => "grep",
@@ -53,13 +59,25 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
     let path_property = |description: &str| {
         json!({ "type": "string", "description": description })
     };
+    let (read_op, read_description) = if read_write {
+        (
+            FileOp::ReadAnchored,
+            "Read a text file. Each line is prefixed with an anchor `LINE:HASH|` for \
+             edit_lines — the prefix is NOT part of the file content. Returns the full \
+             content, or a window of it when `offset`/`limit` are given.",
+        )
+    } else {
+        (
+            FileOp::Read,
+            "Read a text file. Returns the full content, or a window of it when \
+             `offset`/`limit` are given.",
+        )
+    };
     let mut tools = vec![
         (
             ToolFunction {
-                name: FileOp::Read.tool_name().to_string(),
-                description: "Read a text file. Returns the full content, or a window \
-                    of it when `offset`/`limit` are given."
-                    .to_string(),
+                name: read_op.tool_name().to_string(),
+                description: read_description.to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -70,7 +88,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
                     "required": ["path"]
                 }),
             },
-            FileOp::Read,
+            read_op,
             true,
         ),
         (
@@ -154,10 +172,38 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
         ));
         tools.push((
             ToolFunction {
+                name: FileOp::EditLines.tool_name().to_string(),
+                description: "Replace a range of lines using anchors from read_file. \
+                    `first` and `last` are anchors like `42:9f3a` copied verbatim from \
+                    a read_file listing (`last` defaults to `first`). The hash must \
+                    match the file's current content — if the file changed since you \
+                    read it, the edit is rejected and you must re-read. `new_text` is \
+                    raw text WITHOUT anchor prefixes; empty `new_text` deletes the \
+                    range; `insert_after` inserts without removing lines. The reply \
+                    shows fresh anchors around the change."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": path_property("File path, relative to the working directory"),
+                        "first": { "type": "string", "description": "Anchor of the first line, e.g. 42:9f3a" },
+                        "last": { "type": "string", "description": "Anchor of the last line (default: first)" },
+                        "new_text": { "type": "string", "description": "Replacement text, without anchor prefixes" },
+                        "insert_after": { "type": "boolean", "description": "Insert new_text after `first` instead of replacing (default false)" }
+                    },
+                    "required": ["path", "first", "new_text"]
+                }),
+            },
+            FileOp::EditLines,
+            false,
+        ));
+        tools.push((
+            ToolFunction {
                 name: FileOp::Edit.tool_name().to_string(),
                 description: "Replace an exact string in a file. `old_string` must \
                     match exactly once (include surrounding lines to disambiguate), \
-                    or pass replace_all to change every occurrence."
+                    or pass replace_all to change every occurrence. Prefer edit_lines \
+                    when you have anchors from read_file."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -185,11 +231,11 @@ pub fn dispatch(op: FileOp, arguments: &Value) -> String {
     };
     let str_arg = |key: &str| arguments.get(key).and_then(Value::as_str);
     match op {
-        FileOp::Read => {
+        FileOp::Read | FileOp::ReadAnchored => {
             let Some(path) = str_arg("path") else { return missing("path") };
             let offset = arguments.get("offset").and_then(Value::as_u64);
             let limit = arguments.get("limit").and_then(Value::as_u64);
-            read_file(&cwd, path, offset, limit)
+            read_file(&cwd, path, offset, limit, op == FileOp::ReadAnchored)
         }
         FileOp::Write => {
             let Some(path) = str_arg("path") else { return missing("path") };
@@ -202,6 +248,15 @@ pub fn dispatch(op: FileOp, arguments: &Value) -> String {
             let Some(new) = str_arg("new_string") else { return missing("new_string") };
             let all = arguments.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
             edit_file(&cwd, path, old, new, all)
+        }
+        FileOp::EditLines => {
+            let Some(path) = str_arg("path") else { return missing("path") };
+            let Some(first) = str_arg("first") else { return missing("first") };
+            let Some(new_text) = str_arg("new_text") else { return missing("new_text") };
+            let last = str_arg("last");
+            let insert_after =
+                arguments.get("insert_after").and_then(Value::as_bool).unwrap_or(false);
+            edit_lines(&cwd, path, first, last, new_text, insert_after)
         }
         FileOp::List => list_dir(&cwd, str_arg("path").unwrap_or("")),
         FileOp::Glob => {
@@ -252,7 +307,35 @@ fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
-fn read_file(cwd: &Path, path: &str, offset: Option<u64>, limit: Option<u64>) -> String {
+/// A short content hash for line anchors: FNV-1a 32 folded to 16 bits,
+/// rendered as 4 hex chars. It only guards staleness of a specific line
+/// (the line number does the locating), so 16 bits is plenty.
+fn line_hash(line: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in line.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{:04x}", (hash ^ (hash >> 16)) & 0xffff)
+}
+
+/// Render lines with `LINE:HASH|` anchors, numbering from `start` (1-based).
+fn anchored_lines(lines: &[&str], start: usize) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{}:{}|{line}", start + index, line_hash(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn read_file(
+    cwd: &Path,
+    path: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    anchored: bool,
+) -> String {
     let resolved = match resolve(cwd, path) {
         Ok(p) => p,
         Err(e) => return e,
@@ -262,18 +345,18 @@ fn read_file(cwd: &Path, path: &str, offset: Option<u64>, limit: Option<u64>) ->
         Err(e) => return format!("ERROR: cannot read `{path}`: {e}"),
     };
     let (Some(offset), limit) = (offset.or(limit.map(|_| 1)), limit) else {
-        return content;
+        if !anchored {
+            return content;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        return anchored_lines(&lines, 1);
     };
     let total = content.lines().count();
     let start = (offset.max(1) - 1) as usize;
     let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
     let window: Vec<&str> = content.lines().skip(start).take(take).collect();
-    format!(
-        "[lines {}-{} of {total}]\n{}",
-        start + 1,
-        start + window.len(),
-        window.join("\n")
-    )
+    let body = if anchored { anchored_lines(&window, start + 1) } else { window.join("\n") };
+    format!("[lines {}-{} of {total}]\n{body}", start + 1, start + window.len())
 }
 
 fn write_file(cwd: &Path, path: &str, content: &str) -> String {
@@ -338,6 +421,124 @@ fn edit_file(cwd: &Path, path: &str, old: &str, new: &str, replace_all: bool) ->
         ),
         Err(e) => format!("ERROR: cannot write `{path}`: {e}"),
     }
+}
+
+/// Parse an anchor like `42:9f3a` into its 1-based line number and hash.
+fn parse_anchor(anchor: &str) -> Result<(usize, String), String> {
+    let parsed = anchor
+        .trim()
+        .split_once(':')
+        .and_then(|(number, hash)| Some((number.parse::<usize>().ok()?, hash.trim())))
+        .filter(|(number, hash)| *number > 0 && !hash.is_empty());
+    match parsed {
+        Some((number, hash)) => Ok((number, hash.to_lowercase())),
+        None => Err(format!(
+            "ERROR: `{anchor}` is not a line anchor — copy one verbatim from a \
+             read_file listing (they look like `42:9f3a`)"
+        )),
+    }
+}
+
+fn edit_lines(
+    cwd: &Path,
+    path: &str,
+    first: &str,
+    last: Option<&str>,
+    new_text: &str,
+    insert_after: bool,
+) -> String {
+    let resolved = match resolve(cwd, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let content = match std::fs::read_to_string(&resolved) {
+        Ok(content) => content,
+        Err(e) => return format!("ERROR: cannot read `{path}`: {e}"),
+    };
+    let had_trailing_newline = content.ends_with('\n');
+    let lines: Vec<&str> = content.lines().collect();
+
+    // An anchor is only usable if the line it names still has the content
+    // the model saw — the stale check that keeps edits from corrupting.
+    let verify = |anchor: &str| -> Result<usize, String> {
+        let (number, hash) = parse_anchor(anchor)?;
+        let line = lines.get(number - 1).ok_or_else(|| {
+            format!(
+                "ERROR: anchor `{anchor}` is out of range — `{path}` has {} line(s)",
+                lines.len()
+            )
+        })?;
+        let current = line_hash(line);
+        if current != hash {
+            return Err(format!(
+                "ERROR: stale anchor `{anchor}` — line {number} is now \
+                 `{number}:{current}|{line}`. The file changed since you read it; \
+                 re-read it and use fresh anchors."
+            ));
+        }
+        Ok(number)
+    };
+    let first_line = match verify(first) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let last_line = match last {
+        Some(anchor) if !insert_after => match verify(anchor) {
+            Ok(n) => n,
+            Err(e) => return e,
+        },
+        _ => first_line,
+    };
+    if last_line < first_line {
+        return format!("ERROR: `last` (line {last_line}) is before `first` (line {first_line})");
+    }
+
+    let replacement: Vec<&str> =
+        if new_text.is_empty() { Vec::new() } else { new_text.lines().collect() };
+    let mut updated: Vec<&str> = Vec::new();
+    if insert_after {
+        updated.extend(&lines[..first_line]);
+        updated.extend(&replacement);
+        updated.extend(&lines[first_line..]);
+    } else {
+        updated.extend(&lines[..first_line - 1]);
+        updated.extend(&replacement);
+        updated.extend(&lines[last_line..]);
+    }
+    let mut new_content = updated.join("\n");
+    if had_trailing_newline && !new_content.is_empty() {
+        new_content.push('\n');
+    }
+    if let Err(e) = std::fs::write(&resolved, new_content) {
+        return format!("ERROR: cannot write `{path}`: {e}");
+    }
+
+    // Fresh anchors around the change, so nearby follow-up edits don't
+    // need a re-read.
+    let region_start = if insert_after { first_line } else { first_line - 1 };
+    let window_start = region_start.saturating_sub(2);
+    let window_end = (region_start + replacement.len() + 2).min(updated.len());
+    let action = if insert_after {
+        format!("inserted {} line(s) after line {first_line}", replacement.len())
+    } else if replacement.is_empty() {
+        format!("deleted lines {first_line}-{last_line}")
+    } else {
+        format!(
+            "replaced lines {first_line}-{last_line} with {} line(s)",
+            replacement.len()
+        )
+    };
+    let mut response = format!("edited `{path}`: {action}");
+    if window_start < window_end {
+        response.push_str(&format!(
+            "\n[lines {}-{} of {} — fresh anchors]\n{}",
+            window_start + 1,
+            window_end,
+            updated.len(),
+            anchored_lines(&updated[window_start..window_end], window_start + 1),
+        ));
+    }
+    response
 }
 
 fn list_dir(cwd: &Path, path: &str) -> String {
@@ -519,14 +720,14 @@ mod tests {
     fn read_write_edit_roundtrip() {
         let cwd = project("rwe");
         assert_eq!(
-            read_file(&cwd, "src/main.rs", None, None),
+            read_file(&cwd, "src/main.rs", None, None, false),
             "fn main() {\n    println!(\"hi\");\n}\n"
         );
         assert_eq!(
-            read_file(&cwd, "src/main.rs", Some(2), Some(1)),
+            read_file(&cwd, "src/main.rs", Some(2), Some(1), false),
             "[lines 2-2 of 3]\n    println!(\"hi\");"
         );
-        assert!(read_file(&cwd, "missing.rs", None, None).starts_with("ERROR"));
+        assert!(read_file(&cwd, "missing.rs", None, None, false).starts_with("ERROR"));
 
         // Write creates parents; edit requires a unique match.
         assert_eq!(write_file(&cwd, "deep/new.txt", "abc"), "created `deep/new.txt` (3 bytes)");
@@ -535,7 +736,7 @@ mod tests {
             edit_file(&cwd, "src/main.rs", "\"hi\"", "\"hello\"", false),
             "edited `src/main.rs` (1 replacement)"
         );
-        assert!(read_file(&cwd, "src/main.rs", None, None).contains("hello"));
+        assert!(read_file(&cwd, "src/main.rs", None, None, false).contains("hello"));
         assert!(edit_file(&cwd, "src/main.rs", "nope", "x", false).contains("not found"));
         let ambiguous = edit_file(&cwd, "src/lib.rs", "pub fn add", "fn add", false);
         assert!(ambiguous.contains("occurs 2 times"), "{ambiguous}");
@@ -543,6 +744,58 @@ mod tests {
             edit_file(&cwd, "src/lib.rs", "pub fn add", "fn add", true),
             "edited `src/lib.rs` (2 replacements)"
         );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn anchored_reads_and_line_edits() {
+        let cwd = project("anchors");
+        let anchor_for = |path: &str, number: usize| -> String {
+            let listing = read_file(&cwd, path, None, None, true);
+            let line = listing.lines().nth(number - 1).unwrap();
+            line.split('|').next().unwrap().to_string()
+        };
+
+        // Anchored reads prefix every line; windows keep absolute numbers.
+        let listing = read_file(&cwd, "src/main.rs", None, None, true);
+        assert!(listing.starts_with(&format!("1:{}|fn main() {{", line_hash("fn main() {"))));
+        let window = read_file(&cwd, "src/main.rs", Some(2), Some(1), true);
+        assert!(window.starts_with("[lines 2-2 of 3]\n2:"), "{window}");
+
+        // Replace one line via its anchor; the reply carries fresh anchors.
+        let anchor = anchor_for("src/main.rs", 2);
+        let reply = edit_lines(&cwd, "src/main.rs", &anchor, None, "    println!(\"anchored\");", false);
+        assert!(reply.starts_with("edited `src/main.rs`: replaced lines 2-2 with 1 line(s)"), "{reply}");
+        assert!(reply.contains("fresh anchors"), "{reply}");
+        assert!(read_file(&cwd, "src/main.rs", None, None, false).contains("anchored"));
+
+        // The old anchor is now stale and rejected with the current line.
+        let stale = edit_lines(&cwd, "src/main.rs", &anchor, None, "x", false);
+        assert!(stale.contains("stale anchor"), "{stale}");
+        assert!(stale.contains("re-read"), "{stale}");
+
+        // Insert after line 1 without removing anything; then delete it by
+        // range with an empty new_text.
+        let top = anchor_for("src/main.rs", 1);
+        let reply = edit_lines(&cwd, "src/main.rs", &top, None, "// header", true);
+        assert!(reply.contains("inserted 1 line(s) after line 1"), "{reply}");
+        let inserted = anchor_for("src/main.rs", 2);
+        assert!(inserted.ends_with(&line_hash("// header")), "{inserted}");
+        let reply = edit_lines(&cwd, "src/main.rs", &inserted, None, "", false);
+        assert!(reply.contains("deleted lines 2-2"), "{reply}");
+        assert!(!read_file(&cwd, "src/main.rs", None, None, false).contains("header"));
+
+        // Range replacement across lines 1..3, trailing newline preserved.
+        let (a1, a3) = (anchor_for("src/main.rs", 1), anchor_for("src/main.rs", 3));
+        let reply = edit_lines(&cwd, "src/main.rs", &a1, Some(&a3), "fn main() {}", false);
+        assert!(reply.contains("replaced lines 1-3 with 1 line(s)"), "{reply}");
+        assert_eq!(read_file(&cwd, "src/main.rs", None, None, false), "fn main() {}\n");
+
+        // Malformed and out-of-range anchors are corrected, not applied.
+        assert!(edit_lines(&cwd, "src/main.rs", "42", None, "x", false)
+            .contains("not a line anchor"));
+        assert!(edit_lines(&cwd, "src/main.rs", "99:abcd", None, "x", false)
+            .contains("out of range"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

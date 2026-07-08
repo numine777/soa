@@ -294,10 +294,20 @@ files = true
 ```
 
 `read_file` (with optional line windows), `list_dir`, `glob`, and `grep`
-(regex, `path:line:` output) are always included; `write_file` and
-`edit_file` only in `read_write` mode. `edit_file` replaces an exact
-string and insists on a unique match — far more reliable for small local
-models than whole-file rewrites. Everything is rooted at the working
+(regex, `path:line:` output) are always included; `write_file`,
+`edit_lines`, and `edit_file` only in `read_write` mode.
+
+**Hash-anchored edits.** In `read_write` mode, `read_file` prefixes every
+line with an anchor — `42:9f3a|` (line number + a short content hash) —
+and `edit_lines` addresses edits by those anchors instead of asking the
+model to reproduce file content byte-exactly: replace a range, insert
+after a line, or delete (empty `new_text`). The hash must match the
+file's *current* content, so a stale anchor (the file changed since the
+read) is rejected with the line's fresh anchor instead of corrupting the
+file, and every successful edit returns re-anchored context around the
+change so nearby follow-ups don't need a re-read. `edit_file`
+(exact-string replacement with a unique-match requirement) remains for
+cross-line rewrites. Everything is rooted at the working
 directory (paths that escape it are rejected), `glob`/`grep` skip `.git`,
 `node_modules`, `target`, and hidden entries, and results are capped so
 one call can't flood the context. Writes participate in approvals

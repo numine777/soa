@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(names(0), vec!["read_file", "list_dir", "glob", "grep"]);
         assert_eq!(
             names(1),
-            vec!["read_file", "list_dir", "glob", "grep", "write_file", "edit_file"]
+            vec!["read_file", "list_dir", "glob", "grep", "write_file", "edit_lines", "edit_file"]
         );
         assert!(names(2).is_empty());
     }

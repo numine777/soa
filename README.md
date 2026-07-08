@@ -129,7 +129,15 @@ llama.cpp, vLLM, or a hosted API.
 [providers.ollama]
 base_url = "http://localhost:11434/v1"
 api_key = "${SOME_KEY}"     # optional; ${VAR} expands from the environment
+stream = true               # default: stream responses over SSE; set false
+                            # for servers that don't support it
 ```
+
+Responses stream token-by-token everywhere: live in the chat TUI (with a
+`▌` cursor while text arrives), and to stderr during `soa run` so you can
+watch stages think. Stdout still receives only the final answer, and only
+when it isn't the same terminal that just showed the stream — so piping
+`soa run` output stays clean while interactive runs aren't duplicated.
 
 ### `[models.<name>]`
 

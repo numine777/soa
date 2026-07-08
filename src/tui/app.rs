@@ -36,6 +36,8 @@ pub enum TranscriptItem {
 
 /// Events sent by the background worker back to the UI loop.
 pub enum AgentEvent {
+    /// A streamed fragment of the assistant's in-progress reply.
+    Delta(String),
     ToolCall { name: String, args: String },
     ToolDone { preview: String },
     Diff(DiffEntry),
@@ -71,6 +73,9 @@ pub struct App {
     pub diff_viewport: usize,
     pub tool_count: usize,
     pub spinner: usize,
+    /// The assistant reply currently streaming in, shown live at the bottom
+    /// of the transcript until the turn completes.
+    pub stream_buffer: String,
     pub quit: bool,
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
@@ -126,6 +131,7 @@ impl App {
             diff_viewport: 20,
             tool_count: 0,
             spinner: 0,
+            stream_buffer: String::new(),
             quit: false,
             turn: None,
             compacting: false,
@@ -749,10 +755,20 @@ impl App {
         }));
     }
 
+    /// Move a partially streamed reply into the transcript.
+    fn flush_stream_buffer(&mut self) {
+        let partial = std::mem::take(&mut self.stream_buffer);
+        let partial = partial.trim_end();
+        if !partial.is_empty() {
+            self.transcript.push(TranscriptItem::Assistant(partial.to_string()));
+        }
+    }
+
     pub fn cancel_turn(&mut self) {
         if let Some(handle) = self.turn.take() {
             handle.abort();
             self.compacting = false;
+            self.flush_stream_buffer();
             self.info("cancelled");
         }
     }
@@ -780,7 +796,13 @@ impl App {
                 | AgentEvent::Diff(_)
         );
         match event {
+            AgentEvent::Delta(fragment) => {
+                self.stream_buffer.push_str(&fragment);
+            }
             AgentEvent::ToolCall { name, args } => {
+                // Content streamed before a tool call is commentary the
+                // final answer won't repeat — keep it.
+                self.flush_stream_buffer();
                 self.transcript.push(TranscriptItem::ToolCall { name, args });
             }
             AgentEvent::ToolDone { preview } => {
@@ -791,6 +813,9 @@ impl App {
                 self.diffs.push(entry);
             }
             AgentEvent::Turn { history, text } => {
+                // The buffer holds the same text that just streamed; the
+                // final Turn event is authoritative.
+                self.stream_buffer.clear();
                 self.history = history;
                 if text.trim().is_empty() {
                     self.info("(model returned an empty response)");
@@ -822,6 +847,7 @@ impl App {
                 ));
             }
             AgentEvent::Error(message) => {
+                self.flush_stream_buffer();
                 self.error(message);
                 self.turn = None;
                 self.compacting = false;
@@ -856,6 +882,11 @@ async fn turn_worker(
     max_turns: u32,
     tx: UnboundedSender<AgentEvent>,
 ) {
+    let delta_tx = tx.clone();
+    let on_delta = move |fragment: &str| {
+        let _ = delta_tx.send(AgentEvent::Delta(fragment.to_string()));
+    };
+
     for _ in 0..max_turns {
         let mut request = Vec::with_capacity(history.len() + 1);
         if let Some(system) = &system {
@@ -863,7 +894,7 @@ async fn turn_worker(
         }
         request.extend(history.iter().cloned());
 
-        let reply = match client.chat(&request, &definitions).await {
+        let reply = match client.chat_streamed(&request, &definitions, Some(&on_delta)).await {
             Ok(reply) => reply,
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("{e:#}")));

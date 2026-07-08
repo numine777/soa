@@ -7,7 +7,7 @@ mod stage;
 mod tools;
 mod tui;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -245,6 +245,22 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Streams stage output to stderr as it arrives.
+fn stream_to_stderr(fragment: &str) {
+    let mut err = std::io::stderr();
+    let _ = err.write_all(fragment.as_bytes());
+    let _ = err.flush();
+}
+
+/// The final answer goes to stdout for pipes — except when both stdout and
+/// stderr are the same terminal, where it just got streamed and printing it
+/// again would duplicate it on screen.
+fn print_final(output: &str) {
+    if !(std::io::stdout().is_terminal() && std::io::stderr().is_terminal()) {
+        println!("{output}");
+    }
+}
+
 async fn run_pipeline(
     config: &Config,
     task: &str,
@@ -272,12 +288,22 @@ async fn run_pipeline(
         let manager = McpManager::connect(servers, config, false).await?;
         let context = stage::PipelineContext::new(task);
         eprintln!("── stage {} ──", stage.name);
-        let result =
-            stage::run_stage(config, stage, true, &context, &manager, &http, &[]).await;
+        let result = stage::run_stage(
+            config,
+            stage,
+            true,
+            &context,
+            &manager,
+            &http,
+            &[],
+            Some(&stream_to_stderr),
+        )
+        .await;
         manager.shutdown().await;
         return match result? {
             stage::StageOutcome::Final(output) => {
-                println!("{output}");
+                eprintln!();
+                print_final(&output);
                 Ok(())
             }
             stage::StageOutcome::Reprompt { .. } => unreachable!("no reprompt targets offered"),
@@ -336,17 +362,15 @@ async fn run_pipeline(
             &manager,
             &http,
             &reprompt_targets,
+            Some(&stream_to_stderr),
         )
         .await
         {
             Ok(stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
                 position += 1;
-                // Intermediate outputs go to stderr; only the pipeline's
-                // final answer lands on stdout so `soa run` is pipe-friendly.
-                if position < order.len() {
-                    eprintln!("{output}\n");
-                }
+                // The output already streamed to stderr; just separate stages.
+                eprintln!("\n");
                 last_output = Some(output);
             }
             Ok(stage::StageOutcome::Reprompt { target, instructions }) => {
@@ -370,7 +394,7 @@ async fn run_pipeline(
     if result.is_ok()
         && let Some(output) = last_output
     {
-        println!("{output}");
+        print_final(&output);
     }
 
     manager.shutdown().await;

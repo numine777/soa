@@ -127,6 +127,14 @@ pub struct Provider {
     pub base_url: String,
     /// Optional bearer token. Supports `${ENV_VAR}` expansion.
     pub api_key: Option<String>,
+    /// Stream responses token-by-token over SSE. Disable for servers that
+    /// don't support `"stream": true`.
+    #[serde(default = "default_true")]
+    pub stream: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A named model: a provider reference plus default sampling parameters.

@@ -224,6 +224,13 @@ fn build_transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     }
 
+    // The in-progress streamed reply, with a cursor mark.
+    if !app.stream_buffer.is_empty() {
+        lines.push(Line::raw(""));
+        let live = format!("{}▌", app.stream_buffer);
+        push_wrapped(&mut lines, &live, width, "", "", Style::default());
+    }
+
     lines
 }
 

@@ -487,12 +487,15 @@ pub fn build_client(
             top_p: model.top_p,
             max_tokens: max_tokens.or(model.max_tokens),
         },
+        provider.stream,
     ))
 }
 
 /// Run one stage to completion. `reprompt_targets` are the stages the model
 /// may hand control to via `reprompt_stage` (empty = tool not offered, as in
-/// chat mode and single-stage runs).
+/// chat mode and single-stage runs). `on_delta` receives streamed content
+/// fragments for live display.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stage(
     config: &Config,
     stage: &Stage,
@@ -501,6 +504,7 @@ pub async fn run_stage(
     mcp: &McpManager,
     http: &reqwest::Client,
     reprompt_targets: &[String],
+    on_delta: Option<crate::provider::DeltaHandler<'_>>,
 ) -> Result<StageOutcome> {
     let client =
         build_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
@@ -542,7 +546,15 @@ pub async fn run_stage(
     );
 
     for turn in 1..=max_turns {
-        let reply = client.chat(&messages, &definitions).await?;
+        let reply = client.chat_streamed(&messages, &definitions, on_delta).await?;
+
+        // Terminate the streamed text before anything else (logs, tool
+        // lines) writes to the same terminal.
+        if let (Some(handler), Some(content)) = (on_delta, reply.content.as_deref())
+            && !content.is_empty()
+        {
+            handler("\n");
+        }
 
         if reply.tool_calls.is_empty() {
             let content = reply.content.unwrap_or_default();

@@ -116,6 +116,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
+| `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls |
@@ -192,6 +193,32 @@ servers. In `read_only` mode a tool is only exposed if the server annotates
 it with `readOnlyHint = true` **or** you list it in that server's
 `readonly_tools`. Run `soa tools` to see how each tool is classified.
 MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
+
+## Shell tool
+
+Stages and agents can opt into a built-in `shell` tool:
+
+```toml
+[[stage]]
+name = "review"
+mode = "read_only"
+shell = true
+shell_allow = ["cargo test*", "cargo check*", "git status*"]
+```
+
+Commands run via `sh -c` in the working directory; the model gets the exit
+code, stdout, and stderr back (clamped by `max_tool_output_chars`), and
+commands are killed after `settings.shell_timeout_secs`. `shell_allow`
+restricts commands to `*`-wildcard patterns anchored at both ends —
+`"cargo *"` permits `cargo test --all` but not `echo cargo` — and a
+disallowed command returns the pattern list to the model as an error it can
+adapt to. An empty `shell_allow` means unrestricted.
+
+The grant is deliberately independent of `mode`: a `read_only` review stage
+can run the test suite without gaining any MCP write tools. That also means
+`shell = true` on a read-only stage is a real escape hatch — scope it with
+`shell_allow` when the stage's model shouldn't have arbitrary command
+execution.
 
 ## Workflows
 

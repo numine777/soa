@@ -182,6 +182,9 @@ mod tests {
 
     #[test]
     fn loads_and_composes_skills() {
+        // list_skills also searches the global data dir, which store tests
+        // repoint via XDG_DATA_HOME — serialize with them.
+        let _guard = crate::tui::store::ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("soa-skills-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("nested")).unwrap();

@@ -108,8 +108,9 @@ mode = "read_write"
 mcp = ["filesystem"]
 subagents = ["researcher"]
 skills = ["careful-editing"]     # from skills/ next to this file (settings.skills_dir)
+shell = true                     # unrestricted shell (stage is read_write anyway)
 max_turns = 32
-system_prompt = "You are a careful engineer. Complete the task, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."
+system_prompt = "You are a careful engineer. Complete the task and verify it builds, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."
 prompt = """
 # Task
 {{input}}
@@ -131,11 +132,17 @@ model = "reviewer"
 mode = "read_only"
 mcp = ["filesystem"]
 can_reprompt = ["implement", "review"]
+# The shell grant is independent of mode: review can run the test suite
+# without gaining any file-write tools.
+shell = true
+shell_allow = ["cargo check*", "cargo test*", "cargo build*", "cargo clippy*", "git status*", "git diff*", "git log*"]
 system_prompt = """
 You are a code reviewer. Inspect the work described below using the
-read-only tools. If more work is required, call reprompt_stage with
-specific, actionable instructions for the `implement` stage. If the work is
-complete and correct, reply with a short summary of what was accomplished.
+read-only tools, and verify it by running the build and tests with the
+shell tool. If more work is required, call reprompt_stage with specific,
+actionable instructions for the `implement` stage (include failing test
+output). If the work is complete and correct, reply with a short summary
+of what was accomplished.
 """
 
 # ---------------------------------------------------------------------------

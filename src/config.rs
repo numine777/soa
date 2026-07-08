@@ -63,6 +63,10 @@ pub struct Settings {
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Shell commands run by the built-in `shell` tool are killed after
+    /// this many seconds.
+    #[serde(default = "default_shell_timeout")]
+    pub shell_timeout_secs: u64,
     /// Directory holding skills, relative to the config file (default
     /// `skills/`). The global `~/.local/share/soa/skills` is also searched.
     pub skills_dir: Option<PathBuf>,
@@ -93,10 +97,15 @@ impl Default for Settings {
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
             request_timeout_secs: default_timeout(),
+            shell_timeout_secs: default_shell_timeout(),
             skills_dir: None,
             default_workflow: None,
         }
     }
+}
+
+fn default_shell_timeout() -> u64 {
+    120
 }
 
 fn default_search_results() -> usize {
@@ -219,6 +228,12 @@ pub struct Agent {
     /// Skills appended to this agent's system prompt.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Offer the built-in `shell` tool (explicit grant, independent of mode).
+    #[serde(default)]
+    pub shell: bool,
+    /// Restrict shell commands to these `*`-wildcard patterns.
+    #[serde(default)]
+    pub shell_allow: Vec<String>,
 }
 
 impl Agent {
@@ -298,6 +313,15 @@ pub struct Stage {
     /// Skills appended to this stage's system prompt (see the skills dir).
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Offer the built-in `shell` tool. This is an explicit grant,
+    /// independent of `mode` — a read_only review stage can run tests
+    /// without gaining file-write tools.
+    #[serde(default)]
+    pub shell: bool,
+    /// Restrict shell commands to these `*`-wildcard patterns
+    /// (e.g. `["cargo *", "git status"]`). Empty = unrestricted.
+    #[serde(default)]
+    pub shell_allow: Vec<String>,
 }
 
 impl Stage {
@@ -418,6 +442,11 @@ impl Config {
                     ));
                 }
             }
+            if !agent.shell_allow.is_empty() && !agent.shell {
+                errors.push(format!(
+                    "agent `{name}` sets shell_allow but not `shell = true`"
+                ));
+            }
         }
 
         let all_stage_names: Vec<&str> = self.stages.iter().map(|s| s.name.as_str()).collect();
@@ -442,6 +471,12 @@ impl Config {
                         "stage `{name}` subagents references unknown agent `{subagent}`"
                     ));
                 }
+            }
+
+            if !stage.shell_allow.is_empty() && !stage.shell {
+                errors.push(format!(
+                    "stage `{name}` sets shell_allow but not `shell = true`"
+                ));
             }
 
             if !self.models.contains_key(&stage.model) {

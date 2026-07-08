@@ -190,15 +190,22 @@ impl PromptHistory {
     }
 }
 
+/// `XDG_DATA_HOME` is process-global, so tests that touch it (here and in
+/// other modules) must not overlap.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn with_temp_data_dir<T>(test: impl FnOnce() -> T) -> T {
-        let dir = std::env::temp_dir().join(format!("soa-store-test-{}", std::process::id()));
+    fn with_temp_data_dir<T>(tag: &str, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir()
+            .join(format!("soa-store-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: tests in this module run single-threaded over this var.
+        // SAFETY: serialized by ENV_LOCK.
         unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
         let result = test();
         let _ = std::fs::remove_dir_all(&dir);
@@ -215,7 +222,7 @@ mod tests {
 
     #[test]
     fn session_roundtrip_and_listing() {
-        with_temp_data_dir(|| {
+        with_temp_data_dir("sessions", || {
             let session = Session {
                 id: "20260707-120000".to_string(),
                 started_at: 100,
@@ -238,7 +245,7 @@ mod tests {
 
     #[test]
     fn prompt_history_roundtrip() {
-        with_temp_data_dir(|| {
+        with_temp_data_dir("prompts", || {
             let mut history = PromptHistory::load();
             assert!(history.entries.is_empty());
             history.push("first");

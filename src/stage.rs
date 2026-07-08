@@ -59,6 +59,9 @@ pub enum ToolBinding {
     WebSearch,
     /// Delegate the call's `task` to a configured subagent.
     Agent { agent: String },
+    /// Run the call's `command` with `sh -c`, restricted to the owning
+    /// context's allowlist patterns (empty = unrestricted).
+    Shell { allow: Vec<String> },
 }
 
 pub struct StageTool {
@@ -77,6 +80,8 @@ pub struct ToolProfile<'a> {
     pub mcp: &'a [String],
     pub web_search: bool,
     pub subagents: &'a [String],
+    pub shell: bool,
+    pub shell_allow: &'a [String],
 }
 
 impl crate::config::Stage {
@@ -87,6 +92,8 @@ impl crate::config::Stage {
             mcp: &self.mcp,
             web_search: self.web_search,
             subagents: &self.subagents,
+            shell: self.shell,
+            shell_allow: &self.shell_allow,
         }
     }
 }
@@ -99,6 +106,8 @@ impl crate::config::Agent {
             mcp: &self.mcp,
             web_search: self.web_search,
             subagents: &self.subagents,
+            shell: self.shell,
+            shell_allow: &self.shell_allow,
         }
     }
 }
@@ -196,6 +205,20 @@ pub fn assemble_tools(
             definition: tools::web_search_definition(),
             binding: ToolBinding::WebSearch,
             read_only: true,
+        });
+    }
+
+    // `shell = true` is an explicit per-context grant, offered regardless
+    // of mode: requiring read_write just to run tests would force the whole
+    // MCP write surface onto review-style stages.
+    if profile.shell {
+        stage_tools.push(StageTool {
+            definition: tools::shell_definition(
+                config.settings.shell_timeout_secs,
+                profile.shell_allow,
+            ),
+            binding: ToolBinding::Shell { allow: profile.shell_allow.to_vec() },
+            read_only: false,
         });
     }
 
@@ -345,6 +368,25 @@ async fn dispatch_tool_call_inner(
                 // The agent's failure becomes feedback, not a crashed turn.
                 Err(e) => Ok(format!("ERROR: agent `{agent}` failed: {e:#}")),
             }
+        }
+        ToolBinding::Shell { allow } => {
+            let command =
+                arguments.get("command").and_then(Value::as_str).unwrap_or_default();
+            if command.trim().is_empty() {
+                return Ok("ERROR: `command` must be a non-empty string".to_string());
+            }
+            if !tools::command_allowed(allow, command) {
+                return Ok(format!(
+                    "ERROR: command not permitted here — allowed patterns: {}",
+                    allow.join(", ")
+                ));
+            }
+            tracing::info!(command = %truncate(command, 200), "shell exec");
+            Ok(tools::run_shell(
+                command,
+                std::time::Duration::from_secs(config.settings.shell_timeout_secs),
+            )
+            .await)
         }
     }
 }

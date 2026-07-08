@@ -2,6 +2,7 @@ mod config;
 mod diff;
 mod mcp;
 mod provider;
+mod skills;
 mod stage;
 mod tools;
 mod tui;
@@ -43,6 +44,10 @@ enum Command {
         /// Run only this stage instead of the whole pipeline.
         #[arg(long)]
         stage: Option<String>,
+        /// Named workflow to run (default: settings.default_workflow, a
+        /// workflow named `default`, or every stage in declaration order).
+        #[arg(short, long)]
+        workflow: Option<String>,
     },
     /// Interactive chat TUI using a stage's model, tools, and mode.
     Chat {
@@ -59,6 +64,8 @@ enum Command {
     },
     /// List saved chat sessions.
     Sessions,
+    /// List discoverable skills.
+    Skills,
 }
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
@@ -93,17 +100,29 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Check => {
-            // Config::load already validated; also check prompt files resolve.
+            // Config::load already validated; also check that prompt files
+            // and referenced skills resolve.
             for stage in &config.stages {
-                stage.resolve_system_prompt(&config.base_dir)?;
+                let system = stage.resolve_system_prompt(&config.base_dir)?;
+                skills::apply_skills(
+                    &config,
+                    &format!("stage `{}`", stage.name),
+                    system,
+                    &stage.skills,
+                )?;
+            }
+            for (name, agent) in &config.agents {
+                let system = agent.resolve_system_prompt(&config.base_dir)?;
+                skills::apply_skills(&config, &format!("agent `{name}`"), system, &agent.skills)?;
             }
             println!(
-                "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s)",
+                "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s)",
                 config.providers.len(),
                 config.models.len(),
                 config.mcp.len(),
                 config.agents.len(),
-                config.stages.len()
+                config.stages.len(),
+                config.workflows.len()
             );
             Ok(())
         }
@@ -114,13 +133,58 @@ async fn main() -> Result<()> {
                     Mode::ReadWrite => "read_write",
                 };
                 println!(
-                    "{}. {}  model={}  mode={}  mcp=[{}]{}",
+                    "{}. {}  model={}  mode={}  mcp=[{}]{}{}",
                     index + 1,
                     stage.name,
                     stage.model,
                     mode,
                     stage.mcp.join(", "),
                     if stage.web_search { "  +web_search" } else { "" },
+                    if stage.skills.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  skills=[{}]", stage.skills.join(", "))
+                    },
+                );
+            }
+            if !config.workflows.is_empty() {
+                println!("\nworkflows:");
+                for (name, workflow) in &config.workflows {
+                    let default_marker = match &config.settings.default_workflow {
+                        Some(default) if default == name => "  (default)",
+                        None if name == "default" => "  (default)",
+                        _ => "",
+                    };
+                    println!(
+                        "  {name}: {}{}{}",
+                        workflow.stages.join(" -> "),
+                        if workflow.description.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  — {}", workflow.description)
+                        },
+                        default_marker,
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Skills => {
+            let found = skills::list_skills(&config);
+            if found.is_empty() {
+                let dirs = skills::skills_dirs(&config);
+                println!(
+                    "no skills found (searched: {})",
+                    dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+                );
+                return Ok(());
+            }
+            for skill in found {
+                println!(
+                    "{}  {}  ({})",
+                    skill.name,
+                    if skill.description.is_empty() { "-" } else { &skill.description },
+                    skill.path.display()
                 );
             }
             Ok(())
@@ -142,7 +206,7 @@ async fn main() -> Result<()> {
             manager.shutdown().await;
             Ok(())
         }
-        Command::Run { task, stage } => {
+        Command::Run { task, stage, workflow } => {
             let task = if task.is_empty() {
                 let mut buffer = String::new();
                 std::io::stdin()
@@ -155,7 +219,7 @@ async fn main() -> Result<()> {
             if task.is_empty() {
                 bail!("no task given (pass it as an argument or on stdin)");
             }
-            run_pipeline(&config, &task, stage.as_deref()).await
+            run_pipeline(&config, &task, stage.as_deref(), workflow.as_deref()).await
         }
         Command::Chat { stage, no_mouse, resume } => {
             tui::run(config, stage.as_deref(), !no_mouse, resume.as_deref()).await
@@ -181,7 +245,12 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> Result<()> {
+async fn run_pipeline(
+    config: &Config,
+    task: &str,
+    only_stage: Option<&str>,
+    workflow: Option<&str>,
+) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.settings.request_timeout_secs))
         .build()
@@ -215,23 +284,31 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
         };
     }
 
+    // The workflow gives the execution order as indexes into config.stages.
+    let order = config.resolve_workflow(workflow)?;
+    if order.is_empty() {
+        bail!("nothing to run: the selected workflow is empty");
+    }
+
     // Agents can be reached from any stage, so connect their servers too.
-    let needed_servers: Vec<String> = config
-        .stages
+    let needed_servers: Vec<String> = order
         .iter()
-        .flat_map(|s| s.mcp.iter().cloned())
+        .flat_map(|&i| config.stages[i].mcp.iter().cloned())
         .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
         .collect();
     let manager = McpManager::connect(needed_servers, config, false).await?;
 
+    let workflow_stage_names: Vec<&str> =
+        order.iter().map(|&i| config.stages[i].name.as_str()).collect();
+
     let mut context = stage::PipelineContext::new(task);
-    let mut current = 0;
+    let mut position = 0;
     let mut runs = 0u32;
     let mut last_output = None;
 
     let mut result = Ok(());
-    while current < config.stages.len() {
-        let stage = &config.stages[current];
+    while position < order.len() {
+        let stage = &config.stages[order[position]];
         runs += 1;
         if runs > config.settings.max_stage_runs {
             result = Err(anyhow::anyhow!(
@@ -244,6 +321,13 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
 
         eprintln!("── run {runs} · stage {} ──", stage.name);
         let is_first = context.previous.is_none();
+        // Only offer reprompt targets that are part of the active workflow.
+        let reprompt_targets: Vec<String> = stage
+            .can_reprompt
+            .iter()
+            .filter(|t| workflow_stage_names.contains(&t.as_str()))
+            .cloned()
+            .collect();
         match stage::run_stage(
             config,
             stage,
@@ -251,16 +335,16 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
             &context,
             &manager,
             &http,
-            &stage.can_reprompt,
+            &reprompt_targets,
         )
         .await
         {
             Ok(stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
-                current += 1;
+                position += 1;
                 // Intermediate outputs go to stderr; only the pipeline's
                 // final answer lands on stdout so `soa run` is pipe-friendly.
-                if current < config.stages.len() {
+                if position < order.len() {
                     eprintln!("{output}\n");
                 }
                 last_output = Some(output);
@@ -271,11 +355,10 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
                 // The handoff instructions become the sender's recorded
                 // output, so the target sees them as {{previous}}.
                 context.record(&stage.name, instructions);
-                current = config
-                    .stages
+                position = workflow_stage_names
                     .iter()
-                    .position(|s| s.name == target)
-                    .expect("can_reprompt targets are validated at config load");
+                    .position(|name| *name == target)
+                    .expect("reprompt targets are filtered to the active workflow");
             }
             Err(e) => {
                 result = Err(e);

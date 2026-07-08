@@ -376,8 +376,14 @@ pub fn run_agent<'a>(
             .map(|t| (t.definition.name.as_str(), &t.binding))
             .collect();
 
+        let system = crate::skills::apply_skills(
+            config,
+            &format!("agent `{agent_name}`"),
+            agent.resolve_system_prompt(&config.base_dir)?,
+            &agent.skills,
+        )?;
         let mut messages = Vec::new();
-        if let Some(system) = agent.resolve_system_prompt(&config.base_dir)? {
+        if let Some(system) = system {
             messages.push(ChatMessage::System { content: system });
         }
         messages.push(ChatMessage::User { content: task.to_string() });
@@ -517,8 +523,14 @@ pub async fn run_stage(
         &context.outputs,
     )?;
 
+    let system = crate::skills::apply_skills(
+        config,
+        &format!("stage `{}`", stage.name),
+        stage.resolve_system_prompt(&config.base_dir)?,
+        &stage.skills,
+    )?;
     let mut messages = Vec::new();
-    if let Some(system) = stage.resolve_system_prompt(&config.base_dir)? {
+    if let Some(system) = system {
         messages.push(ChatMessage::System { content: system });
     }
     messages.push(ChatMessage::User { content: user_prompt });

@@ -672,7 +672,16 @@ impl App {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
         };
-        let system = match stage.resolve_system_prompt(&self.config.base_dir) {
+        let system = match stage.resolve_system_prompt(&self.config.base_dir).and_then(
+            |system| {
+                crate::skills::apply_skills(
+                    &config,
+                    &format!("stage `{}`", stage.name),
+                    system,
+                    &stage.skills,
+                )
+            },
+        ) {
             Ok(system) => system,
             Err(e) => return self.error(format!("{e:#}")),
         };

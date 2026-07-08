@@ -34,9 +34,11 @@ answer is printed to stdout, so `soa run` composes with pipes.
 soa check              # validate soa.toml (cross-references, templates, prompt files)
 soa stages             # list the configured pipeline
 soa tools              # connect to every MCP server, list tools with ro/rw markers
-soa run "task"         # run the pipeline (or: echo "task" | soa run)
+soa run "task"         # run the default workflow (or: echo "task" | soa run)
+soa run -w quickfix "task"    # run a named workflow
 soa run --stage plan "task"   # run a single stage
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
+soa skills             # list discoverable skills
 soa -c other.toml …    # use a different config file
 ```
 
@@ -114,6 +116,8 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
+| `skills_dir` | `skills/` | directory of skills, relative to the config file |
+| `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls |
 
 ### `[providers.<name>]`
@@ -180,6 +184,52 @@ servers. In `read_only` mode a tool is only exposed if the server annotates
 it with `readOnlyHint = true` **or** you list it in that server's
 `readonly_tools`. Run `soa tools` to see how each tool is classified.
 MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
+
+## Workflows
+
+`[workflows.<name>]` defines a named pipeline over the stage library, so
+one config can hold several ways of combining the same stages:
+
+```toml
+[workflows.default]
+description = "research, implement, review"
+stages = ["research", "implement", "review"]
+
+[workflows.quickfix]
+stages = ["implement", "review"]
+```
+
+`soa run "task"` uses `settings.default_workflow`, else a workflow named
+`default`, else all `[[stage]]` entries in declaration order (so configs
+without workflows behave exactly as before). `soa run -w quickfix "task"`
+picks one explicitly, and `soa stages` lists workflows with their stage
+chains. A stage may appear in any number of workflows but only once per
+workflow. Reprompting respects the active workflow: `can_reprompt` targets
+that aren't part of it are not offered to the model, and a reprompt jump
+resumes in *workflow* order.
+
+## Skills
+
+A skill is a reusable instruction file appended to a stage's or agent's
+system prompt. Skills live in `skills/` next to the config file
+(`settings.skills_dir` to change) or globally in
+`~/.local/share/soa/skills`, either as `<name>.md` or `<name>/SKILL.md`
+(directory form, for skills that ship supporting files), with optional
+frontmatter:
+
+```markdown
+---
+name: careful-editing
+description: Conventions for safe, minimal file edits
+---
+When editing files: …
+```
+
+Attach skills with `skills = ["careful-editing"]` on any stage or agent;
+each body is appended to the system prompt under a `# Skill: <name>`
+heading, in list order. Project skills shadow global ones with the same
+name. `soa skills` lists everything discoverable, and `soa check` fails
+fast on references to missing skills.
 
 ## Subagents
 

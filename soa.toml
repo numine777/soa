@@ -107,6 +107,7 @@ model = "coder"
 mode = "read_write"
 mcp = ["filesystem"]
 subagents = ["researcher"]
+skills = ["careful-editing"]     # from skills/ next to this file (settings.skills_dir)
 max_turns = 32
 system_prompt = "You are a careful engineer. Complete the task, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."
 prompt = """
@@ -136,3 +137,17 @@ read-only tools. If more work is required, call reprompt_stage with
 specific, actionable instructions for the `implement` stage. If the work is
 complete and correct, reply with a short summary of what was accomplished.
 """
+
+# ---------------------------------------------------------------------------
+# Workflows: named pipelines over the stage library. `soa run` uses the
+# workflow named "default" (or settings.default_workflow); pick another
+# with `soa run -w quickfix "task"`. `soa stages` lists them.
+# ---------------------------------------------------------------------------
+
+[workflows.default]
+description = "research, implement, review"
+stages = ["research", "implement", "review"]
+
+[workflows.quickfix]
+description = "skip research for small, well-understood changes"
+stages = ["implement", "review"]

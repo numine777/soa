@@ -20,6 +20,11 @@ pub struct Config {
     /// Subagents that stages (and other agents) can delegate tasks to.
     #[serde(default)]
     pub agents: BTreeMap<String, Agent>,
+    /// Named pipelines: ordered lists of stage names. When present,
+    /// `soa run --workflow <name>` picks one; otherwise the [[stage]]
+    /// declaration order is the pipeline.
+    #[serde(default)]
+    pub workflows: BTreeMap<String, Workflow>,
     #[serde(default, rename = "stage")]
     pub stages: Vec<Stage>,
 
@@ -58,6 +63,22 @@ pub struct Settings {
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
+    /// Directory holding skills, relative to the config file (default
+    /// `skills/`). The global `~/.local/share/soa/skills` is also searched.
+    pub skills_dir: Option<PathBuf>,
+    /// Workflow used by `soa run` when none is passed. Falls back to a
+    /// workflow literally named `default`, then to the [[stage]] order.
+    pub default_workflow: Option<String>,
+}
+
+/// A named pipeline over the stage library.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workflow {
+    #[serde(default)]
+    pub description: String,
+    /// Stage names in execution order (each stage may appear once).
+    pub stages: Vec<String>,
 }
 
 // A hand-written Default keeps the "[settings] table absent" case in sync
@@ -72,6 +93,8 @@ impl Default for Settings {
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
             request_timeout_secs: default_timeout(),
+            skills_dir: None,
+            default_workflow: None,
         }
     }
 }
@@ -185,6 +208,9 @@ pub struct Agent {
     /// `settings.max_agent_depth`).
     #[serde(default)]
     pub subagents: Vec<String>,
+    /// Skills appended to this agent's system prompt.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 impl Agent {
@@ -261,6 +287,9 @@ pub struct Stage {
     /// Keys into `[agents]`: subagents this stage's model may delegate to.
     #[serde(default)]
     pub subagents: Vec<String>,
+    /// Skills appended to this stage's system prompt (see the skills dir).
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 impl Stage {
@@ -455,11 +484,68 @@ impl Config {
             seen_stage_names.push(name);
         }
 
+        for (name, workflow) in &self.workflows {
+            if workflow.stages.is_empty() {
+                errors.push(format!("workflow `{name}` has no stages"));
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for stage_name in &workflow.stages {
+                if !all_stage_names.contains(&stage_name.as_str()) {
+                    errors.push(format!(
+                        "workflow `{name}` references unknown stage `{stage_name}`"
+                    ));
+                }
+                if seen.contains(&stage_name.as_str()) {
+                    errors.push(format!(
+                        "workflow `{name}` lists stage `{stage_name}` more than once"
+                    ));
+                }
+                seen.push(stage_name);
+            }
+        }
+        if let Some(default) = &self.settings.default_workflow
+            && !self.workflows.contains_key(default)
+        {
+            errors.push(format!(
+                "settings.default_workflow references unknown workflow `{default}`"
+            ));
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             bail!("invalid configuration:\n  - {}", errors.join("\n  - "))
         }
+    }
+
+    /// Resolve which stages `soa run` executes, in order: an explicitly
+    /// requested workflow, else `settings.default_workflow`, else a workflow
+    /// literally named `default`, else every stage in declaration order.
+    pub fn resolve_workflow(&self, requested: Option<&str>) -> Result<Vec<usize>> {
+        let workflow_name = requested
+            .map(str::to_string)
+            .or_else(|| self.settings.default_workflow.clone())
+            .or_else(|| self.workflows.contains_key("default").then(|| "default".to_string()));
+
+        let Some(name) = workflow_name else {
+            return Ok((0..self.stages.len()).collect());
+        };
+        let workflow = self.workflows.get(&name).with_context(|| {
+            format!(
+                "no workflow named `{name}` (available: {})",
+                self.workflows.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        Ok(workflow
+            .stages
+            .iter()
+            .map(|stage_name| {
+                self.stages
+                    .iter()
+                    .position(|s| &s.name == stage_name)
+                    .expect("workflow stages are validated at config load")
+            })
+            .collect())
     }
 }
 
@@ -596,6 +682,43 @@ mod tests {
             MINIMAL.replace("name = \"answer\"", "name = \"answer\"\nsubagents = [\"helper\"]")
         );
         assert!(parse(&toml_str).is_ok());
+    }
+
+    #[test]
+    fn workflow_validation_and_resolution() {
+        // Unknown stage and duplicate stage rejected.
+        let toml_str = format!(
+            "{MINIMAL}\n[workflows.bad]\nstages = [\"answer\", \"ghost\", \"answer\"]\n"
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("unknown stage `ghost`"), "{err}");
+        assert!(err.contains("more than once"), "{err}");
+
+        // Missing default_workflow rejected.
+        let toml_str = format!(
+            "{}\n[workflows.w]\nstages = [\"answer\"]\n",
+            MINIMAL.replace(
+                "[providers.local]",
+                "[settings]\ndefault_workflow = \"nope\"\n\n[providers.local]"
+            )
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("unknown workflow `nope`"), "{err}");
+
+        // Resolution precedence: explicit > default_workflow > "default" > all stages.
+        let toml_str = format!(
+            "{MINIMAL}\n[[stage]]\nname = \"second\"\nmodel = \"default\"\n\n\
+             [workflows.default]\nstages = [\"second\"]\n\
+             [workflows.full]\nstages = [\"answer\", \"second\"]\n"
+        );
+        let config = parse(&toml_str).unwrap();
+        assert_eq!(config.resolve_workflow(Some("full")).unwrap(), vec![0, 1]);
+        assert_eq!(config.resolve_workflow(None).unwrap(), vec![1]); // named "default"
+        assert!(config.resolve_workflow(Some("nope")).is_err());
+
+        // No workflows at all: declaration order.
+        let config = parse(MINIMAL).unwrap();
+        assert_eq!(config.resolve_workflow(None).unwrap(), vec![0]);
     }
 
     #[test]

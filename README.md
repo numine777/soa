@@ -113,6 +113,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `default_max_turns` | 16 | model round-trips per stage before erroring |
 | `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
+| `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls |
 
 ### `[providers.<name>]`
@@ -179,6 +180,49 @@ servers. In `read_only` mode a tool is only exposed if the server annotates
 it with `readOnlyHint = true` **or** you list it in that server's
 `readonly_tools`. Run `soa tools` to see how each tool is classified.
 MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
+
+## Subagents
+
+`[agents.<name>]` defines a subagent: a model with its own system prompt,
+mode, MCP servers, and turn budget. Any stage (or agent) that lists it in
+`subagents = [...]` exposes it to its model as a tool named `agent__<name>`
+taking a single `task` string:
+
+```toml
+[agents.researcher]
+model = "planner"
+mode = "read_only"
+mcp = ["filesystem"]
+web_search = true
+description = "Answers research questions without changing anything."
+system_prompt = "You are a focused researcher…"
+max_turns = 12
+
+[[stage]]
+name = "implement"
+model = "coder"
+subagents = ["researcher"]
+…
+```
+
+Semantics:
+
+- The agent runs its own tool-call loop to completion and its final answer
+  is returned to the caller as the tool result (clamped by
+  `max_tool_output_chars` like any other tool output).
+- Agents are stateless: each delegation starts fresh, so the `description`
+  should tell the caller's model to hand over a complete, self-contained
+  task — the tool description reminds it too.
+- Mode safety composes: a `read_only` stage is only offered `read_only`
+  agents, so delegation can't smuggle in write access.
+- Agents may list their own `subagents`; `settings.max_agent_depth`
+  (default 2) bounds the nesting, so runaway delegation chains are cut off
+  at assembly time rather than at runtime.
+- Subagents work everywhere the stage's tools work: pipeline runs and
+  `soa chat`. In the TUI you'll see the delegation as a single
+  `agent__<name>` tool call with its final answer; the agent's internal
+  tool calls go to the log file (`$TMPDIR/soa-chat.log`). File edits made
+  by a subagent aren't captured by the diff viewer yet.
 
 ## Reprompting: stages sending work back
 

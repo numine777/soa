@@ -64,6 +64,25 @@ readonly_tools = ["read_file", "read_multiple_files", "list_directory", "search_
 # headers = { "x-team" = "soa" }
 
 # ---------------------------------------------------------------------------
+# Agents: subagents that stages (or other agents) can delegate tasks to via
+# `subagents = [...]`. Each becomes a tool `agent__<name>` for the caller's
+# model; the agent runs its own tool loop and returns its final answer.
+# `description` tells the calling model when to delegate.
+# ---------------------------------------------------------------------------
+
+[agents.researcher]
+model = "planner"
+mode = "read_only"
+mcp = ["filesystem"]
+web_search = true
+description = "Answers research questions about the codebase or from the web without changing anything. Good for looking up APIs, finding relevant files, or summarizing docs."
+system_prompt = """
+You are a focused researcher. Answer the task thoroughly but concisely
+using your tools. Do not make any changes.
+"""
+max_turns = 12
+
+# ---------------------------------------------------------------------------
 # Stages, executed in order.
 #   mode = "read_only"  -> only read-only tools are exposed to the model
 #   mode = "read_write" -> all tools from the listed MCP servers
@@ -87,8 +106,9 @@ name = "implement"
 model = "coder"
 mode = "read_write"
 mcp = ["filesystem"]
+subagents = ["researcher"]
 max_turns = 32
-system_prompt = "You are a careful engineer. Complete the task, then summarize what you changed."
+system_prompt = "You are a careful engineer. Complete the task, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."
 prompt = """
 # Task
 {{input}}

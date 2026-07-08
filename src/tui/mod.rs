@@ -67,6 +67,7 @@ pub async fn run(
         .stages
         .iter()
         .flat_map(|s| s.mcp.iter().cloned())
+        .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
         .collect();
     if !servers.is_empty() {
         eprintln!("connecting to {} MCP server(s)…", servers.len());

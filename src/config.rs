@@ -17,6 +17,9 @@ pub struct Config {
     pub models: BTreeMap<String, Model>,
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServer>,
+    /// Subagents that stages (and other agents) can delegate tasks to.
+    #[serde(default)]
+    pub agents: BTreeMap<String, Agent>,
     #[serde(default, rename = "stage")]
     pub stages: Vec<Stage>,
 
@@ -47,6 +50,11 @@ pub struct Settings {
     /// 0 disables truncation.
     #[serde(default = "default_max_tool_output_chars")]
     pub max_tool_output_chars: usize,
+    /// How deep agent delegation may nest: at 1 stages can spawn agents but
+    /// agents cannot spawn agents; at 2 agents get one more level; and so
+    /// on. Guards against delegation loops.
+    #[serde(default = "default_max_agent_depth")]
+    pub max_agent_depth: u32,
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
@@ -62,6 +70,7 @@ impl Default for Settings {
             default_max_turns: default_max_turns(),
             max_stage_runs: default_max_stage_runs(),
             max_tool_output_chars: default_max_tool_output_chars(),
+            max_agent_depth: default_max_agent_depth(),
             request_timeout_secs: default_timeout(),
         }
     }
@@ -78,6 +87,9 @@ fn default_max_stage_runs() -> u32 {
 }
 fn default_max_tool_output_chars() -> usize {
     30_000
+}
+fn default_max_agent_depth() -> u32 {
+    2
 }
 fn default_timeout() -> u64 {
     600
@@ -145,6 +157,62 @@ impl McpServer {
     }
 }
 
+/// A subagent: a model with its own system prompt, mode, and tools that a
+/// stage (or another agent) can delegate a self-contained task to. Each
+/// agent listed in a `subagents` field is exposed to that context's model
+/// as a tool named `agent__<name>`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    /// Shown to the calling model as the tool description — say what this
+    /// agent is good at so the model knows when to delegate.
+    #[serde(default)]
+    pub description: String,
+    /// Key into `[models]`.
+    pub model: String,
+    #[serde(default)]
+    pub mode: Mode,
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    #[serde(default)]
+    pub web_search: bool,
+    pub system_prompt: Option<String>,
+    pub system_prompt_file: Option<PathBuf>,
+    pub max_turns: Option<u32>,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<u32>,
+    /// Agents this agent may itself delegate to (subject to
+    /// `settings.max_agent_depth`).
+    #[serde(default)]
+    pub subagents: Vec<String>,
+}
+
+impl Agent {
+    pub fn resolve_system_prompt(&self, base_dir: &Path) -> Result<Option<String>> {
+        resolve_prompt_source(&self.system_prompt, &self.system_prompt_file, base_dir)
+    }
+}
+
+/// Resolve an inline-or-file prompt pair (mutual exclusivity is enforced
+/// during validation).
+fn resolve_prompt_source(
+    inline: &Option<String>,
+    file: &Option<PathBuf>,
+    base_dir: &Path,
+) -> Result<Option<String>> {
+    match (inline, file) {
+        (Some(inline), None) => Ok(Some(inline.clone())),
+        (None, Some(file)) => {
+            let path = base_dir.join(file);
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read system_prompt_file {}", path.display()))?;
+            Ok(Some(text))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("rejected during validation"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -190,27 +258,16 @@ pub struct Stage {
     /// earlier `implement` stage will run again afterwards.
     #[serde(default)]
     pub can_reprompt: Vec<String>,
+    /// Keys into `[agents]`: subagents this stage's model may delegate to.
+    #[serde(default)]
+    pub subagents: Vec<String>,
 }
 
 impl Stage {
     /// Resolve the system prompt, reading `system_prompt_file` if set.
     pub fn resolve_system_prompt(&self, base_dir: &Path) -> Result<Option<String>> {
-        match (&self.system_prompt, &self.system_prompt_file) {
-            (Some(inline), None) => Ok(Some(inline.clone())),
-            (None, Some(file)) => {
-                let path = base_dir.join(file);
-                let text = std::fs::read_to_string(&path).with_context(|| {
-                    format!(
-                        "stage `{}`: cannot read system_prompt_file {}",
-                        self.name,
-                        path.display()
-                    )
-                })?;
-                Ok(Some(text))
-            }
-            (None, None) => Ok(None),
-            (Some(_), Some(_)) => unreachable!("rejected during validation"),
-        }
+        resolve_prompt_source(&self.system_prompt, &self.system_prompt_file, base_dir)
+            .with_context(|| format!("stage `{}`", self.name))
     }
 
     pub fn prompt_template(&self, is_first: bool) -> String {
@@ -293,6 +350,39 @@ impl Config {
             errors.push("no [[stage]] entries defined".to_string());
         }
 
+        for (name, agent) in &self.agents {
+            if !self.models.contains_key(&agent.model) {
+                errors.push(format!(
+                    "agent `{name}` references unknown model `{}`",
+                    agent.model
+                ));
+            }
+            for server in &agent.mcp {
+                if !self.mcp.contains_key(server) {
+                    errors.push(format!(
+                        "agent `{name}` references unknown mcp server `{server}`"
+                    ));
+                }
+            }
+            if agent.system_prompt.is_some() && agent.system_prompt_file.is_some() {
+                errors.push(format!(
+                    "agent `{name}` sets both system_prompt and system_prompt_file"
+                ));
+            }
+            if agent.web_search && self.settings.searxng_url.is_none() {
+                errors.push(format!(
+                    "agent `{name}` enables web_search but settings.searxng_url is not set"
+                ));
+            }
+            for subagent in &agent.subagents {
+                if !self.agents.contains_key(subagent) {
+                    errors.push(format!(
+                        "agent `{name}` subagents references unknown agent `{subagent}`"
+                    ));
+                }
+            }
+        }
+
         let all_stage_names: Vec<&str> = self.stages.iter().map(|s| s.name.as_str()).collect();
         let mut seen_stage_names: Vec<&str> = Vec::new();
         for (index, stage) in self.stages.iter().enumerate() {
@@ -305,6 +395,14 @@ impl Config {
                 if !all_stage_names.contains(&target.as_str()) {
                     errors.push(format!(
                         "stage `{name}` can_reprompt references unknown stage `{target}`"
+                    ));
+                }
+            }
+
+            for subagent in &stage.subagents {
+                if !self.agents.contains_key(subagent) {
+                    errors.push(format!(
+                        "stage `{name}` subagents references unknown agent `{subagent}`"
                     ));
                 }
             }
@@ -472,6 +570,32 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("stage.third"), "{err}");
+    }
+
+    #[test]
+    fn agent_references_validated() {
+        // Stage referencing an unknown agent.
+        let toml_str = MINIMAL.replace(
+            "name = \"answer\"",
+            "name = \"answer\"\nsubagents = [\"nope\"]",
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("unknown agent `nope`"), "{err}");
+
+        // Agent with a bad model and a bad subagent reference.
+        let toml_str = format!(
+            "{MINIMAL}\n[agents.helper]\nmodel = \"missing\"\nsubagents = [\"ghost\"]\n"
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("agent `helper` references unknown model `missing`"), "{err}");
+        assert!(err.contains("unknown agent `ghost`"), "{err}");
+
+        // A valid agent wired to the stage parses.
+        let toml_str = format!(
+            "{}\n[agents.helper]\nmodel = \"default\"\ndescription = \"helps\"\n",
+            MINIMAL.replace("name = \"answer\"", "name = \"answer\"\nsubagents = [\"helper\"]")
+        );
+        assert!(parse(&toml_str).is_ok());
     }
 
     #[test]

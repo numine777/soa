@@ -98,10 +98,11 @@ async fn main() -> Result<()> {
                 stage.resolve_system_prompt(&config.base_dir)?;
             }
             println!(
-                "OK: {} provider(s), {} model(s), {} mcp server(s), {} stage(s)",
+                "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s)",
                 config.providers.len(),
                 config.models.len(),
                 config.mcp.len(),
+                config.agents.len(),
                 config.stages.len()
             );
             Ok(())
@@ -193,7 +194,13 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
             .iter()
             .find(|s| s.name == name)
             .with_context(|| format!("no stage named `{name}`"))?;
-        let manager = McpManager::connect(stage.mcp.iter().cloned(), config, false).await?;
+        let servers: Vec<String> = stage
+            .mcp
+            .iter()
+            .cloned()
+            .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
+            .collect();
+        let manager = McpManager::connect(servers, config, false).await?;
         let context = stage::PipelineContext::new(task);
         eprintln!("── stage {} ──", stage.name);
         let result =
@@ -208,10 +215,12 @@ async fn run_pipeline(config: &Config, task: &str, only_stage: Option<&str>) -> 
         };
     }
 
+    // Agents can be reached from any stage, so connect their servers too.
     let needed_servers: Vec<String> = config
         .stages
         .iter()
         .flat_map(|s| s.mcp.iter().cloned())
+        .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
         .collect();
     let manager = McpManager::connect(needed_servers, config, false).await?;
 

@@ -2,6 +2,7 @@
 //! filtering), and the per-stage agentic tool-call loop.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::model::JsonObject;
@@ -56,6 +57,8 @@ pub fn render_template(
 pub enum ToolBinding {
     Mcp { server: String, tool: String },
     WebSearch,
+    /// Delegate the call's `task` to a configured subagent.
+    Agent { agent: String },
 }
 
 pub struct StageTool {
@@ -63,6 +66,41 @@ pub struct StageTool {
     pub binding: ToolBinding,
     /// Whether this tool is classified read-only (used for diff capture).
     pub read_only: bool,
+}
+
+/// What a model context (stage or agent) exposes to its model: shared shape
+/// for tool assembly.
+pub struct ToolProfile<'a> {
+    /// For log messages.
+    pub owner: &'a str,
+    pub mode: Mode,
+    pub mcp: &'a [String],
+    pub web_search: bool,
+    pub subagents: &'a [String],
+}
+
+impl crate::config::Stage {
+    pub fn tool_profile(&self) -> ToolProfile<'_> {
+        ToolProfile {
+            owner: &self.name,
+            mode: self.mode,
+            mcp: &self.mcp,
+            web_search: self.web_search,
+            subagents: &self.subagents,
+        }
+    }
+}
+
+impl crate::config::Agent {
+    pub fn tool_profile<'a>(&'a self, name: &'a str) -> ToolProfile<'a> {
+        ToolProfile {
+            owner: name,
+            mode: self.mode,
+            mcp: &self.mcp,
+            web_search: self.web_search,
+            subagents: &self.subagents,
+        }
+    }
 }
 
 /// How a stage finished: with a final answer, or by handing control to
@@ -112,20 +150,28 @@ fn sanitize_tool_name(name: &str) -> String {
     cleaned.chars().take(64).collect()
 }
 
-/// Assemble the tools visible to a stage, applying the read-only filter.
-/// MCP tool names are namespaced as `<server>__<tool>` to avoid collisions.
-pub fn assemble_tools(stage: &Stage, mcp: &McpManager) -> Result<Vec<StageTool>> {
+/// Assemble the tools visible to a context, applying the read-only filter.
+/// MCP tool names are namespaced as `<server>__<tool>` to avoid collisions;
+/// subagents appear as `agent__<name>`. `depth` is how many delegation
+/// levels deep this context already is: agent tools stop being offered at
+/// `settings.max_agent_depth`.
+pub fn assemble_tools(
+    profile: &ToolProfile<'_>,
+    config: &Config,
+    mcp: &McpManager,
+    depth: u32,
+) -> Result<Vec<StageTool>> {
     let mut stage_tools = Vec::new();
 
-    for server_name in &stage.mcp {
+    for server_name in profile.mcp {
         let connection = mcp
             .get(server_name)
             .ok_or_else(|| anyhow!("mcp server `{server_name}` is not connected"))?;
         for tool in &connection.tools {
             let read_only = connection.is_read_only(tool);
-            if stage.mode == Mode::ReadOnly && !read_only {
+            if profile.mode == Mode::ReadOnly && !read_only {
                 tracing::debug!(
-                    stage = %stage.name, server = %server_name, tool = %tool.name,
+                    owner = %profile.owner, server = %server_name, tool = %tool.name,
                     "hidden in read_only mode"
                 );
                 continue;
@@ -145,7 +191,7 @@ pub fn assemble_tools(stage: &Stage, mcp: &McpManager) -> Result<Vec<StageTool>>
         }
     }
 
-    if stage.web_search {
+    if profile.web_search {
         stage_tools.push(StageTool {
             definition: tools::web_search_definition(),
             binding: ToolBinding::WebSearch,
@@ -153,19 +199,72 @@ pub fn assemble_tools(stage: &Stage, mcp: &McpManager) -> Result<Vec<StageTool>>
         });
     }
 
+    if depth < config.settings.max_agent_depth {
+        for agent_name in profile.subagents {
+            let agent = config
+                .agents
+                .get(agent_name)
+                .ok_or_else(|| anyhow!("unknown agent `{agent_name}`"))?;
+            let agent_read_only = agent.mode == Mode::ReadOnly;
+            // A read-only context must not gain write access by delegating.
+            if profile.mode == Mode::ReadOnly && !agent_read_only {
+                tracing::debug!(
+                    owner = %profile.owner, agent = %agent_name,
+                    "read_write agent hidden in read_only mode"
+                );
+                continue;
+            }
+            let about = if agent.description.is_empty() {
+                format!("Delegate a task to the `{agent_name}` agent.")
+            } else {
+                agent.description.clone()
+            };
+            stage_tools.push(StageTool {
+                definition: ToolFunction {
+                    name: sanitize_tool_name(&format!("agent__{agent_name}")),
+                    description: format!(
+                        "{about} Runs as a separate agent with its own tools and no memory \
+                         of this conversation: give it one complete, self-contained task \
+                         and it returns its final answer."
+                    ),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "task": {
+                                "type": "string",
+                                "description": "The complete task, including all context the agent needs"
+                            }
+                        },
+                        "required": ["task"]
+                    }),
+                },
+                binding: ToolBinding::Agent { agent: agent_name.clone() },
+                read_only: agent_read_only,
+            });
+        }
+    } else if !profile.subagents.is_empty() {
+        tracing::debug!(
+            owner = %profile.owner, depth,
+            "subagents hidden: settings.max_agent_depth reached"
+        );
+    }
+
     Ok(stage_tools)
 }
 
 /// Execute a tool call and clamp the result so a single oversized output
 /// (e.g. a recursive directory tree) cannot exhaust the model's context.
+/// `depth` is the caller's delegation depth (0 for stages and chat).
 pub async fn dispatch_tool_call(
     binding: &ToolBinding,
     arguments_json: &str,
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
+    depth: u32,
 ) -> Result<String> {
-    let output = dispatch_tool_call_inner(binding, arguments_json, config, mcp, http).await?;
+    let output =
+        dispatch_tool_call_inner(binding, arguments_json, config, mcp, http, depth).await?;
     Ok(clamp_tool_output(output, config.settings.max_tool_output_chars))
 }
 
@@ -190,6 +289,7 @@ async fn dispatch_tool_call_inner(
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
+    depth: u32,
 ) -> Result<String> {
     let arguments: Value = if arguments_json.trim().is_empty() {
         Value::Object(JsonObject::new())
@@ -235,7 +335,102 @@ async fn dispatch_tool_call_inner(
                 Err(e) => Ok(format!("ERROR: {e:#}")),
             }
         }
+        ToolBinding::Agent { agent } => {
+            let task = arguments.get("task").and_then(Value::as_str).unwrap_or_default();
+            if task.trim().is_empty() {
+                return Ok("ERROR: the agent needs a non-empty `task` string".to_string());
+            }
+            match run_agent(config, agent, task, mcp, http, depth + 1).await {
+                Ok(answer) => Ok(answer),
+                // The agent's failure becomes feedback, not a crashed turn.
+                Err(e) => Ok(format!("ERROR: agent `{agent}` failed: {e:#}")),
+            }
+        }
     }
+}
+
+/// Run a subagent to completion on a task and return its final answer.
+/// Boxed because agents may recursively spawn agents (bounded by
+/// `settings.max_agent_depth` via `assemble_tools`).
+pub fn run_agent<'a>(
+    config: &'a Config,
+    agent_name: &'a str,
+    task: &'a str,
+    mcp: &'a McpManager,
+    http: &'a reqwest::Client,
+    depth: u32,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(async move {
+        let agent = config
+            .agents
+            .get(agent_name)
+            .ok_or_else(|| anyhow!("unknown agent `{agent_name}`"))?;
+        let client =
+            build_client(config, &agent.model, agent.temperature, agent.max_tokens, http)?;
+
+        let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
+        let definitions: Vec<ToolFunction> =
+            agent_tools.iter().map(|t| t.definition.clone()).collect();
+        let bindings: BTreeMap<&str, &ToolBinding> = agent_tools
+            .iter()
+            .map(|t| (t.definition.name.as_str(), &t.binding))
+            .collect();
+
+        let mut messages = Vec::new();
+        if let Some(system) = agent.resolve_system_prompt(&config.base_dir)? {
+            messages.push(ChatMessage::System { content: system });
+        }
+        messages.push(ChatMessage::User { content: task.to_string() });
+
+        let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
+        tracing::info!(
+            agent = %agent_name, model = %agent.model, tools = definitions.len(), depth,
+            task = %truncate(task, 200), "running agent"
+        );
+
+        for turn in 1..=max_turns {
+            let reply = client.chat(&messages, &definitions).await?;
+
+            if reply.tool_calls.is_empty() {
+                tracing::info!(agent = %agent_name, turns = turn, "agent complete");
+                return Ok(reply.content.unwrap_or_default());
+            }
+
+            let tool_calls = reply.tool_calls.clone();
+            messages.push(ChatMessage::Assistant {
+                content: reply.content,
+                tool_calls: Some(reply.tool_calls),
+            });
+
+            for call in tool_calls {
+                tracing::info!(
+                    agent = %agent_name, tool = %call.function.name,
+                    args = %truncate(&call.function.arguments, 200),
+                    "agent tool call"
+                );
+                let output = match bindings.get(call.function.name.as_str()) {
+                    Some(binding) => {
+                        dispatch_tool_call(
+                            binding,
+                            &call.function.arguments,
+                            config,
+                            mcp,
+                            http,
+                            depth,
+                        )
+                        .await?
+                    }
+                    None => format!("ERROR: unknown tool `{}`", call.function.name),
+                };
+                messages.push(ChatMessage::Tool { content: output, tool_call_id: call.id });
+            }
+        }
+
+        bail!(
+            "agent `{agent_name}` did not produce a final answer within {max_turns} turns \
+             (raise `max_turns` on the agent or `default_max_turns` in settings)"
+        )
+    })
 }
 
 /// State threaded through the pipeline: the original task, the previous
@@ -258,13 +453,19 @@ impl PipelineContext {
     }
 }
 
-/// Build the chat client for a stage: resolve its model and provider, and
-/// apply stage-level sampling overrides.
-pub fn build_client(config: &Config, stage: &Stage, http: &reqwest::Client) -> Result<ChatClient> {
+/// Build a chat client for a named model, with optional caller-level
+/// sampling overrides taking precedence over the model's defaults.
+pub fn build_client(
+    config: &Config,
+    model_name: &str,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+    http: &reqwest::Client,
+) -> Result<ChatClient> {
     let model = config
         .models
-        .get(&stage.model)
-        .ok_or_else(|| anyhow!("unknown model `{}`", stage.model))?;
+        .get(model_name)
+        .ok_or_else(|| anyhow!("unknown model `{model_name}`"))?;
     let provider = config
         .providers
         .get(&model.provider)
@@ -276,9 +477,9 @@ pub fn build_client(config: &Config, stage: &Stage, http: &reqwest::Client) -> R
         provider.api_key.clone(),
         &model.model,
         SamplingParams {
-            temperature: stage.temperature.or(model.temperature),
+            temperature: temperature.or(model.temperature),
             top_p: model.top_p,
-            max_tokens: stage.max_tokens.or(model.max_tokens),
+            max_tokens: max_tokens.or(model.max_tokens),
         },
     ))
 }
@@ -295,9 +496,10 @@ pub async fn run_stage(
     http: &reqwest::Client,
     reprompt_targets: &[String],
 ) -> Result<StageOutcome> {
-    let client = build_client(config, stage, http)?;
+    let client =
+        build_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
 
-    let stage_tools = assemble_tools(stage, mcp)?;
+    let stage_tools = assemble_tools(&stage.tool_profile(), config, mcp, 0)?;
     let mut definitions: Vec<ToolFunction> =
         stage_tools.iter().map(|t| t.definition.clone()).collect();
     if !reprompt_targets.is_empty() {
@@ -364,7 +566,7 @@ pub async fn run_stage(
             }
             let output = match bindings.get(call.function.name.as_str()) {
                 Some(binding) => {
-                    dispatch_tool_call(binding, &call.function.arguments, config, mcp, http)
+                    dispatch_tool_call(binding, &call.function.arguments, config, mcp, http, 0)
                         .await?
                 }
                 None => format!("ERROR: unknown tool `{}`", call.function.name),
@@ -436,6 +638,48 @@ mod tests {
     fn missing_stage_output_errors() {
         let err = render_template("{{stage.nope}}", "x", None, &BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn agent_tools_gated_by_mode_and_depth() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [agents.reader]
+            model = "m"
+            description = "reads things"
+
+            [agents.writer]
+            model = "m"
+            mode = "read_write"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            subagents = ["reader", "writer"]
+            "#,
+        )
+        .unwrap();
+        let mcp = McpManager::default();
+
+        // Read-only stage: only the read-only agent is offered.
+        let names: Vec<String> =
+            assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.definition.name)
+                .collect();
+        assert_eq!(names, vec!["agent__reader"]);
+
+        // At the depth cap (default max_agent_depth = 2) no agents are offered.
+        let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
+        assert!(at_cap.is_empty());
     }
 
     #[test]

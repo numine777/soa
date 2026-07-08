@@ -236,9 +236,10 @@ impl App {
     }
 
     fn refresh_tool_count(&mut self) {
-        self.tool_count = assemble_tools(self.stage(), &self.mcp)
-            .map(|tools| tools.len())
-            .unwrap_or(0);
+        self.tool_count =
+            assemble_tools(&self.stage().tool_profile(), &self.config, &self.mcp, 0)
+                .map(|tools| tools.len())
+                .unwrap_or(0);
     }
 
     pub fn is_running(&self) -> bool {
@@ -661,7 +662,13 @@ impl App {
         // fields below stay assignable.
         let config = Arc::clone(&self.config);
         let stage = &config.stages[self.stage_index];
-        let client = match build_client(&self.config, stage, &self.http) {
+        let client = match build_client(
+            &self.config,
+            &stage.model,
+            stage.temperature,
+            stage.max_tokens,
+            &self.http,
+        ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
         };
@@ -669,10 +676,11 @@ impl App {
             Ok(system) => system,
             Err(e) => return self.error(format!("{e:#}")),
         };
-        let stage_tools = match assemble_tools(stage, &self.mcp) {
-            Ok(tools) => tools,
-            Err(e) => return self.error(format!("{e:#}")),
-        };
+        let stage_tools =
+            match assemble_tools(&stage.tool_profile(), &self.config, &self.mcp, 0) {
+                Ok(tools) => tools,
+                Err(e) => return self.error(format!("{e:#}")),
+            };
         self.tool_count = stage_tools.len();
 
         let definitions: Vec<ToolFunction> =
@@ -706,7 +714,14 @@ impl App {
         if self.history.is_empty() {
             return self.info("nothing to compact");
         }
-        let client = match build_client(&self.config, self.stage(), &self.http) {
+        let stage = self.stage();
+        let client = match build_client(
+            &self.config,
+            &stage.model,
+            stage.temperature,
+            stage.max_tokens,
+            &self.http,
+        ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
         };
@@ -876,8 +891,15 @@ async fn turn_worker(
                     } else {
                         Vec::new()
                     };
-                    match dispatch_tool_call(binding, &call.function.arguments, &config, &mcp, &http)
-                        .await
+                    match dispatch_tool_call(
+                        binding,
+                        &call.function.arguments,
+                        &config,
+                        &mcp,
+                        &http,
+                        0,
+                    )
+                    .await
                     {
                         Ok(output) => {
                             for entry in diff::collect_changes(&name, snapshots) {

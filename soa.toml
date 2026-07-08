@@ -13,6 +13,11 @@ request_timeout_secs = 600
 # Tool results longer than this are truncated before entering the
 # conversation (a recursive directory tree can exceed the context window).
 max_tool_output_chars = 30000
+# When real token usage (as reported by the provider) exceeds this fraction
+# of a model's `context_tokens`, chat auto-compacts and stage loops truncate
+# older tool results. 0 disables; only applies to models that declare
+# `context_tokens`.
+auto_compact_threshold = 0.8
 
 # ---------------------------------------------------------------------------
 # Providers: OpenAI-compatible chat-completions endpoints.
@@ -33,12 +38,16 @@ base_url = "http://192.168.5.188:8000/v1"
 provider = "spark"
 model = "qwen"
 temperature = 0.7
+# Declaring the context window enables the real-usage gauge in the chat
+# status bar, auto-compaction, and mid-stage shedding of old tool results.
+context_tokens = 131072
 
 [models.coder]
 provider = "threadripper"
 model = "qwen-haiku"
 temperature = 0.2
 max_tokens = 8192
+context_tokens = 131072
 
 [models.reviewer]
 provider = "spark"

@@ -60,6 +60,11 @@ pub struct Settings {
     /// on. Guards against delegation loops.
     #[serde(default = "default_max_agent_depth")]
     pub max_agent_depth: u32,
+    /// When real usage exceeds this fraction of a model's `context_tokens`,
+    /// chat auto-compacts and stage loops truncate older tool results.
+    /// 0 disables. Only applies to models that declare `context_tokens`.
+    #[serde(default = "default_auto_compact_threshold")]
+    pub auto_compact_threshold: f64,
     /// HTTP timeout for provider requests, in seconds. Local models can be slow.
     #[serde(default = "default_timeout")]
     pub request_timeout_secs: u64,
@@ -96,6 +101,7 @@ impl Default for Settings {
             max_stage_runs: default_max_stage_runs(),
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
+            auto_compact_threshold: default_auto_compact_threshold(),
             request_timeout_secs: default_timeout(),
             shell_timeout_secs: default_shell_timeout(),
             skills_dir: None,
@@ -122,6 +128,9 @@ fn default_max_tool_output_chars() -> usize {
 }
 fn default_max_agent_depth() -> u32 {
     2
+}
+fn default_auto_compact_threshold() -> f64 {
+    0.8
 }
 fn default_timeout() -> u64 {
     600
@@ -157,6 +166,10 @@ pub struct Model {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// The model's context window, in tokens. Enables the pressure gauge
+    /// in the chat status bar, auto-compaction, and mid-stage shedding of
+    /// old tool results.
+    pub context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +437,13 @@ impl Config {
 
         if self.stages.is_empty() {
             errors.push("no [[stage]] entries defined".to_string());
+        }
+
+        if !(0.0..=1.0).contains(&self.settings.auto_compact_threshold) {
+            errors.push(format!(
+                "settings.auto_compact_threshold must be between 0 and 1 (got {})",
+                self.settings.auto_compact_threshold
+            ));
         }
 
         for (name, agent) in &self.agents {

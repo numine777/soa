@@ -562,6 +562,18 @@ pub fn run_agent<'a>(
                 return Ok(reply.content.unwrap_or_default());
             }
 
+            if let Some((used, capacity)) =
+                context_pressure(config, &agent.model, reply.usage.as_ref())
+            {
+                let trimmed = shed_context(&mut messages, 2);
+                if trimmed > 0 {
+                    tracing::warn!(
+                        agent = %agent_name, used, capacity, trimmed,
+                        "context pressure: truncated older tool results"
+                    );
+                }
+            }
+
             let tool_calls = reply.tool_calls.clone();
             messages.push(ChatMessage::Assistant {
                 content: reply.content,
@@ -730,6 +742,19 @@ pub async fn run_stage(
             return Ok(StageOutcome::Final(content));
         }
 
+        // Under context pressure, truncate older tool results before the
+        // next request instead of overflowing the window.
+        if let Some((used, capacity)) = context_pressure(config, &stage.model, reply.usage.as_ref())
+        {
+            let trimmed = shed_context(&mut messages, 2);
+            if trimmed > 0 {
+                tracing::warn!(
+                    stage = %stage.name, used, capacity, trimmed,
+                    "context pressure: truncated older tool results"
+                );
+            }
+        }
+
         let tool_calls = reply.tool_calls.clone();
         messages.push(ChatMessage::Assistant {
             content: reply.content,
@@ -790,6 +815,51 @@ pub async fn run_stage(
          (raise `max_turns` on the stage or `default_max_turns` in settings)",
         stage.name
     )
+}
+
+/// If the last reply's usage puts the conversation over the auto-compact
+/// threshold of the model's declared context window, return
+/// `(used, capacity)`.
+pub fn context_pressure(
+    config: &Config,
+    model_name: &str,
+    usage: Option<&crate::provider::Usage>,
+) -> Option<(u64, u64)> {
+    let threshold = config.settings.auto_compact_threshold;
+    if threshold <= 0.0 {
+        return None;
+    }
+    let capacity = config.models.get(model_name)?.context_tokens?;
+    let used = usage?.context_tokens();
+    (used as f64 >= capacity as f64 * threshold).then_some((used, capacity))
+}
+
+/// Free context by truncating older tool results in place, keeping the
+/// most recent `keep_recent` intact. Returns how many were trimmed.
+/// Deterministic (no model call), so it's safe mid-stage.
+pub fn shed_context(messages: &mut [ChatMessage], keep_recent: usize) -> usize {
+    const MARKER: &str = "[trimmed: an earlier tool result was truncated to save context]";
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, ChatMessage::Tool { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if tool_indices.len() <= keep_recent {
+        return 0;
+    }
+    let mut trimmed = 0;
+    for &index in &tool_indices[..tool_indices.len() - keep_recent] {
+        if let ChatMessage::Tool { content, .. } = &mut messages[index] {
+            if content.starts_with(MARKER) || content.chars().count() <= 400 {
+                continue;
+            }
+            let head: String = content.chars().take(200).collect();
+            *content = format!("{MARKER}\n{head}…");
+            trimmed += 1;
+        }
+    }
+    trimmed
 }
 
 fn parse_reprompt(arguments_json: &str, targets: &[String]) -> Result<StageOutcome, String> {
@@ -886,6 +956,74 @@ mod tests {
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
         let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
         assert!(at_cap.is_empty());
+    }
+
+    #[test]
+    fn context_pressure_gated_by_threshold_and_capacity() {
+        let mut config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.gauged]
+            provider = "p"
+            model = "x"
+            context_tokens = 1000
+
+            [models.unbounded]
+            provider = "p"
+            model = "y"
+
+            [[stage]]
+            name = "s"
+            model = "gauged"
+            "#,
+        )
+        .unwrap();
+        let usage = |prompt, completion| {
+            Some(crate::provider::Usage { prompt_tokens: prompt, completion_tokens: completion })
+        };
+
+        // Default threshold 0.8 of 1000: fires at 800 (prompt + completion), not below.
+        assert_eq!(
+            context_pressure(&config, "gauged", usage(700, 100).as_ref()),
+            Some((800, 1000))
+        );
+        assert_eq!(context_pressure(&config, "gauged", usage(700, 99).as_ref()), None);
+        // No declared window, no reported usage, or unknown model: never fires.
+        assert_eq!(context_pressure(&config, "unbounded", usage(9000, 0).as_ref()), None);
+        assert_eq!(context_pressure(&config, "gauged", None), None);
+        assert_eq!(context_pressure(&config, "missing", usage(9000, 0).as_ref()), None);
+        // Threshold 0 disables the check entirely.
+        config.settings.auto_compact_threshold = 0.0;
+        assert_eq!(context_pressure(&config, "gauged", usage(9000, 0).as_ref()), None);
+    }
+
+    #[test]
+    fn sheds_older_tool_results_only() {
+        let big = "x".repeat(1000);
+        let mut messages = vec![
+            ChatMessage::System { content: "s".into() },
+            ChatMessage::User { content: "u".into() },
+            ChatMessage::Tool { content: big.clone(), tool_call_id: "1".into() },
+            ChatMessage::Tool { content: big.clone(), tool_call_id: "2".into() },
+            ChatMessage::Tool { content: big.clone(), tool_call_id: "3".into() },
+        ];
+        assert_eq!(shed_context(&mut messages, 2), 1);
+        let ChatMessage::Tool { content, .. } = &messages[2] else { panic!() };
+        assert!(content.starts_with("[trimmed"));
+        assert!(content.len() < 400);
+        // Recent two untouched.
+        let ChatMessage::Tool { content, .. } = &messages[4] else { panic!() };
+        assert_eq!(content, &big);
+        // Idempotent: already-trimmed entries aren't re-counted.
+        assert_eq!(shed_context(&mut messages, 2), 0);
+        // Small results aren't worth trimming.
+        let mut small = vec![
+            ChatMessage::Tool { content: "tiny".into(), tool_call_id: "1".into() },
+            ChatMessage::Tool { content: big.clone(), tool_call_id: "2".into() },
+        ];
+        assert_eq!(shed_context(&mut small, 1), 0);
     }
 
     #[test]

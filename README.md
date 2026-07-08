@@ -54,7 +54,7 @@ Slash commands:
 
 | command | effect |
 |---|---|
-| `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx ~N tok` estimate. |
+| `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx` gauge: real provider-reported token usage when available (with percentage of the model's `context_tokens`), otherwise a `~` estimate. This also happens automatically when usage crosses `settings.auto_compact_threshold` — see [Configuration](#configuration). |
 | `/clear` | Drop all conversation context. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
@@ -125,6 +125,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
+| `auto_compact_threshold` | 0.8 | when real token usage crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results (0 disables; needs `context_tokens` on the model) |
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
@@ -154,6 +155,19 @@ when it isn't the same terminal that just showed the stream — so piping
 A provider reference plus default sampling parameters (`temperature`,
 `top_p`, `max_tokens`). Stages refer to models by this name, so you can
 swap the underlying model in one place.
+
+Optionally declare the model's context window with `context_tokens`
+(e.g. `131072`). soa reads real token usage from the provider's `usage`
+field on every response (including streamed ones, via
+`stream_options.include_usage`), and a declared window turns that into:
+
+- a live `ctx used/capacity (N%)` gauge in the chat status bar, which turns
+  yellow at 70% and red at 90% (without real usage or a declared window it
+  falls back to a `~` character estimate);
+- auto-compaction in chat when usage crosses `auto_compact_threshold`;
+- mid-turn shedding in stage, agent, and chat tool loops: older tool
+  results (all but the two most recent) are truncated in place before the
+  next request instead of overflowing the window.
 
 ### `[mcp.<name>]`
 

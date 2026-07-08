@@ -77,11 +77,20 @@ struct ChatRequest<'a> {
     tools: Vec<ToolWire<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    /// Asks for a final usage chunk when streaming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,11 +105,30 @@ struct ResponseMessage {
     tool_calls: Option<Vec<ToolCall>>,
 }
 
+/// Token counts reported by the provider for one request.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+}
+
+impl Usage {
+    /// The context the conversation now occupies: everything sent plus
+    /// everything generated.
+    pub fn context_tokens(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
 /// What the model returned for one round-trip.
 #[derive(Debug)]
 pub struct AssistantTurn {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Real token counts, when the server reports them.
+    pub usage: Option<Usage>,
 }
 
 /// Callback invoked with each streamed content fragment.
@@ -114,6 +142,8 @@ pub type DeltaHandler<'a> = &'a (dyn Fn(&str) + Send + Sync);
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Present on the final chunk when `include_usage` was requested.
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +178,7 @@ struct FunctionDelta {
 struct StreamAccumulator {
     content: String,
     tool_calls: Vec<ToolCall>,
+    usage: Option<Usage>,
 }
 
 impl StreamAccumulator {
@@ -155,6 +186,9 @@ impl StreamAccumulator {
     /// the delta callback.
     fn apply(&mut self, chunk: StreamChunk) -> Option<String> {
         let mut fragment = None;
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
@@ -196,6 +230,7 @@ impl StreamAccumulator {
         AssistantTurn {
             content: (!self.content.is_empty()).then_some(self.content),
             tool_calls: self.tool_calls,
+            usage: self.usage,
         }
     }
 }
@@ -264,6 +299,7 @@ impl ChatClient {
                 .map(|f| ToolWire { kind: "function", function: f })
                 .collect(),
             stream: self.stream,
+            stream_options: self.stream.then_some(StreamOptions { include_usage: true }),
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -301,6 +337,7 @@ impl ChatClient {
             return Ok(AssistantTurn {
                 content: choice.message.content,
                 tool_calls: choice.message.tool_calls.unwrap_or_default(),
+                usage: parsed.usage,
             });
         }
 
@@ -359,9 +396,16 @@ mod tests {
         );
         // Finish chunks with empty deltas produce no fragment.
         assert_eq!(acc.apply(chunk(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)), None);
+        // Final usage chunk (empty choices) is captured.
+        acc.apply(chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+        ));
         let turn = acc.finish();
         assert_eq!(turn.content.as_deref(), Some("Hello"));
         assert!(turn.tool_calls.is_empty());
+        let usage = turn.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.context_tokens(), 120);
     }
 
     #[test]

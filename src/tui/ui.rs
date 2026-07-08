@@ -13,7 +13,7 @@ use ratatui::widgets::{
     Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
-use super::app::{App, TranscriptItem, View, fmt_tokens};
+use super::app::{App, TranscriptItem, View};
 use super::store;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -321,14 +321,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" ●", Style::default().fg(Color::Green)));
     }
     spans.push(Span::styled(
-        format!(
-            "  {} · {} · {} tool(s) · ctx ~{}",
-            stage.name,
-            stage.model,
-            app.tool_count,
-            fmt_tokens(app.token_estimate()),
-        ),
+        format!("  {} · {} · {} tool(s) · ", stage.name, stage.model, app.tool_count),
         dim,
+    ));
+    let (context_text, pressure) = app.context_status();
+    spans.push(Span::styled(
+        context_text,
+        match pressure {
+            2 => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            1 => Style::default().fg(Color::Yellow),
+            _ => dim,
+        },
     ));
     if !app.diffs.is_empty() {
         spans.push(Span::styled(

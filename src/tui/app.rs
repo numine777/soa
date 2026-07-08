@@ -15,8 +15,11 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
-use crate::provider::{ChatClient, ChatMessage, ToolFunction};
-use crate::stage::{CallPolicy, ToolBinding, assemble_tools, build_client, dispatch_tool_call};
+use crate::provider::{ChatClient, ChatMessage, ToolFunction, Usage};
+use crate::stage::{
+    CallPolicy, ToolBinding, assemble_tools, build_client, context_pressure,
+    dispatch_tool_call, shed_context,
+};
 
 const COMPACT_INSTRUCTION: &str = "\
 You are compacting this conversation to free context space. Summarize \
@@ -42,8 +45,11 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     ToolDone { preview: String },
     Diff(DiffEntry),
-    /// Turn finished: the updated history and the assistant's final text.
-    Turn { history: Vec<ChatMessage>, text: String },
+    /// Something the user should know mid-turn (e.g. context shedding).
+    Notice(String),
+    /// Turn finished: the updated history, the assistant's final text, and
+    /// the last reported token usage.
+    Turn { history: Vec<ChatMessage>, text: String, usage: Option<Usage> },
     Compacted { summary: String },
     Error(String),
 }
@@ -81,6 +87,9 @@ pub struct App {
     /// while this is set.
     pub pending_approval: Option<ApprovalRequest>,
     approvals: Arc<Approvals>,
+    /// Real token usage from the most recent turn, when the server reports
+    /// it; None falls back to the character estimate.
+    pub last_usage: Option<Usage>,
     pub quit: bool,
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
@@ -140,6 +149,7 @@ impl App {
             stream_buffer: String::new(),
             pending_approval: None,
             approvals,
+            last_usage: None,
             quit: false,
             turn: None,
             compacting: false,
@@ -164,7 +174,7 @@ impl App {
                     app.session_id,
                     store::format_epoch(app.started_at),
                     app.stage_summary(),
-                    fmt_tokens(app.token_estimate()),
+                    fmt_tokens(app.token_estimate() as u64),
                 ));
             }
             None => app.info(format!(
@@ -191,6 +201,7 @@ impl App {
         self.session_id = session.id;
         self.started_at = session.started_at;
         self.has_activity = true;
+        self.last_usage = None;
         self.scroll_from_bottom = 0;
     }
 
@@ -262,6 +273,43 @@ impl App {
 
     pub fn spinner_tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
+    }
+
+    pub fn context_capacity(&self) -> Option<u64> {
+        self.config.models.get(&self.stage().model).and_then(|m| m.context_tokens)
+    }
+
+    /// Status-bar context gauge: text plus a pressure level
+    /// (0 = fine, 1 = ≥70%, 2 = ≥90%). Real usage when reported, `~`
+    /// estimate otherwise.
+    pub fn context_status(&self) -> (String, u8) {
+        let capacity = self.context_capacity();
+        let (used, estimated) = match self.last_usage {
+            Some(usage) => (usage.context_tokens(), false),
+            None => (self.token_estimate() as u64, true),
+        };
+        let marker = if estimated { "~" } else { "" };
+        match capacity {
+            Some(capacity) => {
+                let percent = used * 100 / capacity.max(1);
+                let level = if percent >= 90 {
+                    2
+                } else if percent >= 70 {
+                    1
+                } else {
+                    0
+                };
+                (
+                    format!(
+                        "ctx {marker}{}/{} ({percent}%)",
+                        fmt_tokens(used),
+                        fmt_tokens(capacity)
+                    ),
+                    level,
+                )
+            }
+            None => (format!("ctx {marker}{}", fmt_tokens(used)), 0),
+        }
     }
 
     /// Rough context-size estimate: ~4 characters per token.
@@ -459,7 +507,7 @@ impl App {
             "switched to session {} ({}, ctx ~{})",
             id,
             self.stage_summary(),
-            fmt_tokens(self.token_estimate()),
+            fmt_tokens(self.token_estimate() as u64),
         ));
     }
 
@@ -475,6 +523,7 @@ impl App {
         self.session_id = store::new_session_id();
         self.started_at = store::now_epoch();
         self.has_activity = false;
+        self.last_usage = None;
         self.scroll_from_bottom = 0;
         self.info(format!(
             "started new session {} — {}. Type /help for commands.",
@@ -690,7 +739,8 @@ impl App {
                 }
                 let freed = self.token_estimate();
                 self.history.clear();
-                self.info(format!("context cleared (freed ~{})", fmt_tokens(freed)));
+                self.last_usage = None;
+                self.info(format!("context cleared (freed ~{})", fmt_tokens(freed as u64)));
             }
             "compact" => self.start_compact(),
             "diff" => self.toggle_diff_view(),
@@ -777,6 +827,7 @@ impl App {
             self.tx.clone(),
             (stage.require_approval, stage.auto_approve.clone()),
             Arc::clone(&self.approvals),
+            stage.model.clone(),
         );
         self.compacting = false;
         self.turn = Some(tokio::spawn(worker));
@@ -822,6 +873,29 @@ impl App {
         if !partial.is_empty() {
             self.transcript.push(TranscriptItem::Assistant(partial.to_string()));
         }
+    }
+
+    /// Kick off compaction automatically when real usage crosses the
+    /// threshold of the model's declared context window.
+    fn maybe_auto_compact(&mut self) {
+        let threshold = self.config.settings.auto_compact_threshold;
+        if threshold <= 0.0 || self.is_running() || self.history.len() <= 2 {
+            return;
+        }
+        let (Some(capacity), Some(usage)) = (self.context_capacity(), self.last_usage) else {
+            return;
+        };
+        let used = usage.context_tokens();
+        if (used as f64) < capacity as f64 * threshold {
+            return;
+        }
+        self.info(format!(
+            "context at {}% ({} of {}) — auto-compacting",
+            used * 100 / capacity.max(1),
+            fmt_tokens(used),
+            fmt_tokens(capacity),
+        ));
+        self.start_compact();
     }
 
     pub fn cancel_turn(&mut self) {
@@ -873,17 +947,20 @@ impl App {
                 self.info(format!("✎ {} — Ctrl+G to view", entry.title()));
                 self.diffs.push(entry);
             }
-            AgentEvent::Turn { history, text } => {
+            AgentEvent::Notice(text) => self.info(text),
+            AgentEvent::Turn { history, text, usage } => {
                 // The buffer holds the same text that just streamed; the
                 // final Turn event is authoritative.
                 self.stream_buffer.clear();
                 self.history = history;
+                self.last_usage = usage;
                 if text.trim().is_empty() {
                     self.info("(model returned an empty response)");
                 } else {
                     self.transcript.push(TranscriptItem::Assistant(text));
                 }
                 self.turn = None;
+                self.maybe_auto_compact();
             }
             AgentEvent::Compacted { summary } => {
                 let before = self.token_estimate();
@@ -901,10 +978,11 @@ impl App {
                 let after = self.token_estimate();
                 self.turn = None;
                 self.compacting = false;
+                self.last_usage = None; // real usage returns on the next turn
                 self.info(format!(
                     "context compacted: ~{} → ~{}",
-                    fmt_tokens(before),
-                    fmt_tokens(after)
+                    fmt_tokens(before as u64),
+                    fmt_tokens(after as u64)
                 ));
             }
             AgentEvent::Error(message) => {
@@ -920,7 +998,7 @@ impl App {
     }
 }
 
-pub fn fmt_tokens(tokens: usize) -> String {
+pub fn fmt_tokens(tokens: u64) -> String {
     if tokens >= 1000 {
         format!("{:.1}k tok", tokens as f64 / 1000.0)
     } else {
@@ -944,6 +1022,7 @@ async fn turn_worker(
     tx: UnboundedSender<AgentEvent>,
     (require_approval, auto_approve): (bool, Vec<String>),
     approvals: Arc<Approvals>,
+    model_name: String,
 ) {
     let delta_tx = tx.clone();
     let on_delta = move |fragment: &str| {
@@ -968,8 +1047,23 @@ async fn turn_worker(
         if reply.tool_calls.is_empty() {
             let text = reply.content.clone().unwrap_or_default();
             history.push(ChatMessage::Assistant { content: reply.content, tool_calls: None });
-            let _ = tx.send(AgentEvent::Turn { history, text });
+            let _ = tx.send(AgentEvent::Turn { history, text, usage: reply.usage });
             return;
+        }
+
+        // Mid-turn context pressure: truncate older tool results in the
+        // history before the next request.
+        if let Some((used, capacity)) =
+            context_pressure(&config, &model_name, reply.usage.as_ref())
+        {
+            let trimmed = shed_context(&mut history, 2);
+            if trimmed > 0 {
+                let _ = tx.send(AgentEvent::Notice(format!(
+                    "context at {} of {} — truncated {trimmed} older tool result(s)",
+                    fmt_tokens(used),
+                    fmt_tokens(capacity),
+                )));
+            }
         }
 
         let calls = reply.tool_calls.clone();

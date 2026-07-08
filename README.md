@@ -77,6 +77,8 @@ Slash commands:
 | `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
 | `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
 | `/export [path]` | Write the transcript to a markdown file (default `soa-session-<id>.md`); refuses to overwrite. |
+| `/branch <name>` | Save a full copy of the conversation as a named branch and keep going. |
+| `/branches` | Open the branch picker. `Enter` **swaps** the live conversation with the selected slot — the branch's line becomes live and the slot holds the line you left, so switching never loses anything and the list doesn't grow. `d` deletes a slot. `/rewind` stores the abandoned line as a branch automatically, which makes rewinding non-destructive. Branching is conversation-level: file state stays physical (each line's checkpoints still work for `/rewind` file restores, since the diff log is shared and append-only). |
 | `/sessions` | Open the session picker: switch to another of this directory's sessions in place, or start a fresh one. |
 | `/help`, `/quit` | The obvious. |
 

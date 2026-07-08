@@ -103,6 +103,34 @@ pub struct Checkpoint {
     pub diff_len: usize,
 }
 
+/// A stored conversation line: a full snapshot of the transcript, model
+/// history, and checkpoints. `/branches` swaps the live conversation with
+/// a branch slot, so switching never loses state. Conversation-only: file
+/// state stays physical (the diff log is shared and append-only, which is
+/// what keeps stored checkpoints valid for file restores after a swap).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Branch {
+    pub name: String,
+    pub created_at: u64,
+    pub transcript: Vec<TranscriptItem>,
+    pub history: Vec<ChatMessage>,
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+impl Branch {
+    /// The last user message, for the picker listing.
+    pub fn title(&self) -> &str {
+        self.transcript
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                TranscriptItem::User(text) => Some(text.lines().next().unwrap_or("")),
+                _ => None,
+            })
+            .unwrap_or("(empty)")
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -122,6 +150,9 @@ pub struct Session {
     /// Rewind targets (empty on sessions saved by older soa versions).
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// Stored conversation lines (see [`Branch`]).
+    #[serde(default)]
+    pub branches: Vec<Branch>,
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
@@ -258,12 +289,21 @@ mod tests {
                     history_len: 0,
                     diff_len: 0,
                 }],
+                branches: vec![Branch {
+                    name: "alt".to_string(),
+                    created_at: 150,
+                    transcript: vec![TranscriptItem::User("other path".to_string())],
+                    history: Vec::new(),
+                    checkpoints: Vec::new(),
+                }],
             };
             save_session(&session).unwrap();
             let loaded = load_session("20260707-120000").unwrap();
             assert_eq!(loaded.title, "fix the widget");
             assert_eq!(loaded.history.len(), 1);
             assert_eq!(loaded.checkpoints.len(), 1);
+            assert_eq!(loaded.branches.len(), 1);
+            assert_eq!(loaded.branches[0].title(), "other path");
             let latest = load_latest_session().unwrap().unwrap();
             assert_eq!(latest.id, session.id);
         });

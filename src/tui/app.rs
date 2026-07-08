@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use super::completion::{self, Completion};
-use super::store::{self, Checkpoint, PromptHistory, Session};
+use super::store::{self, Branch, Checkpoint, PromptHistory, Session};
 use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
@@ -64,6 +64,8 @@ pub enum View {
     /// Rewind picker over `App::checkpoints` (newest first, plus a
     /// session-start row at the bottom).
     Rewind { selected: usize, scroll: usize },
+    /// Branch picker over `App::branches`.
+    Branches { selected: usize, scroll: usize },
 }
 
 pub struct App {
@@ -79,6 +81,9 @@ pub struct App {
     /// Rewind targets: one per turn-starting user message, invalidated by
     /// compaction and `/clear` (both rewrite the history they index into).
     pub checkpoints: Vec<Checkpoint>,
+    /// Stored conversation lines: `/branch` stashes, `/rewind` stashes the
+    /// abandoned tail, `/branches` swaps one with the live conversation.
+    pub branches: Vec<Branch>,
     pub view: View,
     pub input: TextArea<'static>,
     /// 0 = pinned to the bottom (auto-follow); larger = scrolled up.
@@ -165,6 +170,7 @@ impl App {
             transcript: Vec::new(),
             diffs: Vec::new(),
             checkpoints: Vec::new(),
+            branches: Vec::new(),
             view: View::Chat,
             input: new_textarea(),
             scroll_from_bottom: 0,
@@ -230,6 +236,7 @@ impl App {
         self.transcript = session.transcript;
         self.diffs = session.diffs;
         self.checkpoints = session.checkpoints;
+        self.branches = session.branches;
         self.session_id = session.id;
         self.started_at = session.started_at;
         self.has_activity = true;
@@ -264,6 +271,7 @@ impl App {
             transcript: self.transcript.clone(),
             diffs: self.diffs.clone(),
             checkpoints: self.checkpoints.clone(),
+            branches: self.branches.clone(),
         };
         if let Err(e) = store::save_session(&session) {
             self.has_activity = false; // avoid an error loop
@@ -479,6 +487,7 @@ impl App {
             View::Diffs { .. } => self.on_diff_key(key),
             View::Sessions { .. } => self.on_sessions_key(key),
             View::Rewind { .. } => self.on_rewind_key(key),
+            View::Branches { .. } => self.on_branches_key(key),
             View::Chat => self.on_chat_key(key),
         }
     }
@@ -563,6 +572,7 @@ impl App {
         self.transcript.clear();
         self.diffs.clear();
         self.checkpoints.clear();
+        self.branches.clear();
         self.session_id = store::new_session_id();
         self.started_at = store::now_epoch();
         self.has_activity = false;
@@ -784,6 +794,12 @@ impl App {
                 // rows = checkpoints + the session-start row at the bottom
                 *selected = (*selected + 1).min(self.checkpoints.len());
             }
+            (View::Branches { selected, .. }, MouseEventKind::ScrollUp) => {
+                *selected = selected.saturating_sub(1);
+            }
+            (View::Branches { selected, .. }, MouseEventKind::ScrollDown) => {
+                *selected = (*selected + 1).min(self.branches.len().saturating_sub(1));
+            }
             _ => {}
         }
     }
@@ -800,7 +816,7 @@ impl App {
     fn toggle_diff_view(&mut self) {
         match self.view {
             View::Diffs { .. } => self.view = View::Chat,
-            View::Sessions { .. } | View::Rewind { .. } => {} // don't stack modal views
+            View::Sessions { .. } | View::Rewind { .. } | View::Branches { .. } => {} // don't stack modal views
             View::Chat if self.diffs.is_empty() => {
                 self.info("no file changes captured yet");
             }
@@ -888,6 +904,8 @@ impl App {
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
                  /rewind         pick a past message to rewind to (conversation + files)\n\
+                 /branch <name>  save the conversation as a branch and keep going\n\
+                 /branches       switch between saved conversation lines (d deletes)\n\
                  /stage <name>   switch the active stage\n\
                  /model <name>   override the model for this session (/model default reverts)\n\
                  /reload         re-read the config file (MCP changes need a restart)\n\
@@ -929,6 +947,8 @@ impl App {
             }
             "diff" => self.toggle_diff_view(),
             "rewind" => self.open_rewind(),
+            "branch" => self.stash_branch(arg),
+            "branches" => self.open_branches(),
             "stage" => self.switch_stage(arg),
             "model" => self.switch_model(arg),
             "reload" => self.reload_config(),
@@ -1249,6 +1269,106 @@ impl App {
         }
     }
 
+    /// A full snapshot of the live conversation, for a branch slot.
+    fn snapshot_branch(&self, name: String) -> Branch {
+        Branch {
+            name,
+            created_at: store::now_epoch(),
+            transcript: self.transcript.clone(),
+            history: self.history.clone(),
+            checkpoints: self.checkpoints.clone(),
+        }
+    }
+
+    /// A branch name that isn't taken: b1, b2, …
+    fn next_branch_name(&self) -> String {
+        (1..)
+            .map(|n| format!("b{n}"))
+            .find(|name| !self.branches.iter().any(|b| &b.name == name))
+            .expect("some name is free")
+    }
+
+    /// `/branch <name>`: store a copy of the conversation as a branch and
+    /// keep going. `/branch` with no name opens the picker.
+    fn stash_branch(&mut self, name: &str) {
+        if name.is_empty() {
+            return self.open_branches();
+        }
+        if self.branches.iter().any(|b| b.name == name) {
+            return self.error(format!("branch `{name}` already exists (see /branches)"));
+        }
+        if self.transcript.is_empty() {
+            return self.info("nothing to branch — the conversation is empty");
+        }
+        self.branches.push(self.snapshot_branch(name.to_string()));
+        self.has_activity = true;
+        self.info(format!(
+            "saved the conversation as branch `{name}` — /branches switches between lines"
+        ));
+        self.persist();
+    }
+
+    fn open_branches(&mut self) {
+        if self.branches.is_empty() {
+            return self.info(
+                "no branches yet — /branch <name> saves the current line, and /rewind \
+                 stores the abandoned one automatically",
+            );
+        }
+        self.view = View::Branches { selected: 0, scroll: 0 };
+    }
+
+    fn on_branches_key(&mut self, key: KeyEvent) {
+        let View::Branches { selected, .. } = &mut self.view else { return };
+        let current = *selected;
+        let last = self.branches.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
+            KeyCode::Up | KeyCode::Char('k') => *selected = current.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *selected = (current + 1).min(last),
+            KeyCode::Home | KeyCode::Char('g') => *selected = 0,
+            KeyCode::End | KeyCode::Char('G') => *selected = last,
+            KeyCode::Enter => self.swap_branch(current),
+            KeyCode::Char('d') => self.delete_branch(current),
+            _ => {}
+        }
+    }
+
+    /// Swap the live conversation with a branch slot: the branch's line
+    /// becomes live, and the slot now holds what was live — so switching
+    /// never loses anything and never grows the list.
+    fn swap_branch(&mut self, index: usize) {
+        self.view = View::Chat;
+        if self.is_running() {
+            return self.error("finish or cancel the running turn before switching branches");
+        }
+        let Some(branch) = self.branches.get_mut(index) else { return };
+        std::mem::swap(&mut branch.transcript, &mut self.transcript);
+        std::mem::swap(&mut branch.history, &mut self.history);
+        std::mem::swap(&mut branch.checkpoints, &mut self.checkpoints);
+        branch.created_at = store::now_epoch();
+        let name = branch.name.clone();
+        self.last_usage = None;
+        self.scroll_from_bottom = 0;
+        self.has_activity = true;
+        self.info(format!(
+            "switched to branch `{name}` — the line you left now lives in that slot"
+        ));
+        self.persist();
+    }
+
+    fn delete_branch(&mut self, index: usize) {
+        if index >= self.branches.len() {
+            return;
+        }
+        let branch = self.branches.remove(index);
+        self.info(format!("deleted branch `{}` ({})", branch.name, branch.title()));
+        if self.branches.is_empty() {
+            self.view = View::Chat;
+        }
+        self.persist();
+    }
+
     /// `/rewind`: open the checkpoint picker (newest message first, plus a
     /// session-start row).
     fn open_rewind(&mut self) {
@@ -1323,6 +1443,16 @@ impl App {
             self.error(message);
         }
 
+        // The abandoned line is stashed as a branch, not destroyed —
+        // /branches returns to it.
+        let stashed = if checkpoint.transcript_index < self.transcript.len() {
+            let name = self.next_branch_name();
+            self.branches.push(self.snapshot_branch(name.clone()));
+            Some(name)
+        } else {
+            None
+        };
+
         // Then the conversation: drop the rewound message and everything
         // after it, and hand the message text back for editing.
         let message = match self.transcript.get(checkpoint.transcript_index) {
@@ -1339,7 +1469,7 @@ impl App {
         }
 
         self.info(format!(
-            "rewound to {}{}{}",
+            "rewound to {}{}{}{}",
             match index {
                 Some(_) => "before the selected message",
                 None => "the start of the session",
@@ -1347,6 +1477,10 @@ impl App {
             match restored.len() {
                 0 => String::new(),
                 n => format!(" — restored {n} file(s): {}", restored.join(", ")),
+            },
+            match &stashed {
+                Some(name) => format!(" — the abandoned line is saved as branch `{name}`"),
+                None => String::new(),
             },
             if message.is_some() { " (the message is back in the input)" } else { "" },
         ));

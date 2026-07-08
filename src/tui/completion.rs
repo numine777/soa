@@ -10,6 +10,8 @@ use std::path::Path;
 /// Chat slash commands, shown in the popup with their descriptions.
 /// (`/exit` is an undocumented alias of `/quit` and is left out.)
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("branch", "save the conversation as a named branch"),
+    ("branches", "switch between saved conversation lines"),
     ("clear", "drop all conversation context"),
     ("compact", "summarize the conversation and shrink context"),
     ("diff", "open the diff viewer"),

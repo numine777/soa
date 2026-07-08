@@ -60,7 +60,75 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_rewind(frame, app, list_area);
             draw_status(frame, app, status_area);
         }
+        View::Branches { .. } => {
+            let [list_area, status_area] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+            draw_branches(frame, app, list_area);
+            draw_status(frame, app, status_area);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Branch picker
+// ---------------------------------------------------------------------------
+
+fn draw_branches(frame: &mut Frame, app: &mut App, area: Rect) {
+    let rows: Vec<String> = app
+        .branches
+        .iter()
+        .map(|branch| {
+            let messages = branch
+                .transcript
+                .iter()
+                .filter(|item| matches!(item, TranscriptItem::User(_)))
+                .count();
+            format!(
+                "{}  {} message(s)  ends at: {}  ({})",
+                branch.name,
+                messages,
+                truncate_str(branch.title(), 56),
+                store::format_epoch(branch.created_at),
+            )
+        })
+        .collect();
+    let View::Branches { selected, scroll } = &mut app.view else { return };
+    *selected = (*selected).min(rows.len().saturating_sub(1));
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(
+            " branches — Enter swaps the live conversation with a slot · d delete · j/k move · q close ",
+        )
+        .style(Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        header_area,
+    );
+
+    let viewport = body_area.height as usize;
+    if *selected < *scroll {
+        *scroll = *selected;
+    } else if *selected >= *scroll + viewport.max(1) {
+        *scroll = *selected + 1 - viewport.max(1);
+    }
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(*scroll)
+        .take(viewport.max(1))
+        .map(|(row, text)| {
+            let is_selected = row == *selected;
+            let marker = if is_selected { "▶" } else { " " };
+            let style = if is_selected {
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::styled(format!("{marker} {text}"), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), body_area);
 }
 
 // ---------------------------------------------------------------------------

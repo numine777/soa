@@ -90,6 +90,15 @@ appended to `~/.local/share/soa/prompt_history.jsonl` and shared across
 sessions — `Up`/`Down` in the input box scrolls through them, with your
 unsent draft restored when you scroll back past the newest entry.
 
+**File mentions.** `@path` in any prompt attaches that file's content to
+the message the model receives — `@src/main.rs`, `@"file with spaces.txt"`,
+absolute paths, or `@somedir` for a directory listing. Paths resolve
+against the current working directory. Mentions are only recognized at
+word boundaries (`user@host` is left alone), attached files are clamped by
+`max_tool_output_chars`, and the transcript shows what was attached
+(`@Cargo.toml attached (22 lines)`) or flags typos (`@missing.rs not
+found`). Works in `soa run` task text too, with reports on stderr.
+
 **Diff viewer.** When the model calls a non-read-only MCP tool, soa
 snapshots any file named by a path-like argument and records a unified diff
 of what actually changed on disk. Changes show up inline in the transcript

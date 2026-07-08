@@ -1,6 +1,7 @@
 mod config;
 mod diff;
 mod mcp;
+mod mentions;
 mod provider;
 mod skills;
 mod stage;
@@ -218,6 +219,13 @@ async fn main() -> Result<()> {
             };
             if task.is_empty() {
                 bail!("no task given (pass it as an argument or on stdin)");
+            }
+            // Expand @file mentions relative to the current directory.
+            let cwd = std::env::current_dir().context("cannot determine working directory")?;
+            let (task, reports) =
+                mentions::expand_mentions(&task, &cwd, config.settings.max_tool_output_chars);
+            for report in &reports {
+                eprintln!("• {}", report.describe());
             }
             run_pipeline(&config, &task, stage.as_deref(), workflow.as_deref()).await
         }

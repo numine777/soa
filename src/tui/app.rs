@@ -596,8 +596,19 @@ impl App {
         self.remember_prompt(&text);
         self.has_activity = true;
         self.input = new_textarea();
-        self.transcript.push(TranscriptItem::User(text.clone()));
-        self.history.push(ChatMessage::User { content: text });
+
+        // @file mentions: the transcript keeps what was typed; the model
+        // receives the message with file contents appended.
+        let (expanded, reports) = crate::mentions::expand_mentions(
+            &text,
+            std::path::Path::new(&self.cwd),
+            self.config.settings.max_tool_output_chars,
+        );
+        self.transcript.push(TranscriptItem::User(text));
+        for report in &reports {
+            self.info(report.describe());
+        }
+        self.history.push(ChatMessage::User { content: expanded });
         self.scroll_from_bottom = 0;
         self.start_turn();
         self.persist();
@@ -620,6 +631,7 @@ impl App {
                  /stage <name>   switch the active stage\n\
                  /sessions       open the session picker (switch or start new)\n\
                  /quit           exit (Ctrl+D on an empty prompt)\n\
+                 mention files with @path (@src/main.rs, @\"has spaces.txt\", @somedir)\n\
                  keys: Enter send · Alt+Enter newline · Up/Down recall past prompts\n\
                  PgUp/PgDn + mouse wheel scroll\n\
                  diff view: Tab/Shift+Tab switch file · j/k scroll · q close",

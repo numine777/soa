@@ -216,6 +216,28 @@ A provider reference plus default sampling parameters (`temperature`,
 `top_p`, `max_tokens`). Stages refer to models by this name, so you can
 swap the underlying model in one place.
 
+**Fallback chains.** A model may list other models to fail over to when
+its endpoint stays down after `provider_retries` (or rejects the request
+outright):
+
+```toml
+[models.planner]
+provider = "spark"
+model = "qwen"
+fallback = ["planner-tr"]        # try the threadripper if spark is down
+
+[models.planner-tr]
+provider = "threadripper"
+model = "qwen"
+```
+
+Fallbacks may declare their own fallbacks; the chain resolves
+breadth-first and cycles are ignored. Every failover is logged, usage
+stats attribute requests to the model that actually served them, and
+partially streamed text is not repeated across the switch. Caller-level
+overrides (a stage's `temperature`/`max_tokens`) apply across the whole
+chain.
+
 Optionally declare the model's context window with `context_tokens`
 (e.g. `131072`). soa reads real token usage from the provider's `usage`
 field on every response (including streamed ones, via

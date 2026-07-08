@@ -251,6 +251,12 @@ pub struct Model {
     /// in the chat status bar, auto-compaction, and mid-stage shedding of
     /// old tool results.
     pub context_tokens: Option<u64>,
+    /// Other `[models]` entries to fail over to, in order, when this
+    /// model's endpoint stays down after retries (or rejects the request
+    /// outright). Fallbacks may declare their own fallbacks; the chain is
+    /// followed breadth-first and cycles are ignored.
+    #[serde(default)]
+    pub fallback: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -534,6 +540,18 @@ impl Config {
         for (index, hook) in self.hooks.iter().enumerate() {
             if hook.command.trim().is_empty() {
                 errors.push(format!("hooks[{index}] has an empty command"));
+            }
+        }
+
+        for (name, model) in &self.models {
+            for fallback in &model.fallback {
+                if fallback == name {
+                    errors.push(format!("model `{name}` lists itself as a fallback"));
+                } else if !self.models.contains_key(fallback) {
+                    errors.push(format!(
+                        "model `{name}` has unknown fallback model `{fallback}`"
+                    ));
+                }
             }
         }
 
@@ -906,6 +924,26 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("stage.third"), "{err}");
+    }
+
+    #[test]
+    fn fallback_references_validated() {
+        let toml_str = MINIMAL.replace(
+            "model = \"qwen3:8b\"",
+            "model = \"qwen3:8b\"\nfallback = [\"ghost\", \"default\"]",
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("unknown fallback model `ghost`"), "{err}");
+        assert!(err.contains("model `default` lists itself as a fallback"), "{err}");
+
+        let toml_str = format!(
+            "{}\n[models.backup]\nprovider = \"local\"\nmodel = \"qwen3:4b\"\n",
+            MINIMAL.replace(
+                "model = \"qwen3:8b\"",
+                "model = \"qwen3:8b\"\nfallback = [\"backup\"]"
+            )
+        );
+        assert!(parse(&toml_str).is_ok());
     }
 
     #[test]

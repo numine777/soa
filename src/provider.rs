@@ -323,17 +323,27 @@ pub struct SamplingParams {
     pub max_tokens: Option<u32>,
 }
 
+/// One endpoint a [`ChatClient`] can talk to: a provider URL plus the
+/// model and sampling parameters to use there.
+pub struct Target {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    /// Config-level model name, used to attribute [`usage_stats`] and
+    /// name the endpoint in logs.
+    pub label: String,
+    pub params: SamplingParams,
+    pub stream: bool,
+}
+
 pub struct ChatClient {
     http: reqwest::Client,
-    base_url: String,
-    api_key: Option<String>,
-    model: String,
-    /// Config-level model name, used to attribute [`usage_stats`].
-    label: String,
-    params: SamplingParams,
-    stream: bool,
-    /// Additional attempts after a transient failure (network error,
-    /// 408/429/5xx, or an interrupted stream).
+    /// The primary model first, then its fallback chain in order.
+    targets: Vec<Target>,
+    /// Additional attempts per target after a transient failure (network
+    /// error, 408/429/5xx, or an interrupted stream). When a target's
+    /// retries are exhausted — or it fails fatally — the next target in
+    /// the chain is tried.
     retries: u32,
 }
 
@@ -390,27 +400,17 @@ fn novel_suffix(fragment: &str, cumulative_before: usize, emitted: usize) -> Opt
 }
 
 impl ChatClient {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        http: reqwest::Client,
-        base_url: &str,
-        api_key: Option<String>,
-        model: &str,
-        label: &str,
-        params: SamplingParams,
-        stream: bool,
-        retries: u32,
-    ) -> Self {
-        Self {
-            http,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
-            model: model.to_string(),
-            label: label.to_string(),
-            params,
-            stream,
-            retries,
+    pub fn new(http: reqwest::Client, mut targets: Vec<Target>, retries: u32) -> Self {
+        for target in &mut targets {
+            target.base_url = target.base_url.trim_end_matches('/').to_string();
         }
+        assert!(!targets.is_empty(), "a ChatClient needs at least one target");
+        Self { http, targets, retries }
+    }
+
+    /// Config-level model names in chain order (primary first).
+    pub fn target_labels(&self) -> Vec<&str> {
+        self.targets.iter().map(|t| t.label.as_str()).collect()
     }
 
     /// One round-trip without delta reporting.
@@ -428,8 +428,10 @@ impl ChatClient {
     ///
     /// Transient failures (network errors, 408/429/5xx, interrupted
     /// streams) are retried with exponential backoff up to
-    /// `settings.provider_retries` times. Content already delivered to
-    /// `on_delta` before a mid-stream failure is not re-emitted.
+    /// `settings.provider_retries` times; when a target is exhausted (or
+    /// fails fatally) the next target in the fallback chain is tried.
+    /// Content already delivered to `on_delta` before a mid-stream failure
+    /// is not re-emitted, including across a failover.
     pub async fn chat_streamed(
         &self,
         messages: &[ChatMessage],
@@ -437,54 +439,78 @@ impl ChatClient {
         on_delta: Option<DeltaHandler<'_>>,
     ) -> Result<AssistantTurn> {
         let mut emitted = 0usize;
-        let mut attempt = 0u32;
-        loop {
-            match self.attempt_chat(messages, tools, on_delta, &mut emitted).await {
-                Ok(turn) => {
-                    usage_stats::record(&self.label, turn.usage);
-                    return Ok(turn);
+        let mut last_error = None;
+        for (index, target) in self.targets.iter().enumerate() {
+            let mut attempt = 0u32;
+            let failure = loop {
+                match self.attempt_chat(target, messages, tools, on_delta, &mut emitted).await {
+                    Ok(turn) => {
+                        usage_stats::record(&target.label, turn.usage);
+                        if index > 0 {
+                            tracing::warn!(
+                                model = %target.label,
+                                "request served by fallback model"
+                            );
+                        }
+                        return Ok(turn);
+                    }
+                    Err(error) if error.retryable && attempt < self.retries => {
+                        let delay = error.retry_after.unwrap_or_else(|| backoff_delay(attempt));
+                        attempt += 1;
+                        tracing::warn!(
+                            model = %target.label,
+                            attempt,
+                            retries = self.retries,
+                            delay_ms = delay.as_millis() as u64,
+                            error = format!("{:#}", error.source),
+                            "provider request failed; retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => break error.source,
                 }
-                Err(error) if error.retryable && attempt < self.retries => {
-                    let delay = error.retry_after.unwrap_or_else(|| backoff_delay(attempt));
-                    attempt += 1;
-                    tracing::warn!(
-                        attempt,
-                        retries = self.retries,
-                        delay_ms = delay.as_millis() as u64,
-                        error = format!("{:#}", error.source),
-                        "provider request failed; retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-                Err(error) => return Err(error.source),
+            };
+            if index + 1 < self.targets.len() {
+                tracing::warn!(
+                    model = %target.label,
+                    next = %self.targets[index + 1].label,
+                    error = format!("{failure:#}"),
+                    "model endpoint failed; falling back"
+                );
             }
+            last_error = Some(failure);
         }
+        let chain = self.target_labels().join(" -> ");
+        Err(last_error
+            .expect("at least one target")
+            .context(format!("every model endpoint failed (tried: {chain})")))
     }
 
     async fn attempt_chat(
         &self,
+        target: &Target,
         messages: &[ChatMessage],
         tools: &[ToolFunction],
         on_delta: Option<DeltaHandler<'_>>,
         emitted: &mut usize,
     ) -> std::result::Result<AssistantTurn, AttemptError> {
         let request = ChatRequest {
-            model: &self.model,
+            model: &target.model,
             messages,
-            temperature: self.params.temperature,
-            top_p: self.params.top_p,
-            max_tokens: self.params.max_tokens,
+            temperature: target.params.temperature,
+            top_p: target.params.top_p,
+            max_tokens: target.params.max_tokens,
             tools: tools
                 .iter()
                 .map(|f| ToolWire { kind: "function", function: f })
                 .collect(),
-            stream: self.stream,
-            stream_options: self.stream.then_some(StreamOptions { include_usage: true }),
+            stream: target.stream,
+            stream_options: target.stream.then_some(StreamOptions { include_usage: true }),
         };
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", target.base_url);
         let mut builder = self.http.post(&url).json(&request);
-        if let Some(key) = &self.api_key
+        if let Some(key) = &target.api_key
             && !key.is_empty()
         {
             builder = builder.bearer_auth(key);
@@ -512,7 +538,7 @@ impl ChatClient {
             });
         }
 
-        if !self.stream {
+        if !target.stream {
             let body = response.text().await.unwrap_or_default();
             let parsed: ChatResponse = serde_json::from_str(&body).map_err(|e| {
                 AttemptError::fatal(

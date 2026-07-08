@@ -736,7 +736,9 @@ impl PipelineContext {
 }
 
 /// Build a chat client for a named model, with optional caller-level
-/// sampling overrides taking precedence over the model's defaults.
+/// sampling overrides taking precedence over each model's defaults. The
+/// client's targets are the model followed by its fallback chain,
+/// resolved breadth-first with cycles ignored.
 pub fn build_client(
     config: &Config,
     model_name: &str,
@@ -744,29 +746,37 @@ pub fn build_client(
     max_tokens: Option<u32>,
     http: &reqwest::Client,
 ) -> Result<ChatClient> {
-    let model = config
-        .models
-        .get(model_name)
-        .ok_or_else(|| anyhow!("unknown model `{model_name}`"))?;
-    let provider = config
-        .providers
-        .get(&model.provider)
-        .ok_or_else(|| anyhow!("unknown provider `{}`", model.provider))?;
+    let mut targets = Vec::new();
+    let mut queue = std::collections::VecDeque::from([model_name.to_string()]);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let model = config
+            .models
+            .get(&name)
+            .ok_or_else(|| anyhow!("unknown model `{name}`"))?;
+        let provider = config
+            .providers
+            .get(&model.provider)
+            .ok_or_else(|| anyhow!("unknown provider `{}`", model.provider))?;
+        targets.push(crate::provider::Target {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model: model.model.clone(),
+            label: name,
+            params: SamplingParams {
+                temperature: temperature.or(model.temperature),
+                top_p: model.top_p,
+                max_tokens: max_tokens.or(model.max_tokens),
+            },
+            stream: provider.stream,
+        });
+        queue.extend(model.fallback.iter().cloned());
+    }
 
-    Ok(ChatClient::new(
-        http.clone(),
-        &provider.base_url,
-        provider.api_key.clone(),
-        &model.model,
-        model_name,
-        SamplingParams {
-            temperature: temperature.or(model.temperature),
-            top_p: model.top_p,
-            max_tokens: max_tokens.or(model.max_tokens),
-        },
-        provider.stream,
-        config.settings.provider_retries,
-    ))
+    Ok(ChatClient::new(http.clone(), targets, config.settings.provider_retries))
 }
 
 /// Run one stage to completion. `reprompt_targets` are the stages the model
@@ -1095,6 +1105,46 @@ mod tests {
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
         let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
         assert!(at_cap.is_empty());
+    }
+
+    #[test]
+    fn fallback_chain_resolves_breadth_first_and_cuts_cycles() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.a]
+            provider = "p"
+            model = "a-id"
+            fallback = ["b", "c"]
+
+            [models.b]
+            provider = "p"
+            model = "b-id"
+            fallback = ["d", "a"]
+
+            [models.c]
+            provider = "p"
+            model = "c-id"
+
+            [models.d]
+            provider = "p"
+            model = "d-id"
+
+            [[stage]]
+            name = "s"
+            model = "a"
+            "#,
+        )
+        .unwrap();
+        let http = reqwest::Client::new();
+        let client = build_client(&config, "a", None, None, &http).unwrap();
+        // a's own fallbacks first, then theirs; the cycle back to `a` is cut.
+        assert_eq!(client.target_labels(), vec!["a", "b", "c", "d"]);
+        // A model with no fallbacks yields a single target.
+        let solo = build_client(&config, "c", None, None, &http).unwrap();
+        assert_eq!(solo.target_labels(), vec!["c"]);
     }
 
     #[test]

@@ -229,6 +229,37 @@ can run the test suite without gaining any MCP write tools. That also means
 `shell_allow` when the stage's model shouldn't have arbitrary command
 execution.
 
+## Approvals (human in the loop)
+
+A stage or agent with `require_approval = true` pauses every
+non-read-only tool call — MCP write tools, shell commands, delegations to
+write-capable agents — for an interactive decision:
+
+```toml
+[[stage]]
+name = "implement"
+mode = "read_write"
+shell = true
+require_approval = true
+auto_approve = ["shell cargo *", "agent__researcher"]
+```
+
+- In the TUI, a modal bar appears: `[y]` allow once, `[a]` allow everything
+  matching the shown pattern for the rest of the session (e.g. a shell
+  command grants `shell <first-word> *`), `[n]`/`Esc` deny. Input is modal
+  until you decide.
+- `soa run` prompts the same way on the terminal when stdin is a TTY.
+  Non-interactive runs (piped stdin, cron) **deny** gated calls with a
+  message telling the model to ask for an auto_approve pattern — they never
+  hang waiting for input.
+- `auto_approve` patterns skip the prompt: they match tool names
+  (`filesystem__edit_file`, `agent__*`) or `shell <command>` for the shell
+  tool (`shell cargo *`), using the same anchored `*`-wildcards as
+  `shell_allow`.
+- Denials are returned to the model as tool results ("the user declined…
+  adjust your approach"), so a refusal redirects the model instead of
+  crashing the turn. Read-only tools are never gated.
+
 ## Workflows
 
 `[workflows.<name>]` defines a named pipeline over the stage library, so

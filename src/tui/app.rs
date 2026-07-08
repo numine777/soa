@@ -11,11 +11,12 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use super::store::{self, PromptHistory, Session};
+use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
 use crate::provider::{ChatClient, ChatMessage, ToolFunction};
-use crate::stage::{ToolBinding, assemble_tools, build_client, dispatch_tool_call};
+use crate::stage::{CallPolicy, ToolBinding, assemble_tools, build_client, dispatch_tool_call};
 
 const COMPACT_INSTRUCTION: &str = "\
 You are compacting this conversation to free context space. Summarize \
@@ -76,6 +77,10 @@ pub struct App {
     /// The assistant reply currently streaming in, shown live at the bottom
     /// of the transcript until the turn completes.
     pub stream_buffer: String,
+    /// A tool call waiting for the user's y/a/n decision; input is modal
+    /// while this is set.
+    pub pending_approval: Option<ApprovalRequest>,
+    approvals: Arc<Approvals>,
     pub quit: bool,
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
@@ -110,6 +115,7 @@ impl App {
         mcp: Arc<McpManager>,
         stage_index: usize,
         tx: UnboundedSender<AgentEvent>,
+        approvals: Arc<Approvals>,
         resumed: Option<Session>,
     ) -> App {
         let http = reqwest::Client::builder()
@@ -132,6 +138,8 @@ impl App {
             tool_count: 0,
             spinner: 0,
             stream_buffer: String::new(),
+            pending_approval: None,
+            approvals,
             quit: false,
             turn: None,
             compacting: false,
@@ -300,8 +308,46 @@ impl App {
         }
     }
 
+    /// Route an approval request from the worker into the modal prompt.
+    pub fn on_approval_request(&mut self, request: ApprovalRequest) {
+        self.pending_approval = Some(request);
+    }
+
+    fn resolve_approval(&mut self, decision: Decision) {
+        if let Some(request) = self.pending_approval.take() {
+            let note = match decision {
+                Decision::Approve => format!("approved: {}", request.descriptor),
+                Decision::AlwaysAllow => format!(
+                    "approved: {} (always this session: {})",
+                    request.descriptor, request.always_pattern
+                ),
+                Decision::Deny => format!("denied: {}", request.descriptor),
+            };
+            self.info(note);
+            let _ = request.responder.send(decision);
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // A pending approval is modal: only y/a/n (and quit) work.
+        if self.pending_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.resolve_approval(Decision::Approve);
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.resolve_approval(Decision::AlwaysAllow);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.resolve_approval(Decision::Deny);
+                }
+                KeyCode::Char('q') | KeyCode::Char('c') if ctrl => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
 
         // Global bindings.
         match key.code {
@@ -729,6 +775,8 @@ impl App {
             self.history.clone(),
             max_turns,
             self.tx.clone(),
+            (stage.require_approval, stage.auto_approve.clone()),
+            Arc::clone(&self.approvals),
         );
         self.compacting = false;
         self.turn = Some(tokio::spawn(worker));
@@ -780,6 +828,7 @@ impl App {
         if let Some(handle) = self.turn.take() {
             handle.abort();
             self.compacting = false;
+            self.pending_approval = None; // dropped responder reads as deny
             self.flush_stream_buffer();
             self.info("cancelled");
         }
@@ -893,6 +942,8 @@ async fn turn_worker(
     mut history: Vec<ChatMessage>,
     max_turns: u32,
     tx: UnboundedSender<AgentEvent>,
+    (require_approval, auto_approve): (bool, Vec<String>),
+    approvals: Arc<Approvals>,
 ) {
     let delta_tx = tx.clone();
     let on_delta = move |fragment: &str| {
@@ -943,6 +994,12 @@ async fn turn_worker(
                     } else {
                         Vec::new()
                     };
+                    let policy = CallPolicy::for_tool(
+                        require_approval,
+                        &auto_approve,
+                        &approvals,
+                        *read_only,
+                    );
                     match dispatch_tool_call(
                         binding,
                         &call.function.arguments,
@@ -950,6 +1007,7 @@ async fn turn_worker(
                         &mcp,
                         &http,
                         0,
+                        &policy,
                     )
                     .await
                     {

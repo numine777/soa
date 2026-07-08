@@ -109,6 +109,11 @@ mcp = ["filesystem"]
 subagents = ["researcher"]
 skills = ["careful-editing"]     # from skills/ next to this file (settings.skills_dir)
 shell = true                     # unrestricted shell (stage is read_write anyway)
+# Pause writes and non-cargo shell commands for interactive y/n/always
+# approval; cargo builds and researcher delegations run unprompted.
+# Non-interactive runs deny gated calls instead of prompting.
+require_approval = true
+auto_approve = ["shell cargo *", "agent__researcher"]
 max_turns = 32
 system_prompt = "You are a careful engineer. Complete the task and verify it builds, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."
 prompt = """

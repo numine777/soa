@@ -23,14 +23,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.view {
         View::Chat => {
             let input_height = (app.input.lines().len().clamp(1, 6) as u16) + 2;
-            let [transcript_area, status_area, input_area] = Layout::vertical([
+            let approval_height = if app.pending_approval.is_some() { 2 } else { 0 };
+            let [transcript_area, approval_area, status_area, input_area] = Layout::vertical([
                 Constraint::Min(3),
+                Constraint::Length(approval_height),
                 Constraint::Length(1),
                 Constraint::Length(input_height),
             ])
             .areas(area);
 
             draw_transcript(frame, app, transcript_area);
+            if app.pending_approval.is_some() {
+                draw_approval(frame, app, approval_area);
+            }
             draw_status(frame, app, status_area);
             draw_input(frame, app, input_area);
         }
@@ -271,6 +276,31 @@ fn squash(text: &str, max_chars: usize) -> String {
         let cut: String = collapsed.chars().take(max_chars).collect();
         format!("{cut}…")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Approval modal
+// ---------------------------------------------------------------------------
+
+fn draw_approval(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(request) = &app.pending_approval else { return };
+    let style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let detail = if request.detail.is_empty() || request.detail == request.descriptor {
+        String::new()
+    } else {
+        format!("   {}", squash(&request.detail, 100))
+    };
+    let lines = vec![
+        Line::styled(format!(" ⚠ approve: {}{detail}", request.descriptor), style),
+        Line::styled(
+            format!(
+                "   [y] once · [a] always this session ({}) · [n]/Esc deny",
+                request.always_pattern
+            ),
+            style.add_modifier(Modifier::BOLD),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+mod approval;
 mod config;
 mod diff;
 mod mcp;
@@ -253,6 +254,38 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Approvals for pipeline runs: prompt on the terminal when stdin is a
+/// TTY; otherwise gated calls are denied with an explanation.
+fn terminal_approvals() -> std::sync::Arc<approval::Approvals> {
+    use approval::{Approvals, Decision};
+    if !std::io::stdin().is_terminal() {
+        return std::sync::Arc::new(Approvals::non_interactive());
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<approval::ApprovalRequest>();
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Some(request) = rx.recv().await {
+            eprintln!("\n⚠ approval needed: {}", request.descriptor);
+            if !request.detail.is_empty() && request.detail != request.descriptor {
+                eprintln!("  {}", request.detail);
+            }
+            eprint!("  [y] once · [a] always ({}) · [N] deny > ", request.always_pattern);
+            let _ = std::io::stderr().flush();
+            let decision = match lines.next_line().await {
+                Ok(Some(line)) => match line.trim().to_lowercase().as_str() {
+                    "y" | "yes" => Decision::Approve,
+                    "a" | "always" => Decision::AlwaysAllow,
+                    _ => Decision::Deny,
+                },
+                _ => Decision::Deny,
+            };
+            let _ = request.responder.send(decision);
+        }
+    });
+    std::sync::Arc::new(Approvals::new(tx))
+}
+
 /// Streams stage output to stderr as it arrives.
 fn stream_to_stderr(fragment: &str) {
     let mut err = std::io::stderr();
@@ -294,6 +327,7 @@ async fn run_pipeline(
             .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
             .collect();
         let manager = McpManager::connect(servers, config, false).await?;
+        let approvals = terminal_approvals();
         let context = stage::PipelineContext::new(task);
         eprintln!("── stage {} ──", stage.name);
         let result = stage::run_stage(
@@ -305,6 +339,7 @@ async fn run_pipeline(
             &http,
             &[],
             Some(&stream_to_stderr),
+            &approvals,
         )
         .await;
         manager.shutdown().await;
@@ -331,6 +366,7 @@ async fn run_pipeline(
         .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
         .collect();
     let manager = McpManager::connect(needed_servers, config, false).await?;
+    let approvals = terminal_approvals();
 
     let workflow_stage_names: Vec<&str> =
         order.iter().map(|&i| config.stages[i].name.as_str()).collect();
@@ -371,6 +407,7 @@ async fn run_pipeline(
             &http,
             &reprompt_targets,
             Some(&stream_to_stderr),
+            &approvals,
         )
         .await
         {

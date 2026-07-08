@@ -234,6 +234,12 @@ pub struct Agent {
     /// Restrict shell commands to these `*`-wildcard patterns.
     #[serde(default)]
     pub shell_allow: Vec<String>,
+    /// Pause non-read-only tool calls for interactive approval.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Calls matching these patterns skip the approval prompt.
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
 }
 
 impl Agent {
@@ -322,6 +328,15 @@ pub struct Stage {
     /// (e.g. `["cargo *", "git status"]`). Empty = unrestricted.
     #[serde(default)]
     pub shell_allow: Vec<String>,
+    /// Pause non-read-only tool calls for interactive approval (y/n/always).
+    /// Without an interactive approver (piped runs), gated calls are denied.
+    #[serde(default)]
+    pub require_approval: bool,
+    /// Calls matching these `*`-wildcard patterns skip the approval prompt.
+    /// Patterns match tool names (`filesystem__edit_file`, `agent__coder`)
+    /// or, for the shell tool, `shell <command>` (`shell cargo *`).
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
 }
 
 impl Stage {
@@ -447,6 +462,11 @@ impl Config {
                     "agent `{name}` sets shell_allow but not `shell = true`"
                 ));
             }
+            if !agent.auto_approve.is_empty() && !agent.require_approval {
+                errors.push(format!(
+                    "agent `{name}` sets auto_approve but not `require_approval = true`"
+                ));
+            }
         }
 
         let all_stage_names: Vec<&str> = self.stages.iter().map(|s| s.name.as_str()).collect();
@@ -476,6 +496,11 @@ impl Config {
             if !stage.shell_allow.is_empty() && !stage.shell {
                 errors.push(format!(
                     "stage `{name}` sets shell_allow but not `shell = true`"
+                ));
+            }
+            if !stage.auto_approve.is_empty() && !stage.require_approval {
+                errors.push(format!(
+                    "stage `{name}` sets auto_approve but not `require_approval = true`"
                 ));
             }
 

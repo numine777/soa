@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rmcp::model::JsonObject;
 use serde_json::Value;
 
+use crate::approval::{Approvals, Decision};
 use crate::config::{Config, Mode, Stage};
 use crate::mcp::McpManager;
 use crate::provider::{ChatClient, ChatMessage, SamplingParams, ToolFunction};
@@ -275,8 +276,78 @@ pub fn assemble_tools(
     Ok(stage_tools)
 }
 
-/// Execute a tool call and clamp the result so a single oversized output
-/// (e.g. a recursive directory tree) cannot exhaust the model's context.
+/// Approval policy for one tool call, derived from its owning context.
+pub struct CallPolicy<'a> {
+    /// True when the context gates writes and this tool is not read-only.
+    pub require_approval: bool,
+    pub auto_approve: &'a [String],
+    pub approvals: &'a Approvals,
+}
+
+impl<'a> CallPolicy<'a> {
+    /// Policy for a context's tool: approval applies only to
+    /// non-read-only tools of contexts that opted in.
+    pub fn for_tool(
+        context_requires: bool,
+        auto_approve: &'a [String],
+        approvals: &'a Approvals,
+        tool_read_only: bool,
+    ) -> CallPolicy<'a> {
+        CallPolicy {
+            require_approval: context_requires && !tool_read_only,
+            auto_approve,
+            approvals,
+        }
+    }
+}
+
+/// How a call is presented to the approver and matched against patterns.
+pub struct CallDescriptor {
+    pub descriptor: String,
+    pub detail: String,
+    /// What an "always" grant would cover for the rest of the session.
+    pub always_pattern: String,
+}
+
+pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescriptor {
+    let args: Value = serde_json::from_str(arguments_json).unwrap_or(Value::Null);
+    match binding {
+        ToolBinding::Mcp { server, tool } => {
+            let name = sanitize_tool_name(&format!("{server}__{tool}"));
+            CallDescriptor {
+                descriptor: name.clone(),
+                detail: truncate(arguments_json, 200),
+                always_pattern: name,
+            }
+        }
+        ToolBinding::WebSearch => CallDescriptor {
+            descriptor: tools::WEB_SEARCH_TOOL.to_string(),
+            detail: truncate(arguments_json, 200),
+            always_pattern: tools::WEB_SEARCH_TOOL.to_string(),
+        },
+        ToolBinding::Shell { .. } => {
+            let command =
+                args.get("command").and_then(Value::as_str).unwrap_or_default().trim();
+            let first_word = command.split_whitespace().next().unwrap_or("?");
+            CallDescriptor {
+                descriptor: format!("shell {}", truncate(command, 160)),
+                detail: command.to_string(),
+                always_pattern: format!("shell {first_word} *"),
+            }
+        }
+        ToolBinding::Agent { agent } => {
+            let task = args.get("task").and_then(Value::as_str).unwrap_or_default();
+            CallDescriptor {
+                descriptor: format!("agent__{agent}"),
+                detail: truncate(task, 200),
+                always_pattern: format!("agent__{agent}"),
+            }
+        }
+    }
+}
+
+/// Execute a tool call: enforce the approval policy, run it, and clamp the
+/// result so a single oversized output cannot exhaust the model's context.
 /// `depth` is the caller's delegation depth (0 for stages and chat).
 pub async fn dispatch_tool_call(
     binding: &ToolBinding,
@@ -285,9 +356,52 @@ pub async fn dispatch_tool_call(
     mcp: &McpManager,
     http: &reqwest::Client,
     depth: u32,
+    policy: &CallPolicy<'_>,
 ) -> Result<String> {
+    if policy.require_approval {
+        let described = call_descriptor(binding, arguments_json);
+        let pre_approved = policy
+            .auto_approve
+            .iter()
+            .any(|pattern| tools::wildcard_match(pattern, &described.descriptor))
+            || policy.approvals.session_allowed(&described.descriptor);
+        if !pre_approved {
+            if !policy.approvals.is_interactive() {
+                return Ok(format!(
+                    "DENIED: `{}` requires approval, but this session has no interactive \
+                     approver. Ask the user to add a matching auto_approve pattern or to \
+                     run interactively.",
+                    described.descriptor
+                ));
+            }
+            tracing::info!(call = %described.descriptor, "awaiting approval");
+            match policy
+                .approvals
+                .request(
+                    described.descriptor.clone(),
+                    described.detail,
+                    described.always_pattern.clone(),
+                )
+                .await
+            {
+                Decision::Approve => {}
+                Decision::AlwaysAllow => {
+                    policy.approvals.allow_always(described.always_pattern);
+                }
+                Decision::Deny => {
+                    return Ok(format!(
+                        "DENIED: the user declined `{}`. Do not retry the same call; \
+                         adjust your approach or ask for guidance.",
+                        described.descriptor
+                    ));
+                }
+            }
+        }
+    }
+
     let output =
-        dispatch_tool_call_inner(binding, arguments_json, config, mcp, http, depth).await?;
+        dispatch_tool_call_inner(binding, arguments_json, config, mcp, http, depth, policy)
+            .await?;
     Ok(clamp_tool_output(output, config.settings.max_tool_output_chars))
 }
 
@@ -313,6 +427,7 @@ async fn dispatch_tool_call_inner(
     mcp: &McpManager,
     http: &reqwest::Client,
     depth: u32,
+    policy: &CallPolicy<'_>,
 ) -> Result<String> {
     let arguments: Value = if arguments_json.trim().is_empty() {
         Value::Object(JsonObject::new())
@@ -363,7 +478,8 @@ async fn dispatch_tool_call_inner(
             if task.trim().is_empty() {
                 return Ok("ERROR: the agent needs a non-empty `task` string".to_string());
             }
-            match run_agent(config, agent, task, mcp, http, depth + 1).await {
+            match run_agent(config, agent, task, mcp, http, depth + 1, policy.approvals).await
+            {
                 Ok(answer) => Ok(answer),
                 // The agent's failure becomes feedback, not a crashed turn.
                 Err(e) => Ok(format!("ERROR: agent `{agent}` failed: {e:#}")),
@@ -394,6 +510,7 @@ async fn dispatch_tool_call_inner(
 /// Run a subagent to completion on a task and return its final answer.
 /// Boxed because agents may recursively spawn agents (bounded by
 /// `settings.max_agent_depth` via `assemble_tools`).
+#[allow(clippy::too_many_arguments)]
 pub fn run_agent<'a>(
     config: &'a Config,
     agent_name: &'a str,
@@ -401,6 +518,7 @@ pub fn run_agent<'a>(
     mcp: &'a McpManager,
     http: &'a reqwest::Client,
     depth: u32,
+    approvals: &'a Approvals,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         let agent = config
@@ -413,9 +531,9 @@ pub fn run_agent<'a>(
         let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
         let definitions: Vec<ToolFunction> =
             agent_tools.iter().map(|t| t.definition.clone()).collect();
-        let bindings: BTreeMap<&str, &ToolBinding> = agent_tools
+        let bindings: BTreeMap<&str, &StageTool> = agent_tools
             .iter()
-            .map(|t| (t.definition.name.as_str(), &t.binding))
+            .map(|t| (t.definition.name.as_str(), t))
             .collect();
 
         let system = crate::skills::apply_skills(
@@ -457,14 +575,21 @@ pub fn run_agent<'a>(
                     "agent tool call"
                 );
                 let output = match bindings.get(call.function.name.as_str()) {
-                    Some(binding) => {
+                    Some(tool) => {
+                        let policy = CallPolicy::for_tool(
+                            agent.require_approval,
+                            &agent.auto_approve,
+                            approvals,
+                            tool.read_only,
+                        );
                         dispatch_tool_call(
-                            binding,
+                            &tool.binding,
                             &call.function.arguments,
                             config,
                             mcp,
                             http,
                             depth,
+                            &policy,
                         )
                         .await?
                     }
@@ -547,6 +672,7 @@ pub async fn run_stage(
     http: &reqwest::Client,
     reprompt_targets: &[String],
     on_delta: Option<crate::provider::DeltaHandler<'_>>,
+    approvals: &Approvals,
 ) -> Result<StageOutcome> {
     let client =
         build_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
@@ -557,9 +683,9 @@ pub async fn run_stage(
     if !reprompt_targets.is_empty() {
         definitions.push(reprompt_tool(reprompt_targets));
     }
-    let bindings: BTreeMap<&str, &ToolBinding> = stage_tools
+    let bindings: BTreeMap<&str, &StageTool> = stage_tools
         .iter()
-        .map(|t| (t.definition.name.as_str(), &t.binding))
+        .map(|t| (t.definition.name.as_str(), t))
         .collect();
 
     let user_prompt = render_template(
@@ -631,9 +757,23 @@ pub async fn run_stage(
                 }
             }
             let output = match bindings.get(call.function.name.as_str()) {
-                Some(binding) => {
-                    dispatch_tool_call(binding, &call.function.arguments, config, mcp, http, 0)
-                        .await?
+                Some(tool) => {
+                    let policy = CallPolicy::for_tool(
+                        stage.require_approval,
+                        &stage.auto_approve,
+                        approvals,
+                        tool.read_only,
+                    );
+                    dispatch_tool_call(
+                        &tool.binding,
+                        &call.function.arguments,
+                        config,
+                        mcp,
+                        http,
+                        0,
+                        &policy,
+                    )
+                    .await?
                 }
                 None => format!("ERROR: unknown tool `{}`", call.function.name),
             };

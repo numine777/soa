@@ -75,7 +75,16 @@ pub async fn run(
     let mcp = Arc::new(McpManager::connect(servers, &config, true).await?);
 
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = App::new(Arc::new(config), Arc::clone(&mcp), stage_index, agent_tx, resumed);
+    let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
+    let approvals = Arc::new(crate::approval::Approvals::new(approval_tx));
+    let mut app = App::new(
+        Arc::new(config),
+        Arc::clone(&mcp),
+        stage_index,
+        agent_tx,
+        approvals,
+        resumed,
+    );
 
     setup_terminal(mouse)?;
     let original_hook = std::panic::take_hook();
@@ -113,6 +122,11 @@ pub async fn run(
             event = agent_rx.recv() => {
                 if let Some(event) = event {
                     app.on_agent_event(event);
+                }
+            }
+            request = approval_rx.recv() => {
+                if let Some(request) = request {
+                    app.on_approval_request(request);
                 }
             }
             _ = ticker.tick(), if app.is_running() => app.spinner_tick(),

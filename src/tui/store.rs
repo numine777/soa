@@ -115,6 +115,11 @@ pub struct Branch {
     pub transcript: Vec<TranscriptItem>,
     pub history: Vec<ChatMessage>,
     pub checkpoints: Vec<Checkpoint>,
+    /// Display baselines this line had when stashed (see [`Session`]).
+    #[serde(default)]
+    pub transcript_baseline: usize,
+    #[serde(default)]
+    pub diff_baseline: usize,
 }
 
 impl Branch {
@@ -153,6 +158,13 @@ pub struct Session {
     /// Stored conversation lines (see [`Branch`]).
     #[serde(default)]
     pub branches: Vec<Branch>,
+    /// `/clear` display baselines: transcript items and diff entries before
+    /// these indexes are hidden from the UI but never deleted — exports,
+    /// rewinds to session start, and this file keep the full record.
+    #[serde(default)]
+    pub transcript_baseline: usize,
+    #[serde(default)]
+    pub diff_baseline: usize,
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
@@ -295,7 +307,11 @@ mod tests {
                     transcript: vec![TranscriptItem::User("other path".to_string())],
                     history: Vec::new(),
                     checkpoints: Vec::new(),
+                    transcript_baseline: 0,
+                    diff_baseline: 0,
                 }],
+                transcript_baseline: 0,
+                diff_baseline: 0,
             };
             save_session(&session).unwrap();
             let loaded = load_session("20260707-120000").unwrap();

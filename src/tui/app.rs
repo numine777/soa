@@ -38,6 +38,9 @@ pub enum TranscriptItem {
     ToolDone { preview: String },
     Info(String),
     Error(String),
+    /// A `/clear` divider: everything above it is hidden from the chat and
+    /// diff views (but kept in the session data).
+    Cleared(String),
 }
 
 /// Events sent by the background worker back to the UI loop.
@@ -78,6 +81,11 @@ pub struct App {
     pub history: Vec<ChatMessage>,
     pub transcript: Vec<TranscriptItem>,
     pub diffs: Vec<DiffEntry>,
+    /// `/clear` display baselines: transcript items and diff entries before
+    /// these indexes are hidden from the chat and diff views. Data is never
+    /// deleted — exports and session files keep the full record.
+    pub transcript_baseline: usize,
+    pub diff_baseline: usize,
     /// Rewind targets: one per turn-starting user message, invalidated by
     /// compaction and `/clear` (both rewrite the history they index into).
     pub checkpoints: Vec<Checkpoint>,
@@ -170,6 +178,8 @@ impl App {
             history: Vec::new(),
             transcript: Vec::new(),
             diffs: Vec::new(),
+            transcript_baseline: 0,
+            diff_baseline: 0,
             checkpoints: Vec::new(),
             branches: Vec::new(),
             view: View::Chat,
@@ -236,6 +246,8 @@ impl App {
         self.history = session.history;
         self.transcript = session.transcript;
         self.diffs = session.diffs;
+        self.transcript_baseline = session.transcript_baseline.min(self.transcript.len());
+        self.diff_baseline = session.diff_baseline.min(self.diffs.len());
         self.checkpoints = session.checkpoints;
         self.branches = session.branches;
         self.session_id = session.id;
@@ -273,6 +285,8 @@ impl App {
             diffs: self.diffs.clone(),
             checkpoints: self.checkpoints.clone(),
             branches: self.branches.clone(),
+            transcript_baseline: self.transcript_baseline,
+            diff_baseline: self.diff_baseline,
         };
         if let Err(e) = store::save_session(&session) {
             self.has_activity = false; // avoid an error loop
@@ -378,6 +392,19 @@ impl App {
             })
             .sum();
         chars / 4
+    }
+
+    /// Diff entries recorded since the last `/clear` — what the diff view,
+    /// its keys, and the status bar operate on. Earlier entries stay in
+    /// `self.diffs` (and on disk) but are hidden from the UI.
+    pub fn visible_diffs(&self) -> &[DiffEntry] {
+        &self.diffs[self.diff_baseline.min(self.diffs.len())..]
+    }
+
+    /// Transcript items shown in the chat pane: everything since the last
+    /// `/clear` divider (inclusive, so the divider itself is visible).
+    pub fn visible_transcript(&self) -> &[TranscriptItem] {
+        &self.transcript[self.transcript_baseline.min(self.transcript.len())..]
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -572,6 +599,8 @@ impl App {
         self.history.clear();
         self.transcript.clear();
         self.diffs.clear();
+        self.transcript_baseline = 0;
+        self.diff_baseline = 0;
         self.checkpoints.clear();
         self.branches.clear();
         self.session_id = store::new_session_id();
@@ -742,17 +771,20 @@ impl App {
     }
 
     fn on_diff_key(&mut self, key: KeyEvent) {
+        // The view's `selected` indexes the visible (post-/clear) slice;
+        // restore needs the position in the full log.
         if key.code == KeyCode::Char('r')
             && let View::Diffs { selected, .. } = &self.view
         {
-            let index = *selected;
+            let index = self.diff_baseline + *selected;
             return self.restore_diff(index);
         }
+        let visible = self.visible_diffs().len();
         let View::Diffs { selected, scroll } = &mut self.view else { return };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                if *selected + 1 < self.diffs.len() {
+                if *selected + 1 < visible {
                     *selected += 1;
                     *scroll = 0;
                 }
@@ -818,11 +850,16 @@ impl App {
         match self.view {
             View::Diffs { .. } => self.view = View::Chat,
             View::Sessions { .. } | View::Rewind { .. } | View::Branches { .. } => {} // don't stack modal views
-            View::Chat if self.diffs.is_empty() => {
-                self.info("no file changes captured yet");
+            View::Chat if self.visible_diffs().is_empty() => {
+                self.info(if self.diff_baseline > 0 {
+                    "no file changes since /clear (earlier ones are kept in the session file)"
+                } else {
+                    "no file changes captured yet"
+                });
             }
             View::Chat => {
-                self.view = View::Diffs { selected: self.diffs.len() - 1, scroll: 0 };
+                self.view =
+                    View::Diffs { selected: self.visible_diffs().len() - 1, scroll: 0 };
             }
         }
     }
@@ -901,7 +938,8 @@ impl App {
             "help" => self.info(
                 "commands:\n\
                  /compact        summarize the conversation and shrink context\n\
-                 /clear          drop all conversation context\n\
+                 /clear          drop all conversation context and hide earlier\n\
+                                 messages/diffs (kept in the session file)\n\
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
                  /rewind         pick a past message to rewind to (conversation + files)\n\
@@ -931,7 +969,21 @@ impl App {
                 self.history.clear();
                 self.checkpoints.clear(); // their history indexes are gone
                 self.last_usage = None;
-                self.info(format!("context cleared (freed ~{})", fmt_tokens(freed as u64)));
+                let hidden_diffs = self.diffs.len() - self.diff_baseline;
+                // A visible divider, then hide everything above it and every
+                // diff so far. Nothing is deleted: the session file keeps the
+                // full record, and /export still writes all of it.
+                self.transcript.push(TranscriptItem::Cleared(format!(
+                    "context cleared (freed ~{}){}",
+                    fmt_tokens(freed as u64),
+                    match hidden_diffs {
+                        0 => String::new(),
+                        n => format!(" · {n} earlier diff(s) hidden"),
+                    },
+                )));
+                self.transcript_baseline = self.transcript.len() - 1;
+                self.diff_baseline = self.diffs.len();
+                self.scroll_from_bottom = 0;
             }
             "compact" => self.start_compact(),
             "usage" => {
@@ -1069,6 +1121,9 @@ impl App {
                     out.push_str(&format!("\n> ⚒ `{name}` {args}\n"));
                 }
                 TranscriptItem::ToolDone { .. } => {}
+                TranscriptItem::Cleared(text) => {
+                    out.push_str(&format!("\n---\n\n> ⌫ {text}\n"));
+                }
                 TranscriptItem::Info(text) | TranscriptItem::Error(text) => {
                     for line in text.lines() {
                         out.push_str(&format!("> {line}\n"));
@@ -1278,6 +1333,8 @@ impl App {
             transcript: self.transcript.clone(),
             history: self.history.clone(),
             checkpoints: self.checkpoints.clone(),
+            transcript_baseline: self.transcript_baseline,
+            diff_baseline: self.diff_baseline,
         }
     }
 
@@ -1347,6 +1404,13 @@ impl App {
         std::mem::swap(&mut branch.transcript, &mut self.transcript);
         std::mem::swap(&mut branch.history, &mut self.history);
         std::mem::swap(&mut branch.checkpoints, &mut self.checkpoints);
+        // Each line keeps its own /clear baselines. The diff log is shared
+        // and append-only, so a stored diff baseline stays valid; clamp
+        // anyway in case the branch predates baseline tracking.
+        std::mem::swap(&mut branch.transcript_baseline, &mut self.transcript_baseline);
+        std::mem::swap(&mut branch.diff_baseline, &mut self.diff_baseline);
+        self.transcript_baseline = self.transcript_baseline.min(self.transcript.len());
+        self.diff_baseline = self.diff_baseline.min(self.diffs.len());
         branch.created_at = store::now_epoch();
         let name = branch.name.clone();
         self.last_usage = None;
@@ -1463,6 +1527,11 @@ impl App {
         self.transcript.truncate(checkpoint.transcript_index);
         self.history.truncate(checkpoint.history_len);
         self.checkpoints.truncate(index.unwrap_or(0));
+        // Rewinding past a /clear rewinds the clear too. Surviving
+        // checkpoints are always post-clear (/clear drops them), so only
+        // the session-start row (diff_len 0) actually lowers the baselines.
+        self.transcript_baseline = self.transcript_baseline.min(self.transcript.len());
+        self.diff_baseline = self.diff_baseline.min(checkpoint.diff_len);
         self.last_usage = None;
         self.scroll_from_bottom = 0;
         if let Some(text) = &message {
@@ -1812,4 +1881,121 @@ async fn turn_worker(
     let _ = tx.send(AgentEvent::Error(format!(
         "no final answer within {max_turns} tool turns — raise max_turns on the stage"
     )));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            Arc::new(config),
+            PathBuf::from("soa.toml"),
+            Arc::new(McpManager::default()),
+            0,
+            tx,
+            Arc::new(Approvals::non_interactive()),
+            None,
+        )
+    }
+
+    fn entry(path: &str) -> DiffEntry {
+        DiffEntry {
+            tool: "edit_file".to_string(),
+            path: path.to_string(),
+            unified: String::new(),
+            added: 1,
+            removed: 0,
+            // Unrestorable, so rewinds in tests never touch the filesystem.
+            before: crate::diff::Snapshot::Unavailable,
+        }
+    }
+
+    #[test]
+    fn clear_hides_but_preserves_conversation_and_diffs() {
+        let mut app = test_app();
+        let greeting_len = app.transcript.len();
+        app.history.push(ChatMessage::User { content: "hi".to_string() });
+        app.transcript.push(TranscriptItem::User("hi".to_string()));
+        app.transcript.push(TranscriptItem::Assistant("hello".to_string()));
+        app.diffs.push(entry("a.rs"));
+        app.checkpoints.push(Checkpoint {
+            transcript_index: greeting_len,
+            history_len: 0,
+            diff_len: 0,
+        });
+
+        app.run_command("clear");
+
+        // Model context and rewind targets are gone; the record is not.
+        assert!(app.history.is_empty());
+        assert!(app.checkpoints.is_empty());
+        assert_eq!(app.transcript.len(), greeting_len + 3); // + divider
+        assert_eq!(app.diffs.len(), 1);
+        // The UI sees only the divider, and no diffs.
+        assert!(matches!(app.visible_transcript(), [TranscriptItem::Cleared(text)]
+            if text.contains("1 earlier diff(s) hidden")));
+        assert!(app.visible_diffs().is_empty());
+
+        // Post-clear activity is visible; the diff count starts fresh.
+        app.diffs.push(entry("b.rs"));
+        assert_eq!(app.visible_diffs().len(), 1);
+        assert_eq!(app.visible_diffs()[0].path, "b.rs");
+
+        // A second clear stacks: the new divider hides b.rs too.
+        app.run_command("clear");
+        assert!(app.visible_diffs().is_empty());
+        assert_eq!(app.diffs.len(), 2);
+    }
+
+    #[test]
+    fn rewind_to_session_start_rewinds_the_clear() {
+        let mut app = test_app();
+        app.transcript.push(TranscriptItem::User("hi".to_string()));
+        app.diffs.push(entry("a.rs"));
+        app.run_command("clear");
+        assert!(app.transcript_baseline > 0);
+        assert_eq!(app.diff_baseline, 1);
+
+        app.rewind_to(None);
+        assert_eq!(app.transcript_baseline, 0);
+        assert_eq!(app.diff_baseline, 0);
+        // Conversation truncated (only the rewind notice remains)…
+        assert!(matches!(app.transcript.as_slice(), [TranscriptItem::Info(_)]));
+        assert_eq!(app.diffs.len(), 1); // …but the diff log survives
+    }
+
+    #[test]
+    fn branches_carry_their_own_clear_baselines() {
+        let mut app = test_app();
+        app.transcript.push(TranscriptItem::User("first line".to_string()));
+        app.run_command("clear");
+        let cleared_baseline = app.transcript_baseline;
+        assert!(cleared_baseline > 0);
+
+        // Stash the cleared line, then swap to it from a fresh one.
+        app.stash_branch("stashed");
+        app.transcript_baseline = 0; // pretend the live line never cleared
+        app.swap_branch(0);
+        assert_eq!(app.transcript_baseline, cleared_baseline);
+        // Swapping back restores the uncleared view.
+        app.swap_branch(0);
+        assert_eq!(app.transcript_baseline, 0);
+    }
 }

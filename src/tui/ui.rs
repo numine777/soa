@@ -332,7 +332,9 @@ fn build_transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = Vec::new();
 
-    for item in &app.transcript {
+    // Only items since the last /clear are rendered; the divider itself is
+    // the first visible item, so the cut is always explained on screen.
+    for item in app.visible_transcript() {
         match item {
             TranscriptItem::User(text) => {
                 lines.push(Line::raw(""));
@@ -382,6 +384,16 @@ fn build_transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     "  ",
                     Style::default().fg(Color::Red),
                 );
+            }
+            TranscriptItem::Cleared(text) => {
+                lines.push(Line::raw(""));
+                let label = format!(" {text} ");
+                let bar = |n: usize| "─".repeat(n);
+                let remainder = width.saturating_sub(label.chars().count());
+                lines.push(Line::styled(
+                    format!("{}{label}{}", bar(remainder / 2), bar(remainder - remainder / 2)),
+                    dim,
+                ));
             }
         }
     }
@@ -498,9 +510,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             _ => dim,
         },
     ));
-    if !app.diffs.is_empty() {
+    if !app.visible_diffs().is_empty() {
         spans.push(Span::styled(
-            format!(" · {} diff(s) ^G", app.diffs.len()),
+            format!(" · {} diff(s) ^G", app.visible_diffs().len()),
             dim,
         ));
     }
@@ -664,21 +676,29 @@ fn draw_completion(frame: &mut Frame, app: &App, input_area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_diffs(frame: &mut Frame, app: &mut App, area: Rect) {
+    // The viewer works on the post-/clear slice; hidden entries stay in
+    // the session data and are only counted in the header.
+    let hidden = app.diff_baseline.min(app.diffs.len());
+    let visible_len = app.diffs.len() - hidden;
     let View::Diffs { selected, scroll } = &mut app.view else { return };
-    if app.diffs.is_empty() {
+    if visible_len == 0 {
         app.view = View::Chat;
         return;
     }
-    *selected = (*selected).min(app.diffs.len() - 1);
-    let entry = &app.diffs[*selected];
+    *selected = (*selected).min(visible_len - 1);
+    let entry = &app.diffs[hidden + *selected];
 
     let [header_area, body_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
 
     let header = format!(
-        " diff {}/{} · {} · via {}   Tab/Shift-Tab file · j/k scroll · r restore · q close ",
+        " diff {}/{}{} · {} · via {}   Tab/Shift-Tab file · j/k scroll · r restore · q close ",
         *selected + 1,
-        app.diffs.len(),
+        visible_len,
+        match hidden {
+            0 => String::new(),
+            n => format!(" (+{n} before /clear)"),
+        },
         entry.title(),
         entry.tool,
     );

@@ -1,5 +1,5 @@
-//! Stage execution: template rendering, tool assembly (with read-only
-//! filtering), and the per-stage agentic tool-call loop.
+//! Stage execution: template rendering, effect-aware tool assembly and
+//! approval policy, and the per-stage agentic tool-call loop.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -9,7 +9,7 @@ use rmcp::model::JsonObject;
 use serde_json::Value;
 
 use crate::approval::{Approvals, Decision};
-use crate::config::{Config, Mode, Stage};
+use crate::config::{Config, DataBoundary, McpServer, Mode, Stage, ToolEffect};
 use crate::mcp::McpManager;
 use crate::provider::{ChatClient, ChatMessage, SamplingParams, ToolFunction};
 use crate::tools;
@@ -67,11 +67,69 @@ pub enum ToolBinding {
     File { op: crate::files::FileOp },
 }
 
+/// Compact set of observable effects attached to a tool. Keeping this
+/// separate from `read_only` lets approval, delegation, and parallelism make
+/// decisions about the actual capability involved (for example, network
+/// egress is read-like but may still need consent).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolEffects(u16);
+
+impl ToolEffects {
+    pub const NONE: ToolEffects = ToolEffects(0);
+
+    const fn bit(effect: ToolEffect) -> u16 {
+        match effect {
+            ToolEffect::FilesystemRead => 1 << 0,
+            ToolEffect::FilesystemWrite => 1 << 1,
+            ToolEffect::ProcessExecute => 1 << 2,
+            ToolEffect::NetworkEgress => 1 << 3,
+            ToolEffect::ExternalRead => 1 << 4,
+            ToolEffect::ExternalMutation => 1 << 5,
+        }
+    }
+
+    pub const fn one(effect: ToolEffect) -> ToolEffects {
+        ToolEffects(Self::bit(effect))
+    }
+
+    pub fn insert(&mut self, effect: ToolEffect) {
+        self.0 |= Self::bit(effect);
+    }
+
+    pub fn union(self, other: ToolEffects) -> ToolEffects {
+        ToolEffects(self.0 | other.0)
+    }
+
+    pub fn contains(self, effect: ToolEffect) -> bool {
+        self.0 & Self::bit(effect) != 0
+    }
+
+    pub fn intersects(self, effects: &[ToolEffect]) -> bool {
+        effects.iter().any(|effect| self.contains(*effect))
+    }
+
+    /// Effects that can change state or execute arbitrary local processes.
+    pub fn mutating_or_process(self) -> bool {
+        self.contains(ToolEffect::FilesystemWrite)
+            || self.contains(ToolEffect::ProcessExecute)
+            || self.contains(ToolEffect::ExternalMutation)
+    }
+
+    /// Safe to expose through a read-only delegation boundary.
+    pub fn read_only_safe(self) -> bool {
+        !self.mutating_or_process()
+    }
+
+    /// Safe to dispatch beside other calls in the same tool round.
+    pub fn parallel_safe(self) -> bool {
+        !self.mutating_or_process()
+    }
+}
+
 pub struct StageTool {
     pub definition: ToolFunction,
     pub binding: ToolBinding,
-    /// Whether this tool is classified read-only (used for diff capture).
-    pub read_only: bool,
+    pub effects: ToolEffects,
 }
 
 /// What a model context (stage or agent) exposes to its model: shared shape
@@ -165,7 +223,7 @@ fn sanitize_tool_name(name: &str) -> String {
     cleaned.chars().take(64).collect()
 }
 
-/// Assemble the tools visible to a context, applying the read-only filter.
+/// Assemble the tools visible to a context, applying mode and effect filters.
 /// MCP tool names are namespaced as `<server>__<tool>` to avoid collisions;
 /// subagents appear as `agent__<name>`. `depth` is how many delegation
 /// levels deep this context already is: agent tools stop being offered at
@@ -191,6 +249,14 @@ pub fn assemble_tools(
                 );
                 continue;
             }
+            let mut effects = if read_only {
+                ToolEffects::one(ToolEffect::ExternalRead)
+            } else {
+                ToolEffects::one(ToolEffect::ExternalMutation)
+            };
+            if matches!(config.mcp.get(server_name), Some(McpServer::Http { .. })) {
+                effects.insert(ToolEffect::NetworkEgress);
+            }
             stage_tools.push(StageTool {
                 definition: ToolFunction {
                     name: sanitize_tool_name(&format!("{server_name}__{}", tool.name)),
@@ -201,7 +267,7 @@ pub fn assemble_tools(
                     server: server_name.clone(),
                     tool: tool.name.to_string(),
                 },
-                read_only,
+                effects,
             });
         }
     }
@@ -210,7 +276,7 @@ pub fn assemble_tools(
         stage_tools.push(StageTool {
             definition: tools::web_search_definition(),
             binding: ToolBinding::WebSearch,
-            read_only: true,
+            effects: ToolEffects::one(ToolEffect::NetworkEgress),
         });
     }
 
@@ -224,7 +290,7 @@ pub fn assemble_tools(
                 profile.shell_allow,
             ),
             binding: ToolBinding::Shell { allow: profile.shell_allow.to_vec() },
-            read_only: false,
+            effects: ToolEffects::one(ToolEffect::ProcessExecute),
         });
     }
 
@@ -237,7 +303,11 @@ pub fn assemble_tools(
             stage_tools.push(StageTool {
                 definition,
                 binding: ToolBinding::File { op },
-                read_only,
+                effects: ToolEffects::one(if read_only {
+                    ToolEffect::FilesystemRead
+                } else {
+                    ToolEffect::FilesystemWrite
+                }),
             });
         }
     }
@@ -248,12 +318,32 @@ pub fn assemble_tools(
                 .agents
                 .get(agent_name)
                 .ok_or_else(|| anyhow!("unknown agent `{agent_name}`"))?;
-            let agent_read_only = agent.mode == Mode::ReadOnly;
-            // A read-only context must not gain write access by delegating.
-            if profile.mode == Mode::ReadOnly && !agent_read_only {
+            // Include everything the delegated agent can reach, not merely
+            // its declared mode. In particular, a read-only agent with an
+            // explicit shell grant is not safe to smuggle through a
+            // read-only caller.
+            let nested_tools = assemble_tools(
+                &agent.tool_profile(agent_name),
+                config,
+                mcp,
+                depth + 1,
+            )?;
+            let mut agent_effects = nested_tools
+                .iter()
+                .fold(ToolEffects::NONE, |all, tool| all.union(tool.effects));
+            if agent.mode == Mode::ReadWrite {
+                // Preserve the conservative mode boundary even when the
+                // agent currently has no configured write tool.
+                agent_effects.insert(ToolEffect::ExternalMutation);
+            }
+            if model_chain_reaches_external(config, &agent.model) {
+                agent_effects.insert(ToolEffect::NetworkEgress);
+            }
+            if profile.mode == Mode::ReadOnly && !agent_effects.read_only_safe() {
                 tracing::debug!(
                     owner = %profile.owner, agent = %agent_name,
-                    "read_write agent hidden in read_only mode"
+                    effects = ?agent_effects,
+                    "effectful agent hidden in read_only mode"
                 );
                 continue;
             }
@@ -282,7 +372,7 @@ pub fn assemble_tools(
                     }),
                 },
                 binding: ToolBinding::Agent { agent: agent_name.clone() },
-                read_only: agent_read_only,
+                effects: agent_effects,
             });
         }
     } else if !profile.subagents.is_empty() {
@@ -295,25 +385,61 @@ pub fn assemble_tools(
     Ok(stage_tools)
 }
 
+fn model_chain_reaches_external(config: &Config, model_name: &str) -> bool {
+    let mut queue = std::collections::VecDeque::from([model_name.to_string()]);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(model) = config.models.get(&name) else { continue };
+        if config
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.data_boundary == DataBoundary::External)
+        {
+            return true;
+        }
+        queue.extend(model.fallback.iter().cloned());
+    }
+    false
+}
+
 /// Approval policy for one tool call, derived from its owning context.
 pub struct CallPolicy<'a> {
-    /// True when the context gates writes and this tool is not read-only.
+    /// True when this call's effects require approval in its owning context.
     pub require_approval: bool,
     pub auto_approve: &'a [String],
     pub approvals: &'a Approvals,
 }
 
 impl<'a> CallPolicy<'a> {
-    /// Policy for a context's tool: approval applies only to
-    /// non-read-only tools of contexts that opted in.
+    pub fn approval_required(
+        context_requires: bool,
+        additional_effects: &[ToolEffect],
+        tool_effects: ToolEffects,
+    ) -> bool {
+        context_requires
+            && (tool_effects.mutating_or_process()
+                || tool_effects.intersects(additional_effects))
+    }
+
+    /// Policy for a context's tool: mutation and process execution use the
+    /// compatibility default, while contexts can additionally gate effects
+    /// such as network egress.
     pub fn for_tool(
         context_requires: bool,
+        additional_effects: &'a [ToolEffect],
         auto_approve: &'a [String],
         approvals: &'a Approvals,
-        tool_read_only: bool,
+        tool_effects: ToolEffects,
     ) -> CallPolicy<'a> {
         CallPolicy {
-            require_approval: context_requires && !tool_read_only,
+            require_approval: Self::approval_required(
+                context_requires,
+                additional_effects,
+                tool_effects,
+            ),
             auto_approve,
             approvals,
         }
@@ -321,18 +447,18 @@ impl<'a> CallPolicy<'a> {
 }
 
 /// True when a round's tool calls may dispatch concurrently: several
-/// calls, every one resolving to a read-only tool. Writes could conflict,
-/// approval prompts must stay sequential, and control tools
+/// calls, every one resolving to a parallel-safe, non-approval-gated tool.
+/// Mutations could conflict, approval prompts must stay sequential, and control tools
 /// (`reprompt_stage`) or unknown names take the sequential path, which
 /// knows how to answer them.
 pub fn parallel_round(
     enabled: bool,
     calls: &[crate::provider::ToolCall],
-    read_only_of: impl Fn(&str) -> Option<bool>,
+    parallel_safe_of: impl Fn(&str) -> Option<bool>,
 ) -> bool {
     enabled
         && calls.len() > 1
-        && calls.iter().all(|call| read_only_of(&call.function.name) == Some(true))
+        && calls.iter().all(|call| parallel_safe_of(&call.function.name) == Some(true))
 }
 
 /// How a call is presented to the approver and matched against patterns.
@@ -656,16 +782,24 @@ pub fn run_agent<'a>(
             });
 
             if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
-                bindings.get(name).map(|t| t.read_only)
+                bindings.get(name).map(|tool| {
+                    tool.effects.parallel_safe()
+                        && !CallPolicy::approval_required(
+                            agent.require_approval,
+                            &agent.approval_effects,
+                            tool.effects,
+                        )
+                })
             }) {
                 tracing::info!(agent = %agent_name, calls = tool_calls.len(), "parallel tool round");
                 let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
                     let tool = bindings[call.function.name.as_str()];
                     let policy = CallPolicy::for_tool(
                         agent.require_approval,
+                        &agent.approval_effects,
                         &agent.auto_approve,
                         approvals,
-                        tool.read_only,
+                        tool.effects,
                     );
                     async move {
                         tracing::info!(
@@ -705,9 +839,10 @@ pub fn run_agent<'a>(
                     Some(tool) => {
                         let policy = CallPolicy::for_tool(
                             agent.require_approval,
+                            &agent.approval_effects,
                             &agent.auto_approve,
                             approvals,
-                            tool.read_only,
+                            tool.effects,
                         );
                         dispatch_tool_call(
                             &tool.binding,
@@ -790,6 +925,7 @@ pub fn build_client(
                 max_tokens: max_tokens.or(model.max_tokens),
             },
             stream: provider.stream,
+            external: provider.data_boundary == DataBoundary::External,
         });
         queue.extend(model.fallback.iter().cloned());
     }
@@ -895,16 +1031,24 @@ pub async fn run_stage(
         });
 
         if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
-            bindings.get(name).map(|t| t.read_only)
+            bindings.get(name).map(|tool| {
+                tool.effects.parallel_safe()
+                    && !CallPolicy::approval_required(
+                        stage.require_approval,
+                        &stage.approval_effects,
+                        tool.effects,
+                    )
+            })
         }) {
             tracing::info!(stage = %stage.name, calls = tool_calls.len(), "parallel tool round");
             let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
                 let tool = bindings[call.function.name.as_str()];
                 let policy = CallPolicy::for_tool(
                     stage.require_approval,
+                    &stage.approval_effects,
                     &stage.auto_approve,
                     approvals,
-                    tool.read_only,
+                    tool.effects,
                 );
                 async move {
                     tracing::info!(
@@ -959,7 +1103,7 @@ pub async fn run_stage(
                     // Snapshot files a write tool might touch, for the
                     // caller's diff sink.
                     let snapshots = if on_diff.is_some()
-                        && !tool.read_only
+                        && tool.effects.mutating_or_process()
                         && matches!(tool.binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
                     {
                         crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
@@ -968,9 +1112,10 @@ pub async fn run_stage(
                     };
                     let policy = CallPolicy::for_tool(
                         stage.require_approval,
+                        &stage.approval_effects,
                         &stage.auto_approve,
                         approvals,
-                        tool.read_only,
+                        tool.effects,
                     );
                     let output = dispatch_tool_call(
                         &tool.binding,
@@ -1111,6 +1256,9 @@ mod tests {
     fn agent_tools_gated_by_mode_and_depth() {
         let config: Config = toml::from_str(
             r#"
+            [settings]
+            searxng_url = "http://localhost:8888"
+
             [providers.p]
             base_url = "http://localhost/v1"
 
@@ -1121,21 +1269,27 @@ mod tests {
             [agents.reader]
             model = "m"
             description = "reads things"
+            web_search = true
 
             [agents.writer]
             model = "m"
             mode = "read_write"
 
+            [agents.sheller]
+            model = "m"
+            shell = true
+
             [[stage]]
             name = "s"
             model = "m"
-            subagents = ["reader", "writer"]
+            subagents = ["reader", "writer", "sheller"]
             "#,
         )
         .unwrap();
         let mcp = McpManager::default();
 
-        // Read-only stage: only the read-only agent is offered.
+        // Network egress remains read-like, but write mode and process
+        // execution cannot cross a read-only delegation boundary.
         let names: Vec<String> =
             assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0)
                 .unwrap()
@@ -1190,24 +1344,52 @@ mod tests {
     }
 
     #[test]
-    fn parallel_round_requires_all_read_only() {
+    fn parallel_round_requires_every_call_to_be_safe() {
         let call = |name: &str| crate::provider::ToolCall {
             id: "x".into(),
             kind: "function".into(),
             function: crate::provider::FunctionCall { name: name.into(), arguments: "{}".into() },
         };
-        let read_only = |name: &str| match name {
+        let parallel_safe = |name: &str| match name {
             "read" => Some(true),
             "write" => Some(false),
             _ => None,
         };
         let reads = [call("read"), call("read")];
-        assert!(parallel_round(true, &reads, read_only));
-        // Disabled by config, single call, any write, or any unknown tool.
-        assert!(!parallel_round(false, &reads, read_only));
-        assert!(!parallel_round(true, &reads[..1], read_only));
-        assert!(!parallel_round(true, &[call("read"), call("write")], read_only));
-        assert!(!parallel_round(true, &[call("read"), call("reprompt_stage")], read_only));
+        assert!(parallel_round(true, &reads, parallel_safe));
+        // Disabled by config, single call, any unsafe call, or any unknown tool.
+        assert!(!parallel_round(false, &reads, parallel_safe));
+        assert!(!parallel_round(true, &reads[..1], parallel_safe));
+        assert!(!parallel_round(true, &[call("read"), call("write")], parallel_safe));
+        assert!(!parallel_round(true, &[call("read"), call("reprompt_stage")], parallel_safe));
+    }
+
+    #[test]
+    fn approval_policy_can_add_read_like_effects() {
+        let network = ToolEffects::one(ToolEffect::NetworkEgress);
+        assert!(!CallPolicy::approval_required(true, &[], network));
+        assert!(CallPolicy::approval_required(
+            true,
+            &[ToolEffect::NetworkEgress],
+            network,
+        ));
+        assert!(!CallPolicy::approval_required(
+            false,
+            &[ToolEffect::NetworkEgress],
+            network,
+        ));
+
+        // Compatibility defaults always gate mutation and process execution.
+        assert!(CallPolicy::approval_required(
+            true,
+            &[],
+            ToolEffects::one(ToolEffect::FilesystemWrite),
+        ));
+        assert!(CallPolicy::approval_required(
+            true,
+            &[],
+            ToolEffects::one(ToolEffect::ProcessExecute),
+        ));
     }
 
     #[test]
@@ -1267,6 +1449,13 @@ mod tests {
             vec!["read_file", "list_dir", "glob", "grep", "write_file", "edit_lines", "edit_file"]
         );
         assert!(names(2).is_empty());
+
+        let writer_tools =
+            assemble_tools(&config.stages[1].tool_profile(), &config, &mcp, 0).unwrap();
+        let read = writer_tools.iter().find(|tool| tool.definition.name == "read_file").unwrap();
+        let write = writer_tools.iter().find(|tool| tool.definition.name == "write_file").unwrap();
+        assert!(read.effects.contains(ToolEffect::FilesystemRead));
+        assert!(write.effects.contains(ToolEffect::FilesystemWrite));
     }
 
     #[test]

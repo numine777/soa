@@ -1,7 +1,8 @@
-//! Human-in-the-loop approval for non-read-only tool calls.
+//! Human-in-the-loop approval for effect-classified tool calls.
 //!
-//! Contexts with `require_approval = true` route write-classified tool
-//! calls through an [`Approvals`] gate before execution. A call is allowed
+//! Contexts with `require_approval = true` route mutation/process effects,
+//! plus any configured `approval_effects`, through an [`Approvals`] gate
+//! before execution. A call is allowed
 //! if it matches the context's `auto_approve` patterns or a pattern the
 //! user granted with "always" earlier in the session; otherwise an
 //! [`ApprovalRequest`] is sent to the interactive approver (the TUI modal

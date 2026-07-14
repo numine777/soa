@@ -14,13 +14,13 @@ use tui_textarea::TextArea;
 use super::completion::{self, Completion};
 use super::store::{self, Branch, Checkpoint, PromptHistory, Session};
 use crate::approval::{ApprovalRequest, Approvals, Decision};
-use crate::config::{Config, Mode, Stage};
+use crate::config::{Config, Mode, Stage, ToolEffect};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
 use crate::provider::{ChatClient, ChatMessage, ToolFunction, Usage, fmt_tokens, usage_stats};
 use crate::stage::{
     CallPolicy, ToolBinding, assemble_tools, build_client, context_pressure,
-    dispatch_tool_call, shed_context,
+    dispatch_tool_call, shed_context, ToolEffects,
 };
 
 const COMPACT_INSTRUCTION: &str = "\
@@ -1215,9 +1215,9 @@ impl App {
 
         let definitions: Vec<ToolFunction> =
             stage_tools.iter().map(|t| t.definition.clone()).collect();
-        let bindings: HashMap<String, (ToolBinding, bool)> = stage_tools
+        let bindings: HashMap<String, (ToolBinding, ToolEffects)> = stage_tools
             .into_iter()
-            .map(|t| (t.definition.name, (t.binding, t.read_only)))
+            .map(|t| (t.definition.name, (t.binding, t.effects)))
             .collect();
         let max_turns = stage.max_turns.unwrap_or(self.config.settings.default_max_turns);
 
@@ -1234,7 +1234,11 @@ impl App {
             self.history.clone(),
             max_turns,
             self.tx.clone(),
-            (stage.require_approval, stage.auto_approve.clone()),
+            (
+                stage.require_approval,
+                stage.approval_effects.clone(),
+                stage.auto_approve.clone(),
+            ),
             Arc::clone(&self.approvals),
             model_name,
             Arc::clone(&self.steer_queue),
@@ -1951,7 +1955,7 @@ async fn workflow_worker(
 async fn turn_worker(
     client: ChatClient,
     definitions: Vec<ToolFunction>,
-    bindings: HashMap<String, (ToolBinding, bool)>,
+    bindings: HashMap<String, (ToolBinding, ToolEffects)>,
     config: Arc<Config>,
     mcp: Arc<McpManager>,
     http: reqwest::Client,
@@ -1959,7 +1963,7 @@ async fn turn_worker(
     mut history: Vec<ChatMessage>,
     max_turns: u32,
     tx: UnboundedSender<AgentEvent>,
-    (require_approval, auto_approve): (bool, Vec<String>),
+    (require_approval, approval_effects, auto_approve): (bool, Vec<ToolEffect>, Vec<String>),
     approvals: Arc<Approvals>,
     model_name: String,
     steer: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -2012,10 +2016,17 @@ async fn turn_worker(
             tool_calls: Some(reply.tool_calls),
         });
 
-        // An all-read-only round dispatches concurrently; results are
-        // reported and recorded in call order either way.
+        // A round of parallel-safe, non-gated effects dispatches
+        // concurrently; results are reported and recorded in call order.
         if crate::stage::parallel_round(config.settings.parallel_tools, &calls, |name| {
-            bindings.get(name).map(|(_, read_only)| *read_only)
+            bindings.get(name).map(|(_, effects)| {
+                effects.parallel_safe()
+                    && !CallPolicy::approval_required(
+                        require_approval,
+                        &approval_effects,
+                        *effects,
+                    )
+            })
         }) {
             for call in &calls {
                 let _ = tx.send(AgentEvent::ToolCall {
@@ -2025,9 +2036,14 @@ async fn turn_worker(
             }
             let (config, mcp, http) = (&config, &mcp, &http);
             let outputs = futures_util::future::join_all(calls.iter().map(|call| {
-                let (binding, read_only) = &bindings[&call.function.name];
-                let policy =
-                    CallPolicy::for_tool(require_approval, &auto_approve, &approvals, *read_only);
+                let (binding, effects) = &bindings[&call.function.name];
+                let policy = CallPolicy::for_tool(
+                    require_approval,
+                    &approval_effects,
+                    &auto_approve,
+                    &approvals,
+                    *effects,
+                );
                 async move {
                     match dispatch_tool_call(
                         binding,
@@ -2078,9 +2094,9 @@ async fn turn_worker(
 
             let output = match bindings.get(&name) {
                 None => format!("ERROR: unknown tool `{name}`"),
-                Some((binding, read_only)) => {
+                Some((binding, effects)) => {
                     // Snapshot files a write tool might touch, for the diff viewer.
-                    let snapshots = if !read_only
+                    let snapshots = if effects.mutating_or_process()
                         && matches!(binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
                     {
                         diff::snapshot(&diff::extract_paths(&call.function.arguments))
@@ -2089,9 +2105,10 @@ async fn turn_worker(
                     };
                     let policy = CallPolicy::for_tool(
                         require_approval,
+                        &approval_effects,
                         &auto_approve,
                         &approvals,
-                        *read_only,
+                        *effects,
                     );
                     match dispatch_tool_call(
                         binding,

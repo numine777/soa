@@ -18,8 +18,8 @@ max_tool_output_chars = 30000
 # older tool results. 0 disables; only applies to models that declare
 # `context_tokens`.
 auto_compact_threshold = 0.8
-# All-read-only tool rounds dispatch concurrently (writes and approvals
-# always stay sequential). Set false to serialize everything.
+# Effect-safe tool rounds dispatch concurrently (mutation, process execution,
+# and approval-gated calls stay sequential). Set false to serialize everything.
 parallel_tools = true
 # Transient provider failures (network errors, 408/429/5xx, interrupted
 # streams) are retried this many times with exponential backoff before a
@@ -41,9 +41,11 @@ provider_retries = 3
 
 [providers.spark]
 base_url = "http://192.168.6.7:8000/v1"
+data_boundary = "local"            # mark hosted/proprietary APIs "external"
 
 [providers.threadripper]
 base_url = "http://192.168.5.188:8000/v1"
+data_boundary = "local"
 # api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,9 @@ context_tokens = 131072
 # Fail over to other [models] entries (in order) when this endpoint stays
 # down after settings.provider_retries.
 # fallback = ["coder"]
+# If a fallback provider has data_boundary = "external" while this one is
+# local, explicit consent is required:
+# allow_external_fallback = true
 
 [models.coder]
 provider = "threadripper"
@@ -147,6 +152,8 @@ shell = true                     # unrestricted shell (stage is read_write anywa
 # expressions such as `cargo test; other-command`.
 # Non-interactive runs deny gated calls instead of prompting.
 require_approval = true
+# Additional read-like effects can be gated too, for example:
+# approval_effects = ["network_egress"]
 auto_approve = ["shell cargo *", "agent__researcher"]
 max_turns = 32
 system_prompt = "You are a careful engineer. Complete the task and verify it builds, then summarize what you changed. Delegate research questions to the researcher agent instead of exploring yourself."

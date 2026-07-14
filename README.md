@@ -140,7 +140,7 @@ word boundaries (`user@host` is left alone), attached files are clamped by
 (`@Cargo.toml attached (22 lines)`) or flags typos (`@missing.rs not
 found`). Works in `soa run` task text too, with reports on stderr.
 
-**Diff viewer.** When the model calls a non-read-only MCP tool, soa
+**Diff viewer.** When the model calls a mutation- or process-classified tool, soa
 snapshots any file named by a path-like argument and records a unified diff
 of what actually changed on disk. Changes show up inline in the transcript
 (`✎ path (+a −r)`) and in the full-screen viewer under `Ctrl+G`.
@@ -239,7 +239,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `context_files` | `["SOA.md"]` | project-instruction files, each discovered by walking up from the working directory and sourced into every system prompt in the listed order (see below) |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
-| `parallel_tools` | true | when a model emits several tool calls in one round and every one is read-only, dispatch them concurrently. Rounds containing writes, approval-gated calls, or `reprompt_stage` always run sequentially. Results are recorded in call order either way. |
+| `parallel_tools` | true | when a model emits several effect-safe tool calls in one round and none requires approval, dispatch them concurrently. Mutation, process execution, approval-gated calls, and `reprompt_stage` always stay sequential. Results are recorded in call order either way. |
 | `provider_retries` | 3 | how many times a failed provider request is retried with exponential backoff (500ms doubling, capped at 10s; a `Retry-After` header is honored). Covers network failures, 408/429/5xx responses, and interrupted streams; other errors fail immediately. 0 disables. |
 | `request_timeout_secs` | 600 | HTTP timeout for provider calls (per attempt) |
 
@@ -254,7 +254,14 @@ base_url = "http://localhost:11434/v1"
 api_key = "${SOME_KEY}"     # optional; ${VAR} expands from the environment
 stream = true               # default: stream responses over SSE; set false
                             # for servers that don't support it
+data_boundary = "local"     # default; use "external" for hosted providers
 ```
+
+`data_boundary = "external"` marks requests as leaving the trusted local
+boundary. Directly selecting such a provider is explicit consent to send the
+stage or agent context there. A fallback is less visible, so soa rejects any
+local-to-external fallback edge unless the source model sets
+`allow_external_fallback = true`.
 
 Responses stream token-by-token everywhere: live in the chat TUI (with a
 `▌` cursor while text arrives), and to stderr during `soa run` so you can
@@ -288,7 +295,9 @@ breadth-first and cycles are ignored. Every failover is logged, usage
 stats attribute requests to the model that actually served them, and
 partially streamed text is not repeated across the switch. Caller-level
 overrides (a stage's `temperature`/`max_tokens`) apply across the whole
-chain.
+chain. When a fallback provider has `data_boundary = "external"` while the
+source is local, add `allow_external_fallback = true` to the source model;
+without it, `soa check` fails before data can cross the boundary.
 
 Optionally declare the model's context window with `context_tokens`
 (e.g. `131072`). soa reads real token usage from the provider's `usage`
@@ -453,8 +462,8 @@ execution.
 ## Approvals (human in the loop)
 
 A stage or agent with `require_approval = true` pauses every
-non-read-only tool call — MCP write tools, shell commands, delegations to
-write-capable agents — for an interactive decision:
+state-mutating or process-execution tool call — MCP write tools, shell
+commands, delegations to write-capable agents — for an interactive decision:
 
 ```toml
 [[stage]]
@@ -462,8 +471,20 @@ name = "implement"
 mode = "read_write"
 shell = true
 require_approval = true
+approval_effects = ["network_egress"] # additionally gate outbound calls
 auto_approve = ["shell cargo *", "agent__researcher"]
 ```
+
+Tools carry effect labels instead of only a read/write bit:
+`filesystem_read`, `filesystem_write`, `process_execute`, `network_egress`,
+`external_read`, and `external_mutation`. Filesystem writes, process
+execution, and external mutation retain the default approval behavior.
+`approval_effects` adds read-like effects to the gate; for example,
+`network_egress` makes SearXNG, HTTP MCP, and external subagent calls ask
+before sending data, while `external_read` can gate opaque read-only MCP
+calls. Native file tools are classified precisely; MCP effects are inferred
+from transport and the server's `readOnlyHint`/`readonly_tools`
+classification.
 
 - In the TUI, a modal bar appears: `[y]` allow once, `[a]` allow everything
   matching the shown pattern for the rest of the session (e.g. a shell
@@ -482,7 +503,8 @@ auto_approve = ["shell cargo *", "agent__researcher"]
   unrestricted.
 - Denials are returned to the model as tool results ("the user declined…
   adjust your approach"), so a refusal redirects the model instead of
-  crashing the turn. Read-only tools are never gated.
+  crashing the turn. Read-like effects are ungated unless named in
+  `approval_effects`.
 
 ## Workflows
 
@@ -562,8 +584,9 @@ Semantics:
 - Agents are stateless: each delegation starts fresh, so the `description`
   should tell the caller's model to hand over a complete, self-contained
   task — the tool description reminds it too.
-- Mode safety composes: a `read_only` stage is only offered `read_only`
-  agents, so delegation can't smuggle in write access.
+- Mode safety composes from reachable effects: a `read_only` stage is not
+  offered an agent with write, mutation, or process-execution effects. This
+  also catches a nominally read-only agent that has an explicit shell grant.
 - Agents may list their own `subagents`; `settings.max_agent_depth`
   (default 2) bounds the nesting, so runaway delegation chains are cut off
   at assembly time rather than at runtime.

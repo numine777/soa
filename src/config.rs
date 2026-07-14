@@ -234,10 +234,23 @@ pub struct Provider {
     /// don't support `"stream": true`.
     #[serde(default = "default_true")]
     pub stream: bool,
+    /// Whether requests to this endpoint leave the user's trusted local
+    /// boundary. This label is used to prevent an implicit local-to-external
+    /// fallback unless the model explicitly opts in.
+    #[serde(default)]
+    pub data_boundary: DataBoundary,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataBoundary {
+    #[default]
+    Local,
+    External,
 }
 
 /// A named model: a provider reference plus default sampling parameters.
@@ -261,6 +274,24 @@ pub struct Model {
     /// followed breadth-first and cycles are ignored.
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// Permit this model's fallback chain to cross from a local provider to
+    /// an external provider. Without this explicit consent, validation
+    /// rejects the cross-boundary edge before any request can be sent.
+    #[serde(default)]
+    pub allow_external_fallback: bool,
+}
+
+/// Observable effects a tool may have. Contexts use these labels to add
+/// approval gates beyond the default mutation/process policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffect {
+    FilesystemRead,
+    FilesystemWrite,
+    ProcessExecute,
+    NetworkEgress,
+    ExternalRead,
+    ExternalMutation,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -342,9 +373,15 @@ pub struct Agent {
     /// (write tools only in read_write mode).
     #[serde(default)]
     pub files: bool,
-    /// Pause non-read-only tool calls for interactive approval.
+    /// Pause mutation/process effects, plus `approval_effects`, for
+    /// interactive approval.
     #[serde(default)]
     pub require_approval: bool,
+    /// Additional effects to gate when `require_approval = true`. Mutating
+    /// and process-execution effects are always gated by default; this list
+    /// is primarily useful for read-like effects such as `network_egress`.
+    #[serde(default)]
+    pub approval_effects: Vec<ToolEffect>,
     /// Calls matching these patterns skip the approval prompt.
     #[serde(default)]
     pub auto_approve: Vec<String>,
@@ -441,10 +478,15 @@ pub struct Stage {
     /// working directory.
     #[serde(default)]
     pub files: bool,
-    /// Pause non-read-only tool calls for interactive approval (y/n/always).
+    /// Pause mutation/process effects, plus `approval_effects`, for
+    /// interactive approval (y/n/always).
     /// Without an interactive approver (piped runs), gated calls are denied.
     #[serde(default)]
     pub require_approval: bool,
+    /// Additional effects to gate when `require_approval = true`. Mutating
+    /// and process-execution effects remain gated regardless of this list.
+    #[serde(default)]
+    pub approval_effects: Vec<ToolEffect>,
     /// Calls matching these `*`-wildcard patterns skip the approval prompt.
     /// Patterns match tool names (`filesystem__edit_file`, `agent__coder`)
     /// or, for the shell tool, `shell <command>` (`shell cargo *`).
@@ -555,6 +597,26 @@ impl Config {
                     errors.push(format!(
                         "model `{name}` has unknown fallback model `{fallback}`"
                     ));
+                } else {
+                    let source_boundary = self
+                        .providers
+                        .get(&model.provider)
+                        .map(|provider| provider.data_boundary);
+                    let fallback_boundary = self
+                        .models
+                        .get(fallback)
+                        .and_then(|fallback_model| self.providers.get(&fallback_model.provider))
+                        .map(|provider| provider.data_boundary);
+                    if source_boundary == Some(DataBoundary::Local)
+                        && fallback_boundary == Some(DataBoundary::External)
+                        && !model.allow_external_fallback
+                    {
+                        errors.push(format!(
+                            "model `{name}` falls back from local data boundary to external \
+                             model `{fallback}`; set allow_external_fallback = true on \
+                             model `{name}` to consent"
+                        ));
+                    }
                 }
             }
         }
@@ -607,6 +669,11 @@ impl Config {
                     "agent `{name}` sets auto_approve but not `require_approval = true`"
                 ));
             }
+            if !agent.approval_effects.is_empty() && !agent.require_approval {
+                errors.push(format!(
+                    "agent `{name}` sets approval_effects but not `require_approval = true`"
+                ));
+            }
         }
 
         let all_stage_names: Vec<&str> = self.stages.iter().map(|s| s.name.as_str()).collect();
@@ -641,6 +708,11 @@ impl Config {
             if !stage.auto_approve.is_empty() && !stage.require_approval {
                 errors.push(format!(
                     "stage `{name}` sets auto_approve but not `require_approval = true`"
+                ));
+            }
+            if !stage.approval_effects.is_empty() && !stage.require_approval {
+                errors.push(format!(
+                    "stage `{name}` sets approval_effects but not `require_approval = true`"
                 ));
             }
 
@@ -948,6 +1020,52 @@ mod tests {
             )
         );
         assert!(parse(&toml_str).is_ok());
+    }
+
+    #[test]
+    fn external_fallback_requires_explicit_consent() {
+        let cloud_tables = r#"
+            [providers.cloud]
+            base_url = "https://api.example.invalid/v1"
+            data_boundary = "external"
+
+            [models.cloud]
+            provider = "cloud"
+            model = "proprietary-coder"
+        "#;
+        let without_consent = format!(
+            "{}\n{cloud_tables}",
+            MINIMAL.replace(
+                "model = \"qwen3:8b\"",
+                "model = \"qwen3:8b\"\nfallback = [\"cloud\"]"
+            )
+        );
+        let error = parse(&without_consent).unwrap_err().to_string();
+        assert!(error.contains("local data boundary to external"), "{error}");
+        assert!(error.contains("allow_external_fallback = true"), "{error}");
+
+        let with_consent = without_consent.replace(
+            "fallback = [\"cloud\"]",
+            "fallback = [\"cloud\"]\nallow_external_fallback = true",
+        );
+        assert!(parse(&with_consent).is_ok());
+    }
+
+    #[test]
+    fn additional_approval_effects_require_approval_mode() {
+        let without_gate = MINIMAL.replace(
+            "name = \"answer\"",
+            "name = \"answer\"\napproval_effects = [\"network_egress\"]",
+        );
+        let error = parse(&without_gate).unwrap_err().to_string();
+        assert!(error.contains("approval_effects"), "{error}");
+        assert!(error.contains("require_approval = true"), "{error}");
+
+        let with_gate = without_gate.replace(
+            "approval_effects = [\"network_egress\"]",
+            "require_approval = true\napproval_effects = [\"network_egress\"]",
+        );
+        assert!(parse(&with_gate).is_ok());
     }
 
     #[test]

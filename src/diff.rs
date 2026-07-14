@@ -1,7 +1,7 @@
 //! Capture file changes made by write tools during a conversation.
 //!
 //! Tool calls are opaque, so this works heuristically: before dispatching a
-//! non-read-only MCP tool we snapshot every file named by a path-like
+//! mutation-classified MCP tool we snapshot every file named by a path-like
 //! argument; afterwards we re-read them and record a unified diff for each
 //! file that changed.
 

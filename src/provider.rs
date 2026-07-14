@@ -334,6 +334,8 @@ pub struct Target {
     pub label: String,
     pub params: SamplingParams,
     pub stream: bool,
+    /// Requests to this target cross the configured external data boundary.
+    pub external: bool,
 }
 
 pub struct ChatClient {
@@ -449,6 +451,7 @@ impl ChatClient {
                         if index > 0 {
                             tracing::warn!(
                                 model = %target.label,
+                                external = target.external,
                                 "request served by fallback model"
                             );
                         }
@@ -494,6 +497,11 @@ impl ChatClient {
         on_delta: Option<DeltaHandler<'_>>,
         emitted: &mut usize,
     ) -> std::result::Result<AssistantTurn, AttemptError> {
+        tracing::debug!(
+            model = %target.label,
+            external = target.external,
+            "sending provider request"
+        );
         let request = ChatRequest {
             model: &target.model,
             messages,

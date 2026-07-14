@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::model::UsageSnapshot;
 use crate::tui::store;
 
 fn runs_dir() -> PathBuf {
@@ -42,6 +43,10 @@ pub struct RunState {
     pub previous: Option<String>,
     /// Completed stage outputs, for `{{stage.<name>}}` templates.
     pub outputs: BTreeMap<String, String>,
+    /// Cumulative provider usage and active elapsed time. Older checkpoints
+    /// deserialize as an empty ledger.
+    #[serde(default)]
+    pub usage: UsageSnapshot,
 }
 
 impl RunState {
@@ -58,6 +63,7 @@ impl RunState {
             runs: 0,
             previous: None,
             outputs: BTreeMap::new(),
+            usage: UsageSnapshot::default(),
         }
     }
 }
@@ -127,8 +133,7 @@ mod tests {
     #[test]
     fn run_state_roundtrip_and_listing() {
         let _guard = store::ENV_LOCK.lock().unwrap();
-        let dir =
-            std::env::temp_dir().join(format!("soa-runs-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("soa-runs-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: serialized by ENV_LOCK.
@@ -148,12 +153,31 @@ mod tests {
         state.position = 1;
         state.runs = 1;
         state.previous = Some("a says hi".to_string());
-        state.outputs.insert("a".to_string(), "a says hi".to_string());
+        state
+            .outputs
+            .insert("a".to_string(), "a says hi".to_string());
+        state.usage.elapsed_ms = 1_234;
+        state.usage.models.insert(
+            "coder".to_string(),
+            crate::model::ModelUsage {
+                requests: 2,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                ..Default::default()
+            },
+        );
         save_run(&state).unwrap();
         let loaded = load_run(&state.id).unwrap();
         assert_eq!(loaded.position, 1);
         assert_eq!(loaded.previous.as_deref(), Some("a says hi"));
         assert_eq!(loaded.stage_names, vec!["a", "b"]);
+        assert_eq!(loaded.usage.elapsed_ms, 1_234);
+        assert_eq!(loaded.usage.models["coder"].requests, 2);
+
+        let mut legacy = serde_json::to_value(&loaded).unwrap();
+        legacy.as_object_mut().unwrap().remove("usage");
+        let legacy: RunState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.usage, UsageSnapshot::default());
 
         // Listing is newest-first; latest-for-cwd filters by directory.
         let all = list_runs().unwrap();

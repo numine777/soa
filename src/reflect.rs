@@ -115,8 +115,10 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     // Newest-first from the store; keep the newest batch, then reflect in
     // chronological order so digests read as a timeline.
     let reflected = insights::load_reflected();
-    let all_sessions: Vec<Session> =
-        store::list_sessions()?.into_iter().filter(|s| s.cwd == cwd).collect();
+    let all_sessions: Vec<Session> = store::list_sessions()?
+        .into_iter()
+        .filter(|s| s.cwd == cwd)
+        .collect();
     let mut sessions: Vec<Session> = all_sessions
         .iter()
         .filter(|s| reflected.get(&s.id) != Some(&s.updated_at))
@@ -131,7 +133,9 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     let mut git_marks = insights::load_git_marks();
     let (commits, findings) = match &repo {
         Some(root) => {
-            let mark = git_marks.get(&root.display().to_string()).map(String::as_str);
+            let mark = git_marks
+                .get(&root.display().to_string())
+                .map(String::as_str);
             match crate::git::commits_since(root, mark, MAX_GIT_COMMITS) {
                 Ok(commits) => {
                     let soa_added = soa_added_lines(&all_sessions);
@@ -156,7 +160,17 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     let existing_lessons = read_lessons(&lessons_path);
     let skill_summaries: Vec<String> = crate::skills::list_skills(config)
         .iter()
-        .map(|s| format!("{} — {}", s.name, if s.description.is_empty() { "(no description)" } else { &s.description }))
+        .map(|s| {
+            format!(
+                "{} — {}",
+                s.name,
+                if s.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &s.description
+                }
+            )
+        })
         .collect();
 
     // Digest until the prompt budget runs out; sessions that don't fit are
@@ -218,10 +232,22 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         if existing_lessons.is_empty() {
             "(none yet)".to_string()
         } else {
-            existing_lessons.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")
+            existing_lessons
+                .iter()
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         },
-        if skill_summaries.is_empty() { "(none)".to_string() } else { skill_summaries.join("\n") },
-        if digests.is_empty() { "(none new)".to_string() } else { digests },
+        if skill_summaries.is_empty() {
+            "(none)".to_string()
+        } else {
+            skill_summaries.join("\n")
+        },
+        if digests.is_empty() {
+            "(none new)".to_string()
+        } else {
+            digests
+        },
         git_section,
     );
 
@@ -232,13 +258,20 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         all_signals.len(),
     );
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(config.settings.request_timeout_secs))
+        .timeout(std::time::Duration::from_secs(
+            config.settings.request_timeout_secs,
+        ))
         .build()
         .context("failed to build HTTP client")?;
-    let client = crate::stage::build_model_client(config, &model, None, None, &http)?;
+    let usage = crate::model::UsageTracker::unlimited();
+    let client = crate::stage::build_model_client(config, &model, None, None, &http, &usage)?;
     let messages = vec![
-        Message::System { content: SYSTEM_PROMPT.to_string() },
-        Message::User { content: user_prompt },
+        Message::System {
+            content: SYSTEM_PROMPT.to_string(),
+        },
+        Message::User {
+            content: user_prompt,
+        },
     ];
     let reply = client.complete(&messages, &[]).await?;
     let text = reply.content.unwrap_or_default();
@@ -274,9 +307,11 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         std::fs::write(&lessons_path, updated)
             .with_context(|| format!("cannot write {}", lessons_path.display()))?;
         println!("updated {}", lessons_path.display());
-        let covered = config.settings.context_files.iter().any(|f| {
-            f.file_name() == lessons_path.file_name()
-        });
+        let covered = config
+            .settings
+            .context_files
+            .iter()
+            .any(|f| f.file_name() == lessons_path.file_name());
         if !covered {
             eprintln!(
                 "⚠ {} is not in settings.context_files — lessons won't reach the models \
@@ -365,7 +400,9 @@ fn soa_added_lines(sessions: &[Session]) -> std::collections::BTreeMap<String, S
                     && !line.starts_with("+++")
                     && crate::git::substantial_line(added)
                 {
-                    lines.entry(added.trim().to_string()).or_insert_with(|| entry.path.clone());
+                    lines
+                        .entry(added.trim().to_string())
+                        .or_insert_with(|| entry.path.clone());
                 }
             }
         }
@@ -375,7 +412,11 @@ fn soa_added_lines(sessions: &[Session]) -> std::collections::BTreeMap<String, S
 
 /// One session as prompt text: what was asked, how it ended, what failed.
 fn digest_session(session: &Session, signals: &[Signal]) -> String {
-    let mut out = format!("\n## Session {} — {}\n", session.id, excerpt(&session.title, 100));
+    let mut out = format!(
+        "\n## Session {} — {}\n",
+        session.id,
+        excerpt(&session.title, 100)
+    );
     let user_messages: Vec<&str> = session
         .history
         .iter()
@@ -390,12 +431,18 @@ fn digest_session(session: &Session, signals: &[Signal]) -> String {
     if user_messages.len() > 8 {
         let _ = writeln!(out, "… {} more user message(s)", user_messages.len() - 8);
     }
-    if let Some(Message::Assistant { content: Some(content), .. }) = session
-        .history
-        .iter()
-        .rev()
-        .find(|m| matches!(m, Message::Assistant { content: Some(_), .. }))
-    {
+    if let Some(Message::Assistant {
+        content: Some(content),
+        ..
+    }) = session.history.iter().rev().find(|m| {
+        matches!(
+            m,
+            Message::Assistant {
+                content: Some(_),
+                ..
+            }
+        )
+    }) {
         let _ = writeln!(out, "final reply: {}", excerpt(content, 240));
     }
     if signals.is_empty() {
@@ -429,8 +476,12 @@ fn parse_proposal(text: &str) -> Result<Proposal> {
     if let Ok(proposal) = serde_json::from_str::<Proposal>(text.trim()) {
         return Ok(proposal);
     }
-    let start = text.find('{').ok_or_else(|| anyhow!("no JSON object in the reply"))?;
-    let end = text.rfind('}').ok_or_else(|| anyhow!("no JSON object in the reply"))?;
+    let start = text
+        .find('{')
+        .ok_or_else(|| anyhow!("no JSON object in the reply"))?;
+    let end = text
+        .rfind('}')
+        .ok_or_else(|| anyhow!("no JSON object in the reply"))?;
     if end <= start {
         bail!("no JSON object in the reply");
     }
@@ -464,8 +515,12 @@ fn slug(name: &str) -> Option<String> {
 
 /// The lessons currently in the managed block of the given file.
 fn read_lessons(path: &std::path::Path) -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(path) else { return Vec::new() };
-    let Some((_, block, _)) = split_lessons_block(&content) else { return Vec::new() };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Some((_, block, _)) = split_lessons_block(&content) else {
+        return Vec::new();
+    };
     block
         .lines()
         .filter_map(|line| line.strip_prefix("- "))
@@ -492,7 +547,8 @@ fn split_lessons_block(content: &str) -> Option<(&str, &str, &str)> {
 /// so hand-placement survives.
 fn replace_lessons_block(content: &str, lessons: &[String]) -> String {
     let bullets: String = lessons.iter().map(|l| format!("- {l}\n")).collect();
-    let block = format!("{LESSONS_START}\n## Lessons (from `soa reflect`)\n\n{bullets}{LESSONS_END}");
+    let block =
+        format!("{LESSONS_START}\n## Lessons (from `soa reflect`)\n\n{bullets}{LESSONS_END}");
     match split_lessons_block(content) {
         Some((before, _, after)) => format!("{before}{block}{after}"),
         None if content.trim().is_empty() => format!("{block}\n"),
@@ -537,7 +593,12 @@ mod tests {
         assert_eq!(proposal.note, "n");
 
         // Missing fields default to empty rather than erroring.
-        assert!(parse_proposal(r#"{"lessons": []}"#).unwrap().skills.is_empty());
+        assert!(
+            parse_proposal(r#"{"lessons": []}"#)
+                .unwrap()
+                .skills
+                .is_empty()
+        );
         assert!(parse_proposal("no json here").is_err());
     }
 
@@ -552,10 +613,16 @@ mod tests {
         // Read back and replace: user content above and below survives.
         let mut with_suffix = one.clone();
         with_suffix.push_str("\nMore notes below.\n");
-        assert_eq!(read_lessons_str(&with_suffix), vec!["always run cargo check"]);
+        assert_eq!(
+            read_lessons_str(&with_suffix),
+            vec!["always run cargo check"]
+        );
         let two = replace_lessons_block(
             &with_suffix,
-            &["prefer edit_lines".to_string(), "run tests before replying".to_string()],
+            &[
+                "prefer edit_lines".to_string(),
+                "run tests before replying".to_string(),
+            ],
         );
         assert!(two.contains("Hand-written notes."));
         assert!(two.contains("More notes below."));
@@ -586,7 +653,10 @@ mod tests {
 
     #[test]
     fn slugs_and_lesson_validation() {
-        assert_eq!(slug("Careful Editing!"), Some("careful-editing".to_string()));
+        assert_eq!(
+            slug("Careful Editing!"),
+            Some("careful-editing".to_string())
+        );
         assert_eq!(slug("--x--"), Some("x".to_string()));
         assert_eq!(slug("  "), None);
         assert_eq!(slug(&"y".repeat(80)), None);
@@ -649,18 +719,30 @@ mod tests {
         // First-writer wins when the same line appears in more sessions.
         session.diffs[0].path = "src/b.rs".to_string();
         let two = vec![
-            crate::tui::store::Session { id: "s2".to_string(), ..session.clone() },
+            crate::tui::store::Session {
+                id: "s2".to_string(),
+                ..session.clone()
+            },
             session,
         ];
         let lines = soa_added_lines(&two);
-        assert_eq!(lines.get("let written_by_soa = compute_from_input(x);").unwrap(), "src/b.rs");
+        assert_eq!(
+            lines
+                .get("let written_by_soa = compute_from_input(x);")
+                .unwrap(),
+            "src/b.rs"
+        );
     }
 
     #[test]
     fn digest_names_signals_and_caps_messages() {
-        let mut history = vec![Message::User { content: "fix the bug".to_string() }];
+        let mut history = vec![Message::User {
+            content: "fix the bug".to_string(),
+        }];
         for i in 0..10 {
-            history.push(Message::User { content: format!("more {i}") });
+            history.push(Message::User {
+                content: format!("more {i}"),
+            });
         }
         history.push(Message::Assistant {
             content: Some("done, tests pass".to_string()),

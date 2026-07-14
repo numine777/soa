@@ -65,6 +65,15 @@ pub struct Settings {
     /// caused by `reprompt_stage`. Guards against reprompt loops.
     #[serde(default = "default_max_stage_runs")]
     pub max_stage_runs: u32,
+    /// Maximum provider-reported input plus output tokens across one run.
+    /// Missing means unlimited.
+    pub max_run_tokens: Option<u64>,
+    /// Maximum known model spend in US dollars across one run. Every model
+    /// must declare input/output prices when this is set.
+    pub max_run_cost_usd: Option<f64>,
+    /// Maximum active wall-clock seconds across one run. Resumed runs carry
+    /// forward time already spent but do not count time while suspended.
+    pub max_run_secs: Option<u64>,
     /// Tool results longer than this many characters are truncated before
     /// they enter the conversation, so one oversized result (e.g. a
     /// recursive directory tree) cannot blow the model's context window.
@@ -135,6 +144,9 @@ impl Default for Settings {
             searxng_max_results: default_search_results(),
             default_max_turns: default_max_turns(),
             max_stage_runs: default_max_stage_runs(),
+            max_run_tokens: None,
+            max_run_cost_usd: None,
+            max_run_secs: None,
             max_tool_output_chars: default_max_tool_output_chars(),
             max_agent_depth: default_max_agent_depth(),
             auto_compact_threshold: default_auto_compact_threshold(),
@@ -146,6 +158,16 @@ impl Default for Settings {
             default_workflow: None,
             context_files: default_context_files(),
             reflect_model: None,
+        }
+    }
+}
+
+impl Settings {
+    pub fn run_limits(&self) -> crate::model::RunLimits {
+        crate::model::RunLimits {
+            max_tokens: self.max_run_tokens,
+            max_cost_usd: self.max_run_cost_usd,
+            max_time: self.max_run_secs.map(std::time::Duration::from_secs),
         }
     }
 }
@@ -274,6 +296,10 @@ pub struct Model {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Input and output prices in US dollars per million tokens. Both are
+    /// required when `settings.max_run_cost_usd` is configured.
+    pub input_cost_per_million: Option<f64>,
+    pub output_cost_per_million: Option<f64>,
     /// The model's context window, in tokens. Enables the pressure gauge
     /// in the chat status bar, auto-compaction, and mid-stage shedding of
     /// old tool results.
@@ -587,6 +613,32 @@ impl Config {
                     model.provider
                 ));
             }
+            if model.input_cost_per_million.is_some() != model.output_cost_per_million.is_some() {
+                errors.push(format!(
+                    "model `{name}` must set both input_cost_per_million and \
+                     output_cost_per_million"
+                ));
+            }
+            for (field, price) in [
+                ("input_cost_per_million", model.input_cost_per_million),
+                ("output_cost_per_million", model.output_cost_per_million),
+            ] {
+                if let Some(price) = price
+                    && (!price.is_finite() || price < 0.0)
+                {
+                    errors.push(format!(
+                        "model `{name}` {field} must be a finite non-negative number"
+                    ));
+                }
+            }
+            if self.settings.max_run_cost_usd.is_some()
+                && (model.input_cost_per_million.is_none()
+                    || model.output_cost_per_million.is_none())
+            {
+                errors.push(format!(
+                    "settings.max_run_cost_usd requires pricing on model `{name}`"
+                ));
+            }
         }
 
         if self.stages.is_empty() {
@@ -636,6 +688,19 @@ impl Config {
                 "settings.auto_compact_threshold must be between 0 and 1 (got {})",
                 self.settings.auto_compact_threshold
             ));
+        }
+        if self.settings.max_run_tokens == Some(0) {
+            errors.push("settings.max_run_tokens must be greater than zero".to_string());
+        }
+        if self.settings.max_run_secs == Some(0) {
+            errors.push("settings.max_run_secs must be greater than zero".to_string());
+        }
+        if let Some(cost) = self.settings.max_run_cost_usd
+            && (!cost.is_finite() || cost <= 0.0)
+        {
+            errors.push(
+                "settings.max_run_cost_usd must be a finite number greater than zero".to_string(),
+            );
         }
 
         for (name, agent) in &self.agents {
@@ -815,7 +880,11 @@ impl Config {
         let workflow_name = requested
             .map(str::to_string)
             .or_else(|| self.settings.default_workflow.clone())
-            .or_else(|| self.workflows.contains_key("default").then(|| "default".to_string()));
+            .or_else(|| {
+                self.workflows
+                    .contains_key("default")
+                    .then(|| "default".to_string())
+            });
 
         let Some(name) = workflow_name else {
             return Ok((0..self.stages.len()).collect());
@@ -823,7 +892,11 @@ impl Config {
         let workflow = self.workflows.get(&name).with_context(|| {
             format!(
                 "no workflow named `{name}` (available: {})",
-                self.workflows.keys().cloned().collect::<Vec<_>>().join(", ")
+                self.workflows
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         })?;
         Ok(workflow
@@ -852,7 +925,10 @@ fn resolve_context_files(entries: &[PathBuf], cwd: &Path) -> Vec<ProjectContext>
         .filter_map(|entry| {
             let found = if entry.is_absolute() {
                 let content = std::fs::read_to_string(entry).ok()?;
-                ProjectContext { path: entry.clone(), content }
+                ProjectContext {
+                    path: entry.clone(),
+                    content,
+                }
             } else {
                 cwd.ancestors().find_map(|dir| {
                     let path = dir.join(entry);
@@ -860,8 +936,7 @@ fn resolve_context_files(entries: &[PathBuf], cwd: &Path) -> Vec<ProjectContext>
                     Some(ProjectContext { path, content })
                 })?
             };
-            (!found.content.trim().is_empty() && seen.insert(found.path.clone()))
-                .then_some(found)
+            (!found.content.trim().is_empty() && seen.insert(found.path.clone())).then_some(found)
         })
         .collect()
 }
@@ -878,8 +953,9 @@ pub fn expand_env(input: &str) -> Result<String> {
             bail!("unterminated ${{...}} reference in `{input}`");
         };
         let var = &after[..end];
-        let value = std::env::var(var)
-            .with_context(|| format!("environment variable `{var}` referenced in config is not set"))?;
+        let value = std::env::var(var).with_context(|| {
+            format!("environment variable `{var}` referenced in config is not set")
+        })?;
         out.push_str(&value);
         rest = &after[end + 1..];
     }
@@ -950,13 +1026,59 @@ mod tests {
     }
 
     #[test]
+    fn run_budgets_and_model_pricing_validate() {
+        let budgeted = format!(
+            "[settings]\nmax_run_tokens = 10000\nmax_run_cost_usd = 0.5\nmax_run_secs = 60\n{}",
+            MINIMAL.replace(
+                "model = \"qwen3:8b\"",
+                "model = \"qwen3:8b\"\ninput_cost_per_million = 0.2\noutput_cost_per_million = 0.8"
+            )
+        );
+        let config = parse(&budgeted).unwrap();
+        assert_eq!(config.settings.run_limits().max_tokens, Some(10_000));
+        assert_eq!(config.settings.run_limits().max_cost_usd, Some(0.5));
+        assert_eq!(
+            config.settings.run_limits().max_time,
+            Some(std::time::Duration::from_secs(60))
+        );
+
+        let missing_prices = format!("[settings]\nmax_run_cost_usd = 1.0\n{MINIMAL}");
+        let error = parse(&missing_prices).unwrap_err().to_string();
+        assert!(
+            error.contains("requires pricing on model `default`"),
+            "{error}"
+        );
+
+        let partial_price = MINIMAL.replace(
+            "model = \"qwen3:8b\"",
+            "model = \"qwen3:8b\"\ninput_cost_per_million = 1.0",
+        );
+        let error = parse(&partial_price).unwrap_err().to_string();
+        assert!(error.contains("must set both"), "{error}");
+
+        let negative_price = MINIMAL.replace(
+            "model = \"qwen3:8b\"",
+            "model = \"qwen3:8b\"\ninput_cost_per_million = -1.0\noutput_cost_per_million = 1.0",
+        );
+        let error = parse(&negative_price).unwrap_err().to_string();
+        assert!(error.contains("finite non-negative"), "{error}");
+
+        let zero_limits = format!(
+            "[settings]\nmax_run_tokens = 0\nmax_run_cost_usd = 0.0\nmax_run_secs = 0\n{MINIMAL}"
+        );
+        let error = parse(&zero_limits).unwrap_err().to_string();
+        assert!(error.contains("max_run_tokens"), "{error}");
+        assert!(error.contains("max_run_cost_usd"), "{error}");
+        assert!(error.contains("max_run_secs"), "{error}");
+    }
+
+    #[test]
     fn resolves_context_files_in_order_walking_up() {
         let root = std::env::temp_dir().join(format!("soa-ctx-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let nested = root.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
-        let entries =
-            |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let entries = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
 
         // Walk-up discovery: found in an ancestor of the working directory.
         std::fs::write(root.join("SOA.md"), "top instructions").unwrap();
@@ -1037,7 +1159,10 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("unknown fallback model `ghost`"), "{err}");
-        assert!(err.contains("model `default` lists itself as a fallback"), "{err}");
+        assert!(
+            err.contains("model `default` lists itself as a fallback"),
+            "{err}"
+        );
 
         let toml_str = format!(
             "{}\n[models.backup]\nprovider = \"local\"\nmodel = \"qwen3:4b\"\n",
@@ -1106,17 +1231,22 @@ mod tests {
         assert!(err.contains("unknown agent `nope`"), "{err}");
 
         // Agent with a bad model and a bad subagent reference.
-        let toml_str = format!(
-            "{MINIMAL}\n[agents.helper]\nmodel = \"missing\"\nsubagents = [\"ghost\"]\n"
-        );
+        let toml_str =
+            format!("{MINIMAL}\n[agents.helper]\nmodel = \"missing\"\nsubagents = [\"ghost\"]\n");
         let err = parse(&toml_str).unwrap_err().to_string();
-        assert!(err.contains("agent `helper` references unknown model `missing`"), "{err}");
+        assert!(
+            err.contains("agent `helper` references unknown model `missing`"),
+            "{err}"
+        );
         assert!(err.contains("unknown agent `ghost`"), "{err}");
 
         // A valid agent wired to the stage parses.
         let toml_str = format!(
             "{}\n[agents.helper]\nmodel = \"default\"\ndescription = \"helps\"\n",
-            MINIMAL.replace("name = \"answer\"", "name = \"answer\"\nsubagents = [\"helper\"]")
+            MINIMAL.replace(
+                "name = \"answer\"",
+                "name = \"answer\"\nsubagents = [\"helper\"]"
+            )
         );
         assert!(parse(&toml_str).is_ok());
     }
@@ -1124,9 +1254,8 @@ mod tests {
     #[test]
     fn workflow_validation_and_resolution() {
         // Unknown stage and duplicate stage rejected.
-        let toml_str = format!(
-            "{MINIMAL}\n[workflows.bad]\nstages = [\"answer\", \"ghost\", \"answer\"]\n"
-        );
+        let toml_str =
+            format!("{MINIMAL}\n[workflows.bad]\nstages = [\"answer\", \"ghost\", \"answer\"]\n");
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("unknown stage `ghost`"), "{err}");
         assert!(err.contains("more than once"), "{err}");
@@ -1165,7 +1294,10 @@ mod tests {
             "name = \"answer\"\ncan_reprompt = [\"answer\", \"nope\"]",
         );
         let err = parse(&toml_str).unwrap_err().to_string();
-        assert!(err.contains("can_reprompt references unknown stage `nope`"), "{err}");
+        assert!(
+            err.contains("can_reprompt references unknown stage `nope`"),
+            "{err}"
+        );
         // Self-reference and any existing stage are fine.
         let toml_str = MINIMAL.replace(
             "name = \"answer\"",
@@ -1178,7 +1310,10 @@ mod tests {
     fn env_expansion() {
         // SAFETY: test-only; no other thread reads this variable.
         unsafe { std::env::set_var("SOA_TEST_TOKEN", "sekrit") };
-        assert_eq!(expand_env("Bearer ${SOA_TEST_TOKEN}!").unwrap(), "Bearer sekrit!");
+        assert_eq!(
+            expand_env("Bearer ${SOA_TEST_TOKEN}!").unwrap(),
+            "Bearer sekrit!"
+        );
         assert!(expand_env("${SOA_DOES_NOT_EXIST_XYZ}").is_err());
         assert_eq!(expand_env("plain").unwrap(), "plain");
     }

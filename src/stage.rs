@@ -13,7 +13,8 @@ use crate::approval::{Approvals, Decision};
 use crate::config::{Config, DataBoundary, McpServer, Mode, Stage, ToolEffect};
 use crate::mcp::McpManager;
 use crate::model::{
-    Message, ModelClient, ModelTarget, ProviderAdapter, SamplingParams, ToolDefinition,
+    Message, ModelClient, ModelPricing, ModelTarget, ProviderAdapter, SamplingParams,
+    ToolDefinition, UsageTracker,
 };
 use crate::tools;
 
@@ -59,15 +60,24 @@ pub fn render_template(
 /// Where a tool call is routed when the model invokes it.
 #[derive(Debug, Clone)]
 pub enum ToolBinding {
-    Mcp { server: String, tool: String },
+    Mcp {
+        server: String,
+        tool: String,
+    },
     WebSearch,
     /// Delegate the call's `task` to a configured subagent.
-    Agent { agent: String },
+    Agent {
+        agent: String,
+    },
     /// Run the call's `command` with `sh -c`, restricted to the owning
     /// context's allowlist patterns (empty = unrestricted).
-    Shell { allow: Vec<String> },
+    Shell {
+        allow: Vec<String>,
+    },
     /// A built-in file tool, rooted at the working directory.
-    File { op: crate::files::FileOp },
+    File {
+        op: crate::files::FileOp,
+    },
 }
 
 /// Compact set of observable effects attached to a tool. Keeping this
@@ -184,7 +194,10 @@ impl crate::config::Agent {
 #[derive(Debug)]
 pub enum StageOutcome {
     Final(String),
-    Reprompt { target: String, instructions: String },
+    Reprompt {
+        target: String,
+        instructions: String,
+    },
 }
 
 pub const REPROMPT_TOOL: &str = "reprompt_stage";
@@ -221,7 +234,13 @@ fn reprompt_tool(targets: &[String]) -> ToolDefinition {
 fn sanitize_tool_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     cleaned.chars().take(64).collect()
 }
@@ -292,7 +311,9 @@ pub fn assemble_tools(
                 config.settings.shell_timeout_secs,
                 profile.shell_allow,
             ),
-            binding: ToolBinding::Shell { allow: profile.shell_allow.to_vec() },
+            binding: ToolBinding::Shell {
+                allow: profile.shell_allow.to_vec(),
+            },
             effects: ToolEffects::one(ToolEffect::ProcessExecute),
         });
     }
@@ -325,12 +346,8 @@ pub fn assemble_tools(
             // its declared mode. In particular, a read-only agent with an
             // explicit shell grant is not safe to smuggle through a
             // read-only caller.
-            let nested_tools = assemble_tools(
-                &agent.tool_profile(agent_name),
-                config,
-                mcp,
-                depth + 1,
-            )?;
+            let nested_tools =
+                assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth + 1)?;
             let mut agent_effects = nested_tools
                 .iter()
                 .fold(ToolEffects::NONE, |all, tool| all.union(tool.effects));
@@ -395,7 +412,9 @@ fn model_chain_reaches_external(config: &Config, model_name: &str) -> bool {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(model) = config.models.get(&name) else { continue };
+        let Some(model) = config.models.get(&name) else {
+            continue;
+        };
         if config
             .providers
             .get(&model.provider)
@@ -423,8 +442,7 @@ impl<'a> CallPolicy<'a> {
         tool_effects: ToolEffects,
     ) -> bool {
         context_requires
-            && (tool_effects.mutating_or_process()
-                || tool_effects.intersects(additional_effects))
+            && (tool_effects.mutating_or_process() || tool_effects.intersects(additional_effects))
     }
 
     /// Policy for a context's tool: mutation and process execution use the
@@ -461,7 +479,9 @@ pub fn parallel_round(
 ) -> bool {
     enabled
         && calls.len() > 1
-        && calls.iter().all(|call| parallel_safe_of(&call.function.name) == Some(true))
+        && calls
+            .iter()
+            .all(|call| parallel_safe_of(&call.function.name) == Some(true))
 }
 
 /// How a call is presented to the approver and matched against patterns.
@@ -495,8 +515,11 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
             pattern_safe: true,
         },
         ToolBinding::Shell { .. } => {
-            let command =
-                args.get("command").and_then(Value::as_str).unwrap_or_default().trim();
+            let command = args
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
             let first_word = command.split_whitespace().next().unwrap_or("?");
             CallDescriptor {
                 descriptor: format!("shell {}", truncate(command, 160)),
@@ -529,12 +552,14 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
 /// Execute a tool call: enforce the approval policy, run it, and clamp the
 /// result so a single oversized output cannot exhaust the model's context.
 /// `depth` is the caller's delegation depth (0 for stages and chat).
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool_call(
     binding: &ToolBinding,
     arguments_json: &str,
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
+    usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
 ) -> Result<String> {
@@ -589,12 +614,23 @@ pub async fn dispatch_tool_call(
         }
     }
 
-    let output =
-        dispatch_tool_call_inner(binding, arguments_json, config, mcp, http, depth, policy)
-            .await?;
+    let output = dispatch_tool_call_inner(
+        binding,
+        arguments_json,
+        config,
+        mcp,
+        http,
+        usage,
+        depth,
+        policy,
+    )
+    .await?;
     let output =
         crate::hooks::post_tool(config, &described.descriptor, arguments_json, output).await;
-    Ok(clamp_tool_output(output, config.settings.max_tool_output_chars))
+    Ok(clamp_tool_output(
+        output,
+        config.settings.max_tool_output_chars,
+    ))
 }
 
 /// Truncate at a character boundary, telling the model what was cut so it
@@ -612,12 +648,14 @@ fn clamp_tool_output(output: String, max_chars: usize) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_tool_call_inner(
     binding: &ToolBinding,
     arguments_json: &str,
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
+    usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
 ) -> Result<String> {
@@ -645,8 +683,13 @@ async fn dispatch_tool_call_inner(
                 .searxng_url
                 .as_deref()
                 .context("searxng_url is not configured")?;
-            match tools::web_search(http, searxng_url, query, config.settings.searxng_max_results)
-                .await
+            match tools::web_search(
+                http,
+                searxng_url,
+                query,
+                config.settings.searxng_max_results,
+            )
+            .await
             {
                 Ok(results) => Ok(results),
                 Err(e) => Ok(format!("ERROR: web search failed: {e:#}")),
@@ -666,11 +709,24 @@ async fn dispatch_tool_call_inner(
             }
         }
         ToolBinding::Agent { agent } => {
-            let task = arguments.get("task").and_then(Value::as_str).unwrap_or_default();
+            let task = arguments
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if task.trim().is_empty() {
                 return Ok("ERROR: the agent needs a non-empty `task` string".to_string());
             }
-            match run_agent(config, agent, task, mcp, http, depth + 1, policy.approvals).await
+            match run_agent(
+                config,
+                agent,
+                task,
+                mcp,
+                http,
+                usage,
+                depth + 1,
+                policy.approvals,
+            )
+            .await
             {
                 Ok(answer) => Ok(answer),
                 // The agent's failure becomes feedback, not a crashed turn.
@@ -678,8 +734,10 @@ async fn dispatch_tool_call_inner(
             }
         }
         ToolBinding::Shell { allow } => {
-            let command =
-                arguments.get("command").and_then(Value::as_str).unwrap_or_default();
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if command.trim().is_empty() {
                 return Ok("ERROR: `command` must be a non-empty string".to_string());
             }
@@ -721,6 +779,7 @@ pub fn run_agent<'a>(
     task: &'a str,
     mcp: &'a McpManager,
     http: &'a reqwest::Client,
+    usage: &'a UsageTracker,
     depth: u32,
     approvals: &'a Approvals,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
@@ -729,8 +788,14 @@ pub fn run_agent<'a>(
             .agents
             .get(agent_name)
             .ok_or_else(|| anyhow!("unknown agent `{agent_name}`"))?;
-        let client =
-            build_model_client(config, &agent.model, agent.temperature, agent.max_tokens, http)?;
+        let client = build_model_client(
+            config,
+            &agent.model,
+            agent.temperature,
+            agent.max_tokens,
+            http,
+            usage,
+        )?;
 
         let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
         let definitions: Vec<ToolDefinition> =
@@ -750,7 +815,9 @@ pub fn run_agent<'a>(
         if let Some(system) = system {
             messages.push(Message::System { content: system });
         }
-        messages.push(Message::User { content: task.to_string() });
+        messages.push(Message::User {
+            content: task.to_string(),
+        });
 
         let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
         tracing::info!(
@@ -816,6 +883,7 @@ pub fn run_agent<'a>(
                             config,
                             mcp,
                             http,
+                            usage,
                             depth,
                             &policy,
                         )
@@ -853,6 +921,7 @@ pub fn run_agent<'a>(
                             config,
                             mcp,
                             http,
+                            usage,
                             depth,
                             &policy,
                         )
@@ -860,7 +929,10 @@ pub fn run_agent<'a>(
                     }
                     None => format!("ERROR: unknown tool `{}`", call.function.name),
                 };
-                messages.push(Message::Tool { content: output, tool_call_id: call.id });
+                messages.push(Message::Tool {
+                    content: output,
+                    tool_call_id: call.id,
+                });
             }
         }
 
@@ -882,7 +954,10 @@ pub struct PipelineContext {
 
 impl PipelineContext {
     pub fn new(input: &str) -> Self {
-        PipelineContext { input: input.to_string(), ..Default::default() }
+        PipelineContext {
+            input: input.to_string(),
+            ..Default::default()
+        }
     }
 
     pub fn record(&mut self, stage_name: &str, output: String) {
@@ -901,6 +976,7 @@ pub fn build_model_client(
     temperature: Option<f64>,
     max_tokens: Option<u32>,
     http: &reqwest::Client,
+    usage: &UsageTracker,
 ) -> Result<ModelClient> {
     let mut targets = Vec::new();
     let mut adapters: BTreeMap<String, Arc<dyn ProviderAdapter>> = BTreeMap::new();
@@ -931,13 +1007,21 @@ pub fn build_model_client(
                 max_tokens: max_tokens.or(model.max_tokens),
             },
             stream: provider.stream,
+            pricing: ModelPricing {
+                input_per_million: model.input_cost_per_million,
+                output_per_million: model.output_cost_per_million,
+            },
             external: provider.data_boundary == DataBoundary::External,
             adapter,
         });
         queue.extend(model.fallback.iter().cloned());
     }
 
-    Ok(ModelClient::new(targets, config.settings.provider_retries))
+    Ok(ModelClient::new(
+        targets,
+        config.settings.provider_retries,
+        usage.clone(),
+    ))
 }
 
 /// Receives a [`crate::diff::DiffEntry`] for each file change a stage's
@@ -957,13 +1041,20 @@ pub async fn run_stage(
     context: &PipelineContext,
     mcp: &McpManager,
     http: &reqwest::Client,
+    usage: &UsageTracker,
     reprompt_targets: &[String],
     on_delta: Option<crate::model::DeltaHandler<'_>>,
     on_diff: DiffSink<'_>,
     approvals: &Approvals,
 ) -> Result<StageOutcome> {
-    let client =
-        build_model_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
+    let client = build_model_client(
+        config,
+        &stage.model,
+        stage.temperature,
+        stage.max_tokens,
+        http,
+        usage,
+    )?;
 
     let stage_tools = assemble_tools(&stage.tool_profile(), config, mcp, 0)?;
     let mut definitions: Vec<ToolDefinition> =
@@ -993,7 +1084,9 @@ pub async fn run_stage(
     if let Some(system) = system {
         messages.push(Message::System { content: system });
     }
-    messages.push(Message::User { content: user_prompt });
+    messages.push(Message::User {
+        content: user_prompt,
+    });
 
     let max_turns = stage.max_turns.unwrap_or(config.settings.default_max_turns);
     tracing::info!(
@@ -1002,7 +1095,9 @@ pub async fn run_stage(
     );
 
     for turn in 1..=max_turns {
-        let reply = client.complete_streamed(&messages, &definitions, on_delta).await?;
+        let reply = client
+            .complete_streamed(&messages, &definitions, on_delta)
+            .await?;
 
         // Terminate the streamed text before anything else (logs, tool
         // lines) writes to the same terminal.
@@ -1069,6 +1164,7 @@ pub async fn run_stage(
                         config,
                         mcp,
                         http,
+                        usage,
                         0,
                         &policy,
                     )
@@ -1111,8 +1207,10 @@ pub async fn run_stage(
                     // caller's diff sink.
                     let snapshots = if on_diff.is_some()
                         && tool.effects.mutating_or_process()
-                        && matches!(tool.binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
-                    {
+                        && matches!(
+                            tool.binding,
+                            ToolBinding::Mcp { .. } | ToolBinding::File { .. }
+                        ) {
                         crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
                     } else {
                         Vec::new()
@@ -1130,14 +1228,13 @@ pub async fn run_stage(
                         config,
                         mcp,
                         http,
+                        usage,
                         0,
                         &policy,
                     )
                     .await?;
                     if let Some(on_diff) = on_diff {
-                        for entry in
-                            crate::diff::collect_changes(&call.function.name, snapshots)
-                        {
+                        for entry in crate::diff::collect_changes(&call.function.name, snapshots) {
                             on_diff(entry);
                         }
                     }
@@ -1223,7 +1320,10 @@ fn parse_reprompt(arguments_json: &str, targets: &[String]) -> Result<StageOutco
     if args.instructions.trim().is_empty() {
         return Err("`instructions` must not be empty".to_string());
     }
-    Ok(StageOutcome::Reprompt { target: args.stage, instructions: args.instructions })
+    Ok(StageOutcome::Reprompt {
+        target: args.stage,
+        instructions: args.instructions,
+    })
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -1297,12 +1397,11 @@ mod tests {
 
         // Network egress remains read-like, but write mode and process
         // execution cannot cross a read-only delegation boundary.
-        let names: Vec<String> =
-            assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0)
-                .unwrap()
-                .into_iter()
-                .map(|t| t.definition.name)
-                .collect();
+        let names: Vec<String> = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.definition.name)
+            .collect();
         assert_eq!(names, vec!["agent__reader"]);
 
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
@@ -1342,11 +1441,12 @@ mod tests {
         )
         .unwrap();
         let http = reqwest::Client::new();
-        let client = build_model_client(&config, "a", None, None, &http).unwrap();
+        let usage = UsageTracker::unlimited();
+        let client = build_model_client(&config, "a", None, None, &http, &usage).unwrap();
         // a's own fallbacks first, then theirs; the cycle back to `a` is cut.
         assert_eq!(client.target_labels(), vec!["a", "b", "c", "d"]);
         // A model with no fallbacks yields a single target.
-        let solo = build_model_client(&config, "c", None, None, &http).unwrap();
+        let solo = build_model_client(&config, "c", None, None, &http, &usage).unwrap();
         assert_eq!(solo.target_labels(), vec!["c"]);
     }
 
@@ -1354,7 +1454,10 @@ mod tests {
     fn parallel_round_requires_every_call_to_be_safe() {
         let call = |name: &str| crate::model::ToolCall {
             id: "x".into(),
-            function: crate::model::FunctionCall { name: name.into(), arguments: "{}".into() },
+            function: crate::model::FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
         };
         let parallel_safe = |name: &str| match name {
             "read" => Some(true),
@@ -1366,8 +1469,16 @@ mod tests {
         // Disabled by config, single call, any unsafe call, or any unknown tool.
         assert!(!parallel_round(false, &reads, parallel_safe));
         assert!(!parallel_round(true, &reads[..1], parallel_safe));
-        assert!(!parallel_round(true, &[call("read"), call("write")], parallel_safe));
-        assert!(!parallel_round(true, &[call("read"), call("reprompt_stage")], parallel_safe));
+        assert!(!parallel_round(
+            true,
+            &[call("read"), call("write")],
+            parallel_safe
+        ));
+        assert!(!parallel_round(
+            true,
+            &[call("read"), call("reprompt_stage")],
+            parallel_safe
+        ));
     }
 
     #[test]
@@ -1405,8 +1516,7 @@ mod tests {
         assert!(simple.pattern_safe);
         assert!(tools::wildcard_match("shell cargo *", &simple.descriptor));
 
-        let compound =
-            call_descriptor(&binding, r#"{"command":"cargo test; dangerous-command"}"#);
+        let compound = call_descriptor(&binding, r#"{"command":"cargo test; dangerous-command"}"#);
         assert!(!compound.pattern_safe);
         // It still textually matches the broad pattern, proving that the
         // separate pattern_safe gate is what prevents auto-approval.
@@ -1452,14 +1562,28 @@ mod tests {
         assert_eq!(names(0), vec!["read_file", "list_dir", "glob", "grep"]);
         assert_eq!(
             names(1),
-            vec!["read_file", "list_dir", "glob", "grep", "write_file", "edit_lines", "edit_file"]
+            vec![
+                "read_file",
+                "list_dir",
+                "glob",
+                "grep",
+                "write_file",
+                "edit_lines",
+                "edit_file"
+            ]
         );
         assert!(names(2).is_empty());
 
         let writer_tools =
             assemble_tools(&config.stages[1].tool_profile(), &config, &mcp, 0).unwrap();
-        let read = writer_tools.iter().find(|tool| tool.definition.name == "read_file").unwrap();
-        let write = writer_tools.iter().find(|tool| tool.definition.name == "write_file").unwrap();
+        let read = writer_tools
+            .iter()
+            .find(|tool| tool.definition.name == "read_file")
+            .unwrap();
+        let write = writer_tools
+            .iter()
+            .find(|tool| tool.definition.name == "write_file")
+            .unwrap();
         assert!(read.effects.contains(ToolEffect::FilesystemRead));
         assert!(write.effects.contains(ToolEffect::FilesystemWrite));
     }
@@ -1487,7 +1611,10 @@ mod tests {
         )
         .unwrap();
         let usage = |prompt, completion| {
-            Some(crate::model::Usage { prompt_tokens: prompt, completion_tokens: completion })
+            Some(crate::model::Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+            })
         };
 
         // Default threshold 0.8 of 1000: fires at 800 (prompt + completion), not below.
@@ -1495,39 +1622,74 @@ mod tests {
             context_pressure(&config, "gauged", usage(700, 100).as_ref()),
             Some((800, 1000))
         );
-        assert_eq!(context_pressure(&config, "gauged", usage(700, 99).as_ref()), None);
+        assert_eq!(
+            context_pressure(&config, "gauged", usage(700, 99).as_ref()),
+            None
+        );
         // No declared window, no reported usage, or unknown model: never fires.
-        assert_eq!(context_pressure(&config, "unbounded", usage(9000, 0).as_ref()), None);
+        assert_eq!(
+            context_pressure(&config, "unbounded", usage(9000, 0).as_ref()),
+            None
+        );
         assert_eq!(context_pressure(&config, "gauged", None), None);
-        assert_eq!(context_pressure(&config, "missing", usage(9000, 0).as_ref()), None);
+        assert_eq!(
+            context_pressure(&config, "missing", usage(9000, 0).as_ref()),
+            None
+        );
         // Threshold 0 disables the check entirely.
         config.settings.auto_compact_threshold = 0.0;
-        assert_eq!(context_pressure(&config, "gauged", usage(9000, 0).as_ref()), None);
+        assert_eq!(
+            context_pressure(&config, "gauged", usage(9000, 0).as_ref()),
+            None
+        );
     }
 
     #[test]
     fn sheds_older_tool_results_only() {
         let big = "x".repeat(1000);
         let mut messages = vec![
-            Message::System { content: "s".into() },
-            Message::User { content: "u".into() },
-            Message::Tool { content: big.clone(), tool_call_id: "1".into() },
-            Message::Tool { content: big.clone(), tool_call_id: "2".into() },
-            Message::Tool { content: big.clone(), tool_call_id: "3".into() },
+            Message::System {
+                content: "s".into(),
+            },
+            Message::User {
+                content: "u".into(),
+            },
+            Message::Tool {
+                content: big.clone(),
+                tool_call_id: "1".into(),
+            },
+            Message::Tool {
+                content: big.clone(),
+                tool_call_id: "2".into(),
+            },
+            Message::Tool {
+                content: big.clone(),
+                tool_call_id: "3".into(),
+            },
         ];
         assert_eq!(shed_context(&mut messages, 2), 1);
-        let Message::Tool { content, .. } = &messages[2] else { panic!() };
+        let Message::Tool { content, .. } = &messages[2] else {
+            panic!()
+        };
         assert!(content.starts_with("[trimmed"));
         assert!(content.len() < 400);
         // Recent two untouched.
-        let Message::Tool { content, .. } = &messages[4] else { panic!() };
+        let Message::Tool { content, .. } = &messages[4] else {
+            panic!()
+        };
         assert_eq!(content, &big);
         // Idempotent: already-trimmed entries aren't re-counted.
         assert_eq!(shed_context(&mut messages, 2), 0);
         // Small results aren't worth trimming.
         let mut small = vec![
-            Message::Tool { content: "tiny".into(), tool_call_id: "1".into() },
-            Message::Tool { content: big.clone(), tool_call_id: "2".into() },
+            Message::Tool {
+                content: "tiny".into(),
+                tool_call_id: "1".into(),
+            },
+            Message::Tool {
+                content: big.clone(),
+                tool_call_id: "2".into(),
+            },
         ];
         assert_eq!(shed_context(&mut small, 1), 0);
     }

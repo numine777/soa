@@ -10,6 +10,12 @@ searxng_url = "http://localhost:8888"
 searxng_max_results = 8
 default_max_turns = 16
 request_timeout_secs = 600
+# Optional run-wide hard stops. Token/cost accounting uses provider-reported
+# usage; time covers stages, tools, agents, retries, and fallback. Resumed runs
+# carry prior usage and active time forward.
+# max_run_tokens = 500000
+# max_run_cost_usd = 5.00
+# max_run_secs = 3600
 # Tool results longer than this are truncated before entering the
 # conversation (a recursive directory tree can exceed the context window).
 max_tool_output_chars = 30000
@@ -62,6 +68,10 @@ temperature = 0.7
 # Declaring the context window enables the real-usage gauge in the chat
 # status bar, auto-compaction, and mid-stage shedding of old tool results.
 context_tokens = 131072
+# Optional cost accounting, in USD per million tokens. Both prices are
+# required on every model when settings.max_run_cost_usd is set.
+# input_cost_per_million = 0.20
+# output_cost_per_million = 0.80
 # Fail over to other [models] entries (in order) when this endpoint stays
 # down after settings.provider_retries.
 # fallback = ["coder"]
@@ -75,11 +85,15 @@ model = "qwen-haiku"
 temperature = 0.2
 max_tokens = 8192
 context_tokens = 131072
+# input_cost_per_million = 3.00
+# output_cost_per_million = 15.00
 
 [models.reviewer]
 provider = "spark"
 model = "qwen"
 temperature = 0.7
+# input_cost_per_million = 0.20
+# output_cost_per_million = 0.80
 
 # ---------------------------------------------------------------------------
 # MCP servers. transport = "stdio" spawns a process; "http" connects to a

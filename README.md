@@ -27,9 +27,11 @@ model's first plain-text reply is the stage's output. That output becomes
 
 Intermediate stage output and logs go to stderr; only the final stage's
 answer is printed to stdout, so `soa run` composes with pipes. Every run
-(including failed ones) ends with a `── token usage ──` summary on stderr:
-per-model requests and prompt/completion token totals, covering stage
-loops, subagents, and retried requests alike.
+(including failed ones) ends with a `── usage ──` summary on stderr:
+per-model successful requests and attempts, failures, input/output tokens,
+known cost, provider latency, adapter/data-boundary attribution, wall time,
+and configured budget progress. Stage loops, subagents, retries, and fallback
+targets all report through the same run ledger.
 
 ## Commands
 
@@ -51,13 +53,15 @@ soa -c other.toml …    # use a different config file
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
 
 **Checkpoints.** Pipeline runs are checkpointed to `<data dir>/runs/` after
-every completed stage: the task, each stage's output, and the position in
-the workflow (including reprompt jumps). If a run fails or is interrupted,
+every completed stage: the task, each stage's output, the position in the
+workflow (including reprompt jumps), and cumulative usage/budget state. If a run fails or is interrupted,
 `soa run --resume` picks it up at the first incomplete stage instead of
 starting over — completed stages are not re-run. Mid-stage progress isn't
 checkpointed (the interrupted stage restarts from its prompt), stage names
 must still exist in the config, and the checkpoint is deleted when the
 pipeline finishes. Single-stage runs (`--stage`) are not checkpointed.
+Resuming carries forward tokens, cost, and active time already spent; time
+while the run was suspended does not consume its wall-clock budget.
 
 ## Interactive chat (`soa chat`)
 
@@ -71,10 +75,10 @@ Slash commands:
 |---|---|
 | `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx` gauge: real provider-reported token usage when available (with percentage of the model's `context_tokens`), otherwise a `~` estimate. This also happens automatically when usage crosses `settings.auto_compact_threshold` — see [Configuration](#configuration). |
 | `/clear` | Drop all conversation context and start the display fresh: a `── context cleared ──` divider is shown, and everything above it — messages *and* diff entries — is hidden from the chat and diff views. Nothing is deleted: the session file keeps the full record, `/export` still writes all of it, and rewinding to session start brings the hidden history back into view. |
-| `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
+| `/usage` | Rich per-model usage since this TUI started: requests/attempts, failures, input/output tokens, known cost, provider latency, adapter/data-boundary attribution, plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/rewind` | Open the checkpoint picker: every turn-starting message is a rewind target (newest first, plus a session-start row). Selecting one restores every file touched afterwards to its state at that moment, truncates the conversation back to before the message, and puts the message text back in the input for editing. File restores are recorded as `rewind` diff entries, so a rewind can be re-applied forward from the diff viewer. Compaction and `/clear` rewrite the history, so checkpoints from before them are dropped. |
-| `/run [workflow] <task>` | Run a stage pipeline without leaving the chat: `/run fix the tests` uses the default workflow, `/run quickfix fix the tests` picks one by name (first word only counts when it names a workflow). Stage banners and streamed output appear in the transcript, file edits are captured in the diff viewer, approval prompts use the normal modal, and Esc cancels. The final stage's output joins the conversation history as a normal exchange, so the chat model can discuss the result; intermediate stage outputs stay in the pipeline. `@file` mentions in the task are expanded, and the run is a rewind target like any message. |
+| `/run [workflow] <task>` | Run a stage pipeline without leaving the chat: `/run fix the tests` uses the default workflow, `/run quickfix fix the tests` picks one by name (first word only counts when it names a workflow). Stage banners and streamed output appear in the transcript, file edits are captured in the diff viewer, approval prompts use the normal modal, and Esc cancels. Run-wide token/cost/time budgets apply and a rich usage summary is recorded in the transcript. The final stage's output joins the conversation history as a normal exchange, so the chat model can discuss the result; intermediate stage outputs stay in the pipeline. `@file` mentions in the task are expanded, and the run is a rewind target like any message. |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
 | `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
 | `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
@@ -232,6 +236,9 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `searxng_max_results` | 8 | results returned per search |
 | `default_max_turns` | 16 | model round-trips per stage before erroring |
 | `max_stage_runs` | 24 | total stage executions per run (guards reprompt loops) |
+| `max_run_tokens` | – | maximum provider-reported input + output tokens across a run |
+| `max_run_cost_usd` | – | maximum known model cost in USD across a run; requires input/output pricing on every configured model |
+| `max_run_secs` | – | active wall-clock limit for the whole run, including tools, agents, retries, and fallback; resumed runs carry prior active time |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
 | `auto_compact_threshold` | 0.8 | when real token usage crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results (0 disables; needs `context_tokens` on the model) |
@@ -321,6 +328,27 @@ field on every response (including streamed ones, via
 - mid-turn shedding in stage, agent, and chat tool loops: older tool
   results (all but the two most recent) are truncated in place before the
   next request instead of overflowing the window.
+
+For cost accounting, declare both prices in US dollars per million tokens:
+
+```toml
+[models.cloud-coder]
+provider = "cloud"
+model = "proprietary-coder"
+input_cost_per_million = 3.0
+output_cost_per_million = 15.0
+```
+
+When `max_run_tokens` is configured, soa clamps each request's output
+allowance to the remaining reported budget. Input size is only known after
+the provider responds, so a final request can cross the limit; soa records it
+and stops the run immediately. Token and cost budgets fail closed when a
+successful provider response omits usage. Cost limits also require pricing on
+every model so an unpriced fallback cannot bypass the cap. Without a cost
+limit, missing prices are allowed and the summary labels those requests
+`unpriced` instead of inventing a value. Token- or cost-limited runs serialize
+provider requests so parallel subagents cannot race the same remaining
+allowance; their non-model tool calls can still run concurrently.
 
 ### `[mcp.<name>]`
 

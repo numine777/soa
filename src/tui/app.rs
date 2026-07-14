@@ -17,10 +17,10 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage, ToolEffect};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
-use crate::model::{Message, ModelClient, ToolDefinition, Usage, fmt_tokens, usage_stats};
+use crate::model::{Message, ModelClient, ToolDefinition, Usage, UsageTracker, fmt_tokens};
 use crate::stage::{
-    CallPolicy, ToolBinding, assemble_tools, build_model_client, context_pressure,
-    dispatch_tool_call, shed_context, ToolEffects,
+    CallPolicy, ToolBinding, ToolEffects, assemble_tools, build_model_client, context_pressure,
+    dispatch_tool_call, shed_context,
 };
 
 const COMPACT_INSTRUCTION: &str = "\
@@ -34,8 +34,13 @@ points. Output only the briefing.";
 pub enum TranscriptItem {
     User(String),
     Assistant(String),
-    ToolCall { name: String, args: String },
-    ToolDone { preview: String },
+    ToolCall {
+        name: String,
+        args: String,
+    },
+    ToolDone {
+        preview: String,
+    },
     Info(String),
     Error(String),
     /// A `/clear` divider: everything above it is hidden from the chat and
@@ -47,33 +52,64 @@ pub enum TranscriptItem {
 pub enum AgentEvent {
     /// A streamed fragment of the assistant's in-progress reply.
     Delta(String),
-    ToolCall { name: String, args: String },
-    ToolDone { preview: String },
+    ToolCall {
+        name: String,
+        args: String,
+    },
+    ToolDone {
+        preview: String,
+    },
     Diff(DiffEntry),
     /// Something the user should know mid-turn (e.g. context shedding).
     Notice(String),
     /// Turn finished: the updated history, the assistant's final text, and
     /// the last reported token usage.
-    Turn { history: Vec<Message>, text: String, usage: Option<Usage> },
-    Compacted { summary: String },
+    Turn {
+        history: Vec<Message>,
+        text: String,
+        usage: Option<Usage>,
+    },
+    Compacted {
+        summary: String,
+    },
     /// A `/run` workflow entered a stage (`run` counts reprompt re-runs).
-    StageStart { stage: String, run: u32 },
+    StageStart {
+        stage: String,
+        run: u32,
+    },
     /// A `/run` workflow finished: the last stage's output, or the error
     /// that stopped the pipeline. `task` is the mention-expanded task.
-    WorkflowDone { workflow: String, task: String, result: Result<String, String> },
+    WorkflowDone {
+        workflow: String,
+        task: String,
+        result: Result<String, String>,
+        usage: Vec<String>,
+    },
     Error(String),
 }
 
 pub enum View {
     Chat,
-    Diffs { selected: usize, scroll: usize },
+    Diffs {
+        selected: usize,
+        scroll: usize,
+    },
     /// Session picker over `App::session_list`.
-    Sessions { selected: usize, scroll: usize },
+    Sessions {
+        selected: usize,
+        scroll: usize,
+    },
     /// Rewind picker over `App::checkpoints` (newest first, plus a
     /// session-start row at the bottom).
-    Rewind { selected: usize, scroll: usize },
+    Rewind {
+        selected: usize,
+        scroll: usize,
+    },
     /// Branch picker over `App::branches`.
-    Branches { selected: usize, scroll: usize },
+    Branches {
+        selected: usize,
+        scroll: usize,
+    },
 }
 
 pub struct App {
@@ -124,6 +160,9 @@ pub struct App {
     /// Real token usage from the most recent turn, when the server reports
     /// it; None falls back to the character estimate.
     pub last_usage: Option<Usage>,
+    /// Rich usage for ordinary chat and compaction requests in this TUI
+    /// session. `/run` workflows get a separate budgeted ledger.
+    usage: UsageTracker,
     pub quit: bool,
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
@@ -175,7 +214,9 @@ impl App {
         resumed: Option<Session>,
     ) -> App {
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.settings.request_timeout_secs))
+            .timeout(std::time::Duration::from_secs(
+                config.settings.request_timeout_secs,
+            ))
             .build()
             .expect("HTTP client");
         let mut app = App {
@@ -204,6 +245,7 @@ impl App {
             config_path,
             model_override: None,
             last_usage: None,
+            usage: UsageTracker::unlimited(),
             quit: false,
             turn: None,
             compacting: false,
@@ -246,8 +288,11 @@ impl App {
     /// transcript already carries its original greeting.
     fn apply_session(&mut self, session: Session, restore_stage: bool) {
         if restore_stage
-            && let Some(index) =
-                self.config.stages.iter().position(|s| s.name == session.stage)
+            && let Some(index) = self
+                .config
+                .stages
+                .iter()
+                .position(|s| s.name == session.stage)
         {
             self.stage_index = index;
             self.refresh_tool_count();
@@ -314,7 +359,9 @@ impl App {
     /// The model requests actually use: the `/model` override when set,
     /// otherwise the active stage's model.
     pub fn active_model(&self) -> &str {
-        self.model_override.as_deref().unwrap_or(&self.stage().model)
+        self.model_override
+            .as_deref()
+            .unwrap_or(&self.stage().model)
     }
 
     fn stage_summary(&self) -> String {
@@ -323,7 +370,11 @@ impl App {
             "stage `{}` · model `{}`{} · {} · {} tool(s)",
             stage.name,
             self.active_model(),
-            if self.model_override.is_some() { " (override)" } else { "" },
+            if self.model_override.is_some() {
+                " (override)"
+            } else {
+                ""
+            },
             match stage.mode {
                 Mode::ReadOnly => "read_only",
                 Mode::ReadWrite => "read_write",
@@ -333,10 +384,9 @@ impl App {
     }
 
     fn refresh_tool_count(&mut self) {
-        self.tool_count =
-            assemble_tools(&self.stage().tool_profile(), &self.config, &self.mcp, 0)
-                .map(|tools| tools.len())
-                .unwrap_or(0);
+        self.tool_count = assemble_tools(&self.stage().tool_profile(), &self.config, &self.mcp, 0)
+            .map(|tools| tools.len())
+            .unwrap_or(0);
     }
 
     pub fn is_running(&self) -> bool {
@@ -348,7 +398,10 @@ impl App {
     }
 
     pub fn context_capacity(&self) -> Option<u64> {
-        self.config.models.get(self.active_model()).and_then(|m| m.context_tokens)
+        self.config
+            .models
+            .get(self.active_model())
+            .and_then(|m| m.context_tokens)
     }
 
     /// Status-bar context gauge: text plus a pressure level
@@ -391,7 +444,10 @@ impl App {
             .iter()
             .map(|message| match message {
                 Message::System { content } | Message::User { content } => content.len(),
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                } => {
                     content.as_deref().map_or(0, str::len)
                         + tool_calls.as_ref().map_or(0, |calls| {
                             calls.iter().map(|c| c.function.arguments.len() + 32).sum()
@@ -434,7 +490,8 @@ impl App {
             Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Paste(text) => {
                 if matches!(self.view, View::Chat) {
-                    self.input.insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+                    self.input
+                        .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
                     self.refresh_completion();
                 }
             }
@@ -550,11 +607,19 @@ impl App {
             .position(|s| s.id == self.session_id)
             .map_or(0, |index| index + 1);
         self.session_list = list;
-        self.view = View::Sessions { selected, scroll: 0 };
+        self.view = View::Sessions {
+            selected,
+            scroll: 0,
+        };
     }
 
     fn on_sessions_key(&mut self, key: KeyEvent) {
-        let View::Sessions { selected: current, .. } = self.view else { return };
+        let View::Sessions {
+            selected: current, ..
+        } = self.view
+        else {
+            return;
+        };
         let last = self.session_list.len(); // rows = sessions + the new-session row
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
@@ -581,7 +646,9 @@ impl App {
 
     fn switch_to_session(&mut self, index: usize) {
         self.view = View::Chat;
-        let Some(session) = self.session_list.get(index).cloned() else { return };
+        let Some(session) = self.session_list.get(index).cloned() else {
+            return;
+        };
         if session.id == self.session_id {
             return;
         }
@@ -648,7 +715,9 @@ impl App {
                 // Enter accepts only when it would change the input; a
                 // fully typed command or path submits as usual.
                 KeyCode::Enter
-                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
                 {
                     if self.completion_changes_input() {
                         self.accept_completion();
@@ -662,7 +731,9 @@ impl App {
         match key.code {
             KeyCode::Esc => self.cancel_turn(),
             KeyCode::Enter
-                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
             {
                 self.input.insert_newline();
             }
@@ -696,8 +767,7 @@ impl App {
     fn refresh_completion(&mut self) {
         let (row, col) = self.input.cursor();
         let line = self.input.lines().get(row).cloned().unwrap_or_default();
-        let stage_names: Vec<String> =
-            self.config.stages.iter().map(|s| s.name.clone()).collect();
+        let stage_names: Vec<String> = self.config.stages.iter().map(|s| s.name.clone()).collect();
         let model_names: Vec<String> = self.config.models.keys().cloned().collect();
         let workflow_names: Vec<String> = self.config.workflows.keys().cloned().collect();
         self.completion = completion::compute(
@@ -713,11 +783,17 @@ impl App {
 
     /// Whether applying the selected completion would alter the input.
     fn completion_changes_input(&self) -> bool {
-        let Some(state) = &self.completion else { return false };
+        let Some(state) = &self.completion else {
+            return false;
+        };
         let item = &state.items[state.selected];
         let (row, col) = self.input.cursor();
-        let line: Vec<char> =
-            self.input.lines().get(row).map(|l| l.chars().collect()).unwrap_or_default();
+        let line: Vec<char> = self
+            .input
+            .lines()
+            .get(row)
+            .map(|l| l.chars().collect())
+            .unwrap_or_default();
         let from = state.replace_from.min(line.len());
         let replaced: String = line[from..col.min(line.len())].iter().collect();
         replaced != item.insert
@@ -726,11 +802,15 @@ impl App {
     /// Splice the selected completion into the input, then recompute (so
     /// accepting a directory descends into it).
     fn accept_completion(&mut self) {
-        let Some(state) = &self.completion else { return };
+        let Some(state) = &self.completion else {
+            return;
+        };
         let item = state.items[state.selected].clone();
         let (row, col) = self.input.cursor();
         let mut lines: Vec<String> = self.input.lines().to_vec();
-        let Some(line) = lines.get(row).cloned() else { return };
+        let Some(line) = lines.get(row).cloned() else {
+            return;
+        };
         let chars: Vec<char> = line.chars().collect();
         let from = state.replace_from.min(chars.len());
         let before: String = chars[..from].iter().collect();
@@ -791,7 +871,9 @@ impl App {
             return self.restore_diff(index);
         }
         let visible = self.visible_diffs().len();
-        let View::Diffs { selected, scroll } = &mut self.view else { return };
+        let View::Diffs { selected, scroll } = &mut self.view else {
+            return;
+        };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::Chat,
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
@@ -869,8 +951,10 @@ impl App {
                 });
             }
             View::Chat => {
-                self.view =
-                    View::Diffs { selected: self.visible_diffs().len() - 1, scroll: 0 };
+                self.view = View::Diffs {
+                    selected: self.visible_diffs().len() - 1,
+                    scroll: 0,
+                };
             }
         }
     }
@@ -1005,14 +1089,14 @@ impl App {
             }
             "compact" => self.start_compact(),
             "usage" => {
-                let lines = usage_stats::report_lines();
+                let lines = self.usage.report_lines();
                 if lines.is_empty() {
                     self.info("no model requests completed yet");
                     return;
                 }
                 let (context, _) = self.context_status();
                 self.info(format!(
-                    "token usage since launch:\n  {}\n  {context}",
+                    "model usage since this TUI started:\n  {}\n  {context}",
                     lines.join("\n  "),
                 ));
             }
@@ -1033,14 +1117,17 @@ impl App {
     fn switch_model(&mut self, name: &str) {
         match name {
             "" => {
-                let available: Vec<&str> =
-                    self.config.models.keys().map(String::as_str).collect();
+                let available: Vec<&str> = self.config.models.keys().map(String::as_str).collect();
                 self.info(format!(
                     "model: `{}`{} (stage default `{}`)\n\
                      available: {}\n\
                      usage: /model <name> · /model default",
                     self.active_model(),
-                    if self.model_override.is_some() { " (override)" } else { "" },
+                    if self.model_override.is_some() {
+                        " (override)"
+                    } else {
+                        ""
+                    },
                     self.stage().model,
                     available.join(", "),
                 ));
@@ -1059,8 +1146,7 @@ impl App {
                 ));
             }
             _ => {
-                let available: Vec<&str> =
-                    self.config.models.keys().map(String::as_str).collect();
+                let available: Vec<&str> = self.config.models.keys().map(String::as_str).collect();
                 self.error(format!(
                     "no model named `{name}` — available: {}",
                     available.join(", ")
@@ -1094,7 +1180,9 @@ impl App {
                 if let Some(model) = &self.model_override
                     && !self.config.models.contains_key(model)
                 {
-                    self.info(format!("model override `{model}` no longer exists — cleared"));
+                    self.info(format!(
+                        "model override `{model}` no longer exists — cleared"
+                    ));
                     self.model_override = None;
                 }
                 self.refresh_tool_count();
@@ -1158,9 +1246,11 @@ impl App {
 
     fn switch_stage(&mut self, name: &str) {
         if name.is_empty() {
-            let names: Vec<&str> =
-                self.config.stages.iter().map(|s| s.name.as_str()).collect();
-            self.info(format!("usage: /stage <name> — available: {}", names.join(", ")));
+            let names: Vec<&str> = self.config.stages.iter().map(|s| s.name.as_str()).collect();
+            self.info(format!(
+                "usage: /stage <name> — available: {}",
+                names.join(", ")
+            ));
             return;
         }
         match self.config.stages.iter().position(|s| s.name == name) {
@@ -1189,28 +1279,28 @@ impl App {
             stage.temperature,
             stage.max_tokens,
             &self.http,
+            &self.usage,
         ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
         };
-        let system = match stage.resolve_system_prompt(&self.config.base_dir).and_then(
-            |system| {
+        let system = match stage
+            .resolve_system_prompt(&self.config.base_dir)
+            .and_then(|system| {
                 crate::skills::compose_system(
                     &config,
                     &format!("stage `{}`", stage.name),
                     system,
                     &stage.skills,
                 )
-            },
-        ) {
+            }) {
             Ok(system) => system,
             Err(e) => return self.error(format!("{e:#}")),
         };
-        let stage_tools =
-            match assemble_tools(&stage.tool_profile(), &self.config, &self.mcp, 0) {
-                Ok(tools) => tools,
-                Err(e) => return self.error(format!("{e:#}")),
-            };
+        let stage_tools = match assemble_tools(&stage.tool_profile(), &self.config, &self.mcp, 0) {
+            Ok(tools) => tools,
+            Err(e) => return self.error(format!("{e:#}")),
+        };
         self.tool_count = stage_tools.len();
 
         let definitions: Vec<ToolDefinition> =
@@ -1219,7 +1309,9 @@ impl App {
             .into_iter()
             .map(|t| (t.definition.name, (t.binding, t.effects)))
             .collect();
-        let max_turns = stage.max_turns.unwrap_or(self.config.settings.default_max_turns);
+        let max_turns = stage
+            .max_turns
+            .unwrap_or(self.config.settings.default_max_turns);
 
         self.steer_queue.lock().unwrap().clear();
         self.steered_this_turn.clear();
@@ -1230,6 +1322,7 @@ impl App {
             Arc::clone(&self.config),
             Arc::clone(&self.mcp),
             self.http.clone(),
+            self.usage.clone(),
             system,
             self.history.clone(),
             max_turns,
@@ -1254,8 +1347,7 @@ impl App {
         if self.is_running() {
             return self.error("busy — wait for the current turn to finish (Esc cancels)");
         }
-        let workflow_names: Vec<&str> =
-            self.config.workflows.keys().map(String::as_str).collect();
+        let workflow_names: Vec<&str> = self.config.workflows.keys().map(String::as_str).collect();
         let Some((workflow, task)) = parse_run(arg, &workflow_names) else {
             return self.info(format!(
                 "usage: /run [workflow] <task>{}",
@@ -1332,12 +1424,15 @@ impl App {
             stage.temperature,
             stage.max_tokens,
             &self.http,
+            &self.usage,
         ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
         };
         let mut request = self.history.clone();
-        request.push(Message::User { content: COMPACT_INSTRUCTION.to_string() });
+        request.push(Message::User {
+            content: COMPACT_INSTRUCTION.to_string(),
+        });
         let tx = self.tx.clone();
         self.compacting = true;
         self.turn = Some(tokio::spawn(async move {
@@ -1356,7 +1451,8 @@ impl App {
         let partial = std::mem::take(&mut self.stream_buffer);
         let partial = partial.trim_end();
         if !partial.is_empty() {
-            self.transcript.push(TranscriptItem::Assistant(partial.to_string()));
+            self.transcript
+                .push(TranscriptItem::Assistant(partial.to_string()));
         }
     }
 
@@ -1408,7 +1504,9 @@ impl App {
         if self.is_running() {
             return self.error("cannot restore while a turn is running (Esc to cancel it first)");
         }
-        let Some(entry) = self.diffs.get(index).cloned() else { return };
+        let Some(entry) = self.diffs.get(index).cloned() else {
+            return;
+        };
         match diff::restore(&entry) {
             Ok(Some(reverse)) => {
                 self.info(format!(
@@ -1474,11 +1572,16 @@ impl App {
                  stores the abandoned one automatically",
             );
         }
-        self.view = View::Branches { selected: 0, scroll: 0 };
+        self.view = View::Branches {
+            selected: 0,
+            scroll: 0,
+        };
     }
 
     fn on_branches_key(&mut self, key: KeyEvent) {
-        let View::Branches { selected, .. } = &mut self.view else { return };
+        let View::Branches { selected, .. } = &mut self.view else {
+            return;
+        };
         let current = *selected;
         let last = self.branches.len().saturating_sub(1);
         match key.code {
@@ -1501,14 +1604,19 @@ impl App {
         if self.is_running() {
             return self.error("finish or cancel the running turn before switching branches");
         }
-        let Some(branch) = self.branches.get_mut(index) else { return };
+        let Some(branch) = self.branches.get_mut(index) else {
+            return;
+        };
         std::mem::swap(&mut branch.transcript, &mut self.transcript);
         std::mem::swap(&mut branch.history, &mut self.history);
         std::mem::swap(&mut branch.checkpoints, &mut self.checkpoints);
         // Each line keeps its own /clear baselines. The diff log is shared
         // and append-only, so a stored diff baseline stays valid; clamp
         // anyway in case the branch predates baseline tracking.
-        std::mem::swap(&mut branch.transcript_baseline, &mut self.transcript_baseline);
+        std::mem::swap(
+            &mut branch.transcript_baseline,
+            &mut self.transcript_baseline,
+        );
         std::mem::swap(&mut branch.diff_baseline, &mut self.diff_baseline);
         self.transcript_baseline = self.transcript_baseline.min(self.transcript.len());
         self.diff_baseline = self.diff_baseline.min(self.diffs.len());
@@ -1528,7 +1636,11 @@ impl App {
             return;
         }
         let branch = self.branches.remove(index);
-        self.info(format!("deleted branch `{}` ({})", branch.name, branch.title()));
+        self.info(format!(
+            "deleted branch `{}` ({})",
+            branch.name,
+            branch.title()
+        ));
         if self.branches.is_empty() {
             self.view = View::Chat;
         }
@@ -1546,11 +1658,16 @@ impl App {
                 "nothing to rewind — no checkpoints this session and no restorable file changes",
             );
         }
-        self.view = View::Rewind { selected: 0, scroll: 0 };
+        self.view = View::Rewind {
+            selected: 0,
+            scroll: 0,
+        };
     }
 
     fn on_rewind_key(&mut self, key: KeyEvent) {
-        let View::Rewind { selected, .. } = &mut self.view else { return };
+        let View::Rewind { selected, .. } = &mut self.view else {
+            return;
+        };
         let current = *selected;
         let last = self.checkpoints.len(); // rows = checkpoints + session-start row
         let select = |view: &mut View, index: usize| {
@@ -1589,7 +1706,11 @@ impl App {
                 Some(checkpoint) => *checkpoint,
                 None => return,
             },
-            None => Checkpoint { transcript_index: 0, history_len: 0, diff_len: 0 },
+            None => Checkpoint {
+                transcript_index: 0,
+                history_len: 0,
+                diff_len: 0,
+            },
         };
 
         // Files first: undo everything recorded at or after the checkpoint.
@@ -1653,7 +1774,11 @@ impl App {
                 Some(name) => format!(" — the abandoned line is saved as branch `{name}`"),
                 None => String::new(),
             },
-            if message.is_some() { " (the message is back in the input)" } else { "" },
+            if message.is_some() {
+                " (the message is back in the input)"
+            } else {
+                ""
+            },
         ));
         self.persist();
     }
@@ -1715,7 +1840,8 @@ impl App {
                 // Content streamed before a tool call is commentary the
                 // final answer won't repeat — keep it.
                 self.flush_stream_buffer();
-                self.transcript.push(TranscriptItem::ToolCall { name, args });
+                self.transcript
+                    .push(TranscriptItem::ToolCall { name, args });
             }
             AgentEvent::ToolDone { preview } => {
                 self.transcript.push(TranscriptItem::ToolDone { preview });
@@ -1725,7 +1851,11 @@ impl App {
                 self.diffs.push(entry);
             }
             AgentEvent::Notice(text) => self.info(text),
-            AgentEvent::Turn { history, text, usage } => {
+            AgentEvent::Turn {
+                history,
+                text,
+                usage,
+            } => {
                 // The buffer holds the same text that just streamed; the
                 // final Turn event is authoritative.
                 self.stream_buffer.clear();
@@ -1739,8 +1869,7 @@ impl App {
                 self.turn = None;
                 // Steered messages the worker never got to (the reply had no
                 // further tool rounds) become the next turn immediately.
-                let leftovers: Vec<String> =
-                    self.steer_queue.lock().unwrap().drain(..).collect();
+                let leftovers: Vec<String> = self.steer_queue.lock().unwrap().drain(..).collect();
                 self.steered_this_turn.clear();
                 if leftovers.is_empty() {
                     self.maybe_auto_compact();
@@ -1783,9 +1912,18 @@ impl App {
                 self.flush_stream_buffer();
                 self.info(format!("── stage {stage} (run {run}) ──"));
             }
-            AgentEvent::WorkflowDone { workflow, task, result } => {
+            AgentEvent::WorkflowDone {
+                workflow,
+                task,
+                result,
+                usage,
+            } => {
                 self.turn = None;
                 self.workflow_running = None;
+                self.pending_approval = None;
+                if !usage.is_empty() {
+                    self.info(format!("workflow usage:\n  {}", usage.join("\n  ")));
+                }
                 match result {
                     Ok(output) => {
                         // The buffer holds the final stage's streamed text;
@@ -1869,6 +2007,10 @@ async fn workflow_worker(
     task: String,
     tx: UnboundedSender<AgentEvent>,
 ) {
+    let usage = UsageTracker::new(
+        config.settings.run_limits(),
+        crate::model::UsageSnapshot::default(),
+    );
     let delta_tx = tx.clone();
     let on_delta = move |fragment: &str| {
         let _ = delta_tx.send(AgentEvent::Delta(fragment.to_string()));
@@ -1881,10 +2023,13 @@ async fn workflow_worker(
         workflow: workflow.clone(),
         task: task.clone(),
         result,
+        usage: usage.report_lines(),
     };
 
-    let stage_names: Vec<&str> =
-        order.iter().map(|&i| config.stages[i].name.as_str()).collect();
+    let stage_names: Vec<&str> = order
+        .iter()
+        .map(|&i| config.stages[i].name.as_str())
+        .collect();
     let mut context = crate::stage::PipelineContext::new(&task);
     let mut position = 0usize;
     let mut runs = 0u32;
@@ -1901,7 +2046,10 @@ async fn workflow_worker(
             ))));
             return;
         }
-        let _ = tx.send(AgentEvent::StageStart { stage: stage.name.clone(), run: runs });
+        let _ = tx.send(AgentEvent::StageStart {
+            stage: stage.name.clone(),
+            run: runs,
+        });
 
         let is_first = context.previous.is_none();
         let reprompt_targets: Vec<String> = stage
@@ -1910,26 +2058,29 @@ async fn workflow_worker(
             .filter(|t| stage_names.contains(&t.as_str()))
             .cloned()
             .collect();
-        match crate::stage::run_stage(
+        let stage_run = crate::stage::run_stage(
             &config,
             stage,
             is_first,
             &context,
             &mcp,
             &http,
+            &usage,
             &reprompt_targets,
             Some(&on_delta),
             Some(&on_diff),
             &approvals,
-        )
-        .await
-        {
+        );
+        match usage.within_time(stage_run).await {
             Ok(crate::stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
                 last_output = output;
                 position += 1;
             }
-            Ok(crate::stage::StageOutcome::Reprompt { target, instructions }) => {
+            Ok(crate::stage::StageOutcome::Reprompt {
+                target,
+                instructions,
+            }) => {
                 let _ = tx.send(AgentEvent::Notice(format!(
                     "↩ {} reprompts {}: {instructions}",
                     stage.name, target
@@ -1959,6 +2110,7 @@ async fn turn_worker(
     config: Arc<Config>,
     mcp: Arc<McpManager>,
     http: reqwest::Client,
+    usage: UsageTracker,
     system: Option<String>,
     mut history: Vec<Message>,
     max_turns: u32,
@@ -1976,11 +2128,16 @@ async fn turn_worker(
     for _ in 0..max_turns {
         let mut request = Vec::with_capacity(history.len() + 1);
         if let Some(system) = &system {
-            request.push(Message::System { content: system.clone() });
+            request.push(Message::System {
+                content: system.clone(),
+            });
         }
         request.extend(history.iter().cloned());
 
-        let reply = match client.complete_streamed(&request, &definitions, Some(&on_delta)).await {
+        let reply = match client
+            .complete_streamed(&request, &definitions, Some(&on_delta))
+            .await
+        {
             Ok(reply) => reply,
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
@@ -1990,15 +2147,21 @@ async fn turn_worker(
 
         if reply.tool_calls.is_empty() {
             let text = reply.content.clone().unwrap_or_default();
-            history.push(Message::Assistant { content: reply.content, tool_calls: None });
-            let _ = tx.send(AgentEvent::Turn { history, text, usage: reply.usage });
+            history.push(Message::Assistant {
+                content: reply.content,
+                tool_calls: None,
+            });
+            let _ = tx.send(AgentEvent::Turn {
+                history,
+                text,
+                usage: reply.usage,
+            });
             return;
         }
 
         // Mid-turn context pressure: truncate older tool results in the
         // history before the next request.
-        if let Some((used, capacity)) =
-            context_pressure(&config, &model_name, reply.usage.as_ref())
+        if let Some((used, capacity)) = context_pressure(&config, &model_name, reply.usage.as_ref())
         {
             let trimmed = shed_context(&mut history, 2);
             if trimmed > 0 {
@@ -2021,11 +2184,7 @@ async fn turn_worker(
         if crate::stage::parallel_round(config.settings.parallel_tools, &calls, |name| {
             bindings.get(name).map(|(_, effects)| {
                 effects.parallel_safe()
-                    && !CallPolicy::approval_required(
-                        require_approval,
-                        &approval_effects,
-                        *effects,
-                    )
+                    && !CallPolicy::approval_required(require_approval, &approval_effects, *effects)
             })
         }) {
             for call in &calls {
@@ -2044,6 +2203,7 @@ async fn turn_worker(
                     &approvals,
                     *effects,
                 );
+                let usage = usage.clone();
                 async move {
                     match dispatch_tool_call(
                         binding,
@@ -2051,6 +2211,7 @@ async fn turn_worker(
                         config,
                         mcp,
                         http,
+                        &usage,
                         0,
                         &policy,
                     )
@@ -2063,8 +2224,13 @@ async fn turn_worker(
             }))
             .await;
             for (call, output) in calls.iter().zip(outputs) {
-                let preview: String =
-                    output.lines().next().unwrap_or("").chars().take(100).collect();
+                let preview: String = output
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(100)
+                    .collect();
                 let _ = tx.send(AgentEvent::ToolDone { preview });
                 history.push(Message::Tool {
                     content: output,
@@ -2116,6 +2282,7 @@ async fn turn_worker(
                         &config,
                         &mcp,
                         &http,
+                        &usage,
                         0,
                         &policy,
                     )
@@ -2140,7 +2307,10 @@ async fn turn_worker(
                 .take(100)
                 .collect();
             let _ = tx.send(AgentEvent::ToolDone { preview });
-            history.push(Message::Tool { content: output, tool_call_id: call.id });
+            history.push(Message::Tool {
+                content: output,
+                tool_call_id: call.id,
+            });
         }
 
         // Steering: deliver messages the user typed during this round before
@@ -2210,9 +2380,12 @@ mod tests {
     fn clear_hides_but_preserves_conversation_and_diffs() {
         let mut app = test_app();
         let greeting_len = app.transcript.len();
-        app.history.push(Message::User { content: "hi".to_string() });
+        app.history.push(Message::User {
+            content: "hi".to_string(),
+        });
         app.transcript.push(TranscriptItem::User("hi".to_string()));
-        app.transcript.push(TranscriptItem::Assistant("hello".to_string()));
+        app.transcript
+            .push(TranscriptItem::Assistant("hello".to_string()));
         app.diffs.push(entry("a.rs"));
         app.checkpoints.push(Checkpoint {
             transcript_index: greeting_len,
@@ -2228,8 +2401,10 @@ mod tests {
         assert_eq!(app.transcript.len(), greeting_len + 3); // + divider
         assert_eq!(app.diffs.len(), 1);
         // The UI sees only the divider, and no diffs.
-        assert!(matches!(app.visible_transcript(), [TranscriptItem::Cleared(text)]
-            if text.contains("1 earlier diff(s) hidden")));
+        assert!(
+            matches!(app.visible_transcript(), [TranscriptItem::Cleared(text)]
+            if text.contains("1 earlier diff(s) hidden"))
+        );
         assert!(app.visible_diffs().is_empty());
 
         // Post-clear activity is visible; the diff count starts fresh.
@@ -2256,7 +2431,10 @@ mod tests {
         assert_eq!(app.transcript_baseline, 0);
         assert_eq!(app.diff_baseline, 0);
         // Conversation truncated (only the rewind notice remains)…
-        assert!(matches!(app.transcript.as_slice(), [TranscriptItem::Info(_)]));
+        assert!(matches!(
+            app.transcript.as_slice(),
+            [TranscriptItem::Info(_)]
+        ));
         assert_eq!(app.diffs.len(), 1); // …but the diff log survives
     }
 
@@ -2264,11 +2442,20 @@ mod tests {
     fn parse_run_splits_workflow_and_task() {
         let workflows = ["default", "quickfix"];
         // First word naming a workflow selects it; the rest is the task.
-        assert_eq!(parse_run("quickfix fix the bug", &workflows), Some((Some("quickfix"), "fix the bug")));
+        assert_eq!(
+            parse_run("quickfix fix the bug", &workflows),
+            Some((Some("quickfix"), "fix the bug"))
+        );
         // Otherwise the whole argument is the task for the default workflow.
-        assert_eq!(parse_run("fix the bug", &workflows), Some((None, "fix the bug")));
+        assert_eq!(
+            parse_run("fix the bug", &workflows),
+            Some((None, "fix the bug"))
+        );
         // A task that merely starts with a workflow-like word still works.
-        assert_eq!(parse_run("quickfixes are bad", &workflows), Some((None, "quickfixes are bad")));
+        assert_eq!(
+            parse_run("quickfixes are bad", &workflows),
+            Some((None, "quickfixes are bad"))
+        );
         // No task → no run.
         assert_eq!(parse_run("", &workflows), None);
         assert_eq!(parse_run("   ", &workflows), None);
@@ -2279,11 +2466,17 @@ mod tests {
     #[test]
     fn workflow_done_joins_the_conversation() {
         let mut app = test_app();
-        app.transcript.push(TranscriptItem::User("do the thing".to_string()));
+        app.transcript
+            .push(TranscriptItem::User("do the thing".to_string()));
 
-        app.on_agent_event(AgentEvent::StageStart { stage: "s".to_string(), run: 1 });
-        assert!(matches!(app.transcript.last(), Some(TranscriptItem::Info(text))
-            if text.contains("stage s")));
+        app.on_agent_event(AgentEvent::StageStart {
+            stage: "s".to_string(),
+            run: 1,
+        });
+        assert!(
+            matches!(app.transcript.last(), Some(TranscriptItem::Info(text))
+            if text.contains("stage s"))
+        );
 
         app.workflow_running = Some("default".to_string());
         app.stream_buffer = "the final answer".to_string(); // streamed copy
@@ -2291,6 +2484,7 @@ mod tests {
             workflow: "default".to_string(),
             task: "do the thing (expanded)".to_string(),
             result: Ok("the final answer".to_string()),
+            usage: Vec::new(),
         });
 
         // The exchange landed in the model history (expanded task, output),
@@ -2315,16 +2509,20 @@ mod tests {
             workflow: "default".to_string(),
             task: "again".to_string(),
             result: Err("stage `s` blew up".to_string()),
+            usage: Vec::new(),
         });
         assert_eq!(app.history.len(), 2);
-        assert!(matches!(app.transcript.last(), Some(TranscriptItem::Error(text))
-            if text.contains("blew up")));
+        assert!(
+            matches!(app.transcript.last(), Some(TranscriptItem::Error(text))
+            if text.contains("blew up"))
+        );
     }
 
     #[test]
     fn branches_carry_their_own_clear_baselines() {
         let mut app = test_app();
-        app.transcript.push(TranscriptItem::User("first line".to_string()));
+        app.transcript
+            .push(TranscriptItem::User("first line".to_string()));
         app.run_command("clear");
         let cleared_baseline = app.transcript_baseline;
         assert!(cleared_baseline > 0);

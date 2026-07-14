@@ -160,7 +160,10 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|f| f.display().to_string())
                     .collect();
-                println!("project instructions: none (searched for {})", candidates.join(", "));
+                println!(
+                    "project instructions: none (searched for {})",
+                    candidates.join(", ")
+                );
             }
             for context in &config.project_contexts {
                 println!(
@@ -184,7 +187,11 @@ async fn main() -> Result<()> {
                     stage.model,
                     mode,
                     stage.mcp.join(", "),
-                    if stage.web_search { "  +web_search" } else { "" },
+                    if stage.web_search {
+                        "  +web_search"
+                    } else {
+                        ""
+                    },
                     if stage.skills.is_empty() {
                         String::new()
                     } else {
@@ -220,7 +227,10 @@ async fn main() -> Result<()> {
                 let dirs = skills::skills_dirs(&config);
                 println!(
                     "no skills found (searched: {})",
-                    dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ")
+                    dirs.iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 return Ok(());
             }
@@ -228,7 +238,11 @@ async fn main() -> Result<()> {
                 println!(
                     "{}  {}  ({})",
                     skill.name,
-                    if skill.description.is_empty() { "-" } else { &skill.description },
+                    if skill.description.is_empty() {
+                        "-"
+                    } else {
+                        &skill.description
+                    },
                     skill.path.display()
                 );
             }
@@ -240,18 +254,32 @@ async fn main() -> Result<()> {
                 let connection = manager.get(name).expect("connected above");
                 println!("[{name}]");
                 for tool in &connection.tools {
-                    let marker = if connection.is_read_only(tool) { "ro" } else { "rw" };
+                    let marker = if connection.is_read_only(tool) {
+                        "ro"
+                    } else {
+                        "rw"
+                    };
                     println!(
                         "  {} ({marker})  {}",
                         tool.name,
-                        tool.description.as_deref().unwrap_or("").lines().next().unwrap_or("")
+                        tool.description
+                            .as_deref()
+                            .unwrap_or("")
+                            .lines()
+                            .next()
+                            .unwrap_or("")
                     );
                 }
             }
             manager.shutdown().await;
             Ok(())
         }
-        Command::Run { task, stage, workflow, resume } => {
+        Command::Run {
+            task,
+            stage,
+            workflow,
+            resume,
+        } => {
             if let Some(resume) = resume {
                 if !task.is_empty() || stage.is_some() || workflow.is_some() {
                     bail!(
@@ -299,23 +327,47 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             for state in states {
-                let title: String = state.task.lines().next().unwrap_or("").chars().take(60).collect();
+                let title: String = state
+                    .task
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
                 println!(
                     "{}  {}  next stage {}/{} [{}]  {}  ({})",
                     state.id,
                     tui::store::format_epoch(state.updated_at),
                     state.position + 1,
                     state.stage_names.len(),
-                    state.stage_names.get(state.position).map_or("?", |s| s.as_str()),
+                    state
+                        .stage_names
+                        .get(state.position)
+                        .map_or("?", |s| s.as_str()),
                     title,
-                    if state.cwd.is_empty() { "unknown dir" } else { &state.cwd },
+                    if state.cwd.is_empty() {
+                        "unknown dir"
+                    } else {
+                        &state.cwd
+                    },
                 );
             }
             Ok(())
         }
-        Command::Chat { stage, no_mouse, resume } => {
-            tui::run(config, cli.config.clone(), stage.as_deref(), !no_mouse, resume.as_deref())
-                .await
+        Command::Chat {
+            stage,
+            no_mouse,
+            resume,
+        } => {
+            tui::run(
+                config,
+                cli.config.clone(),
+                stage.as_deref(),
+                !no_mouse,
+                resume.as_deref(),
+            )
+            .await
         }
         Command::Reflect { dry_run, model } => {
             reflect::run(&config, model.as_deref(), dry_run).await
@@ -333,7 +385,11 @@ async fn main() -> Result<()> {
                     tui::store::format_epoch(session.updated_at),
                     session.stage,
                     session.title,
-                    if session.cwd.is_empty() { "unknown dir" } else { &session.cwd },
+                    if session.cwd.is_empty() {
+                        "unknown dir"
+                    } else {
+                        &session.cwd
+                    },
                 );
             }
             Ok(())
@@ -357,7 +413,10 @@ fn terminal_approvals() -> std::sync::Arc<approval::Approvals> {
             if !request.detail.is_empty() && request.detail != request.descriptor {
                 eprintln!("  {}", request.detail);
             }
-            eprint!("  [y] once · [a] always ({}) · [N] deny > ", request.always_pattern);
+            eprint!(
+                "  [y] once · [a] always ({}) · [N] deny > ",
+                request.always_pattern
+            );
             let _ = std::io::stderr().flush();
             let decision = match lines.next_line().await {
                 Ok(Some(line)) => match line.trim().to_lowercase().as_str() {
@@ -402,6 +461,10 @@ async fn run_pipeline(
 
     // Single-stage mode: one run, no reprompting.
     if let Some(name) = only_stage {
+        let usage = model::UsageTracker::new(
+            config.settings.run_limits(),
+            model::UsageSnapshot::default(),
+        );
         let stage = config
             .stages
             .iter()
@@ -413,7 +476,16 @@ async fn run_pipeline(
             .cloned()
             .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
             .collect();
-        let manager = McpManager::connect(servers, config, false).await?;
+        let manager = match usage
+            .within_time(McpManager::connect(servers, config, false))
+            .await
+        {
+            Ok(manager) => manager,
+            Err(error) => {
+                print_usage_summary(&usage);
+                return Err(error);
+            }
+        };
         let approvals = terminal_approvals();
         let context = stage::PipelineContext::new(task);
         eprintln!("── stage {} ──", stage.name);
@@ -424,14 +496,15 @@ async fn run_pipeline(
             &context,
             &manager,
             &http,
+            &usage,
             &[],
             Some(&stream_to_stderr),
             None,
             &approvals,
-        )
-        .await;
+        );
+        let result = usage.within_time(result).await;
         manager.shutdown().await;
-        print_usage_summary();
+        print_usage_summary(&usage);
         return match result? {
             stage::StageOutcome::Final(output) => {
                 eprintln!();
@@ -447,8 +520,10 @@ async fn run_pipeline(
     if order.is_empty() {
         bail!("nothing to run: the selected workflow is empty");
     }
-    let stage_names: Vec<String> =
-        order.iter().map(|&i| config.stages[i].name.clone()).collect();
+    let stage_names: Vec<String> = order
+        .iter()
+        .map(|&i| config.stages[i].name.clone())
+        .collect();
     let state = runs::RunState::new(task, stage_names);
     run_workflow(config, &http, order, state).await
 }
@@ -467,12 +542,22 @@ async fn resume_pipeline(config: &Config, state: runs::RunState) -> Result<()> {
         .stage_names
         .iter()
         .map(|name| {
-            config.stages.iter().position(|s| s.name == *name).with_context(|| {
-                format!("run {} uses stage `{name}`, which is no longer configured", state.id)
-            })
+            config
+                .stages
+                .iter()
+                .position(|s| s.name == *name)
+                .with_context(|| {
+                    format!(
+                        "run {} uses stage `{name}`, which is no longer configured",
+                        state.id
+                    )
+                })
         })
         .collect::<Result<_>>()?;
-    let next = state.stage_names.get(state.position).map_or("?", |s| s.as_str());
+    let next = state
+        .stage_names
+        .get(state.position)
+        .map_or("?", |s| s.as_str());
     eprintln!(
         "resuming run {} ({} of {} stage(s) done, {} run(s) used) at stage {next}",
         state.id,
@@ -492,17 +577,35 @@ async fn run_workflow(
     order: Vec<usize>,
     mut state: runs::RunState,
 ) -> Result<()> {
+    let usage = model::UsageTracker::new(config.settings.run_limits(), state.usage.clone());
     // Agents can be reached from any stage, so connect their servers too.
     let needed_servers: Vec<String> = order
         .iter()
         .flat_map(|&i| config.stages[i].mcp.iter().cloned())
         .chain(config.agents.values().flat_map(|a| a.mcp.iter().cloned()))
         .collect();
-    let manager = McpManager::connect(needed_servers, config, false).await?;
+    let manager = match usage
+        .within_time(McpManager::connect(needed_servers, config, false))
+        .await
+    {
+        Ok(manager) => manager,
+        Err(error) => {
+            state.usage = usage.snapshot();
+            state.updated_at = tui::store::now_epoch();
+            if let Err(save_error) = runs::save_run(&state) {
+                eprintln!("⚠ cannot write run checkpoint: {save_error:#}");
+            }
+            eprintln!("✗ run interrupted — continue it with `soa run --resume`");
+            print_usage_summary(&usage);
+            return Err(error);
+        }
+    };
     let approvals = terminal_approvals();
 
-    let workflow_stage_names: Vec<&str> =
-        order.iter().map(|&i| config.stages[i].name.as_str()).collect();
+    let workflow_stage_names: Vec<&str> = order
+        .iter()
+        .map(|&i| config.stages[i].name.as_str())
+        .collect();
 
     let mut context = stage::PipelineContext {
         input: state.task.clone(),
@@ -515,7 +618,7 @@ async fn run_workflow(
 
     // Checkpoint the fresh run too, so a crash inside the first stage
     // still leaves the task resumable.
-    checkpoint(&mut state, position, runs, &context);
+    checkpoint(&mut state, position, runs, &context, &usage);
 
     let mut result = Ok(());
     while position < order.len() {
@@ -539,29 +642,32 @@ async fn run_workflow(
             .filter(|t| workflow_stage_names.contains(&t.as_str()))
             .cloned()
             .collect();
-        match stage::run_stage(
+        let stage_run = stage::run_stage(
             config,
             stage,
             is_first,
             &context,
             &manager,
             http,
+            &usage,
             &reprompt_targets,
             Some(&stream_to_stderr),
             None,
             &approvals,
-        )
-        .await
-        {
+        );
+        match usage.within_time(stage_run).await {
             Ok(stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
                 position += 1;
-                checkpoint(&mut state, position, runs, &context);
+                checkpoint(&mut state, position, runs, &context, &usage);
                 // The output already streamed to stderr; just separate stages.
                 eprintln!("\n");
                 last_output = Some(output);
             }
-            Ok(stage::StageOutcome::Reprompt { target, instructions }) => {
+            Ok(stage::StageOutcome::Reprompt {
+                target,
+                instructions,
+            }) => {
                 eprintln!("↩ {} reprompts {}:", stage.name, target);
                 eprintln!("{instructions}\n");
                 // The handoff instructions become the sender's recorded
@@ -571,7 +677,7 @@ async fn run_workflow(
                     .iter()
                     .position(|name| *name == target)
                     .expect("reprompt targets are filtered to the active workflow");
-                checkpoint(&mut state, position, runs, &context);
+                checkpoint(&mut state, position, runs, &context, &usage);
             }
             Err(e) => {
                 result = Err(e);
@@ -586,10 +692,13 @@ async fn run_workflow(
                 eprintln!("⚠ cannot remove finished run checkpoint: {e:#}");
             }
         }
-        Err(_) => eprintln!("✗ run interrupted — continue it with `soa run --resume`"),
+        Err(_) => {
+            checkpoint(&mut state, position, runs, &context, &usage);
+            eprintln!("✗ run interrupted — continue it with `soa run --resume`");
+        }
     }
 
-    print_usage_summary();
+    print_usage_summary(&usage);
     if result.is_ok()
         && let Some(output) = last_output
     {
@@ -600,14 +709,13 @@ async fn run_workflow(
     result
 }
 
-/// Per-model token totals for this run, on stderr with the other progress
-/// output. Resumed runs only count the resumed portion.
-fn print_usage_summary() {
-    let lines = model::usage_stats::report_lines();
+/// Rich cumulative usage for this run, including the portion before resume.
+fn print_usage_summary(usage: &model::UsageTracker) {
+    let lines = usage.report_lines();
     if lines.is_empty() {
         return;
     }
-    eprintln!("── token usage ──");
+    eprintln!("── usage ──");
     for line in lines {
         eprintln!("{line}");
     }
@@ -621,11 +729,13 @@ fn checkpoint(
     position: usize,
     runs: u32,
     context: &stage::PipelineContext,
+    usage: &model::UsageTracker,
 ) {
     state.position = position;
     state.runs = runs;
     state.previous = context.previous.clone();
     state.outputs = context.outputs.clone();
+    state.usage = usage.snapshot();
     state.updated_at = tui::store::now_epoch();
     if let Err(e) = runs::save_run(state) {
         eprintln!("⚠ cannot write run checkpoint: {e:#}");

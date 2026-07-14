@@ -1,14 +1,14 @@
 //! Checkpoints for pipeline runs, enabling `soa run --resume`.
 //!
 //! A run's state is atomically written to `<data_dir>/runs/<id>.json` at
-//! stage boundaries and after every durable event inside an active stage.
-//! Resuming replays that event log and continues incomplete tool rounds;
-//! finished runs remove the checkpoint.
+//! stage boundaries, while active-stage events use an append-only JSONL
+//! sidecar. Resuming merges the two and continues incomplete tool rounds;
+//! finished runs remove both checkpoint files.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::model::UsageSnapshot;
@@ -17,6 +17,19 @@ use crate::tui::store;
 
 fn runs_dir() -> PathBuf {
     store::data_dir().join("runs")
+}
+
+fn event_log_path(id: &str) -> PathBuf {
+    runs_dir().join(format!("{id}.events.jsonl"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct StageEventRecord {
+    stage: String,
+    run: u32,
+    event: AgentLoopEvent,
+    usage: UsageSnapshot,
+    updated_at: u64,
 }
 
 /// Durable progress inside the currently executing stage. Events are
@@ -97,21 +110,105 @@ fn new_run_id() -> String {
 }
 
 pub fn save_run(state: &RunState) -> Result<()> {
-    let dir = runs_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = dir.join(format!("{}.json", state.id));
-    let temporary = dir.join(format!("{}.json.tmp", state.id));
-    let json = serde_json::to_string(state)?;
-    std::fs::write(&temporary, json)
-        .with_context(|| format!("cannot write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("cannot replace {}", path.display()))
+    let path = runs_dir().join(format!("{}.json", state.id));
+    crate::persistence::atomic_write(&path, &serde_json::to_vec(state)?)
+}
+
+/// Append one active-stage transition without rewriting the growing run
+/// document. The latest record also carries usage/time so budgets resume at
+/// the same point even if the process exits before the next stage boundary.
+pub fn append_stage_event(
+    id: &str,
+    stage: &str,
+    run: u32,
+    event: &AgentLoopEvent,
+    usage: UsageSnapshot,
+) -> Result<()> {
+    crate::persistence::append_json_line(
+        &event_log_path(id),
+        &StageEventRecord {
+            stage: stage.to_string(),
+            run,
+            event: event.clone(),
+            usage,
+            updated_at: store::now_epoch(),
+        },
+    )
+}
+
+pub fn clear_stage_events(id: &str) -> Result<()> {
+    match std::fs::remove_file(event_log_path(id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("cannot remove mid-stage event log"),
+    }
 }
 
 pub fn load_run(id: &str) -> Result<RunState> {
     let path = runs_dir().join(format!("{id}.json"));
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("no interrupted run `{id}` at {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("corrupt run file {}", path.display()))
+    load_run_path(&path).with_context(|| format!("no interrupted run `{id}` at {}", path.display()))
+}
+
+fn load_run_path(path: &std::path::Path) -> Result<RunState> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut state: RunState = serde_json::from_str(&raw)
+        .with_context(|| format!("corrupt run file {}", path.display()))?;
+    hydrate_stage_events(&mut state)?;
+    Ok(state)
+}
+
+fn hydrate_stage_events(state: &mut RunState) -> Result<()> {
+    let Some(progress) = state.active_stage.as_mut() else {
+        return Ok(());
+    };
+    let raw = match std::fs::read(event_log_path(&state.id)) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("cannot read mid-stage event log"),
+    };
+    let lines: Vec<&[u8]> = raw
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .collect();
+    let embedded_events = progress.events.len();
+    for (index, line) in lines.iter().enumerate() {
+        let record: StageEventRecord = match serde_json::from_slice(line) {
+            Ok(record) => record,
+            // A process can stop halfway through its final append. Earlier
+            // corruption is not safe to skip because it could hide a tool.
+            Err(error) if index + 1 == lines.len() => {
+                tracing::warn!(error = %error, "ignoring incomplete final run event");
+                break;
+            }
+            Err(error) => return Err(error).context("corrupt mid-stage event log"),
+        };
+        if record.stage != progress.stage || record.run != progress.run {
+            bail!(
+                "mid-stage event log belongs to `{}` run {}, but checkpoint expects `{}` run {}",
+                record.stage,
+                record.run,
+                progress.stage,
+                progress.run,
+            );
+        }
+        // Boundary/error snapshots may already contain a prefix of the
+        // append-only sidecar. Validate and skip that prefix so repeated
+        // interruptions never duplicate model or tool events on resume.
+        if index < embedded_events {
+            if record.event != progress.events[index] {
+                bail!(
+                    "mid-stage event log diverges from checkpoint at event {}",
+                    index + 1
+                );
+            }
+            continue;
+        }
+        progress.events.push(record.event);
+        state.usage = record.usage;
+        state.updated_at = state.updated_at.max(record.updated_at);
+    }
+    Ok(())
 }
 
 /// All interrupted runs, most recently updated first.
@@ -125,8 +222,7 @@ pub fn list_runs() -> Result<Vec<RunState>> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
-            && let Ok(raw) = std::fs::read_to_string(&path)
-            && let Ok(state) = serde_json::from_str::<RunState>(&raw)
+            && let Ok(state) = load_run_path(&path)
         {
             states.push(state);
         }
@@ -142,7 +238,8 @@ pub fn latest_run_for(cwd: &str) -> Result<Option<RunState>> {
 
 pub fn remove_run(id: &str) -> Result<()> {
     let path = runs_dir().join(format!("{id}.json"));
-    std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))
+    std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+    clear_stage_events(id)
 }
 
 #[cfg(test)]
@@ -185,26 +282,71 @@ mod tests {
                 ..Default::default()
             },
         );
+        let started = AgentLoopEvent::Started {
+            system: Some("stay focused".to_string()),
+            messages: vec![crate::model::Message::User {
+                content: "continue".to_string(),
+            }],
+        };
         state.active_stage = Some(StageProgress {
             stage: "b".to_string(),
             run: 1,
-            events: vec![AgentLoopEvent::Started {
-                system: Some("stay focused".to_string()),
-                messages: vec![crate::model::Message::User {
-                    content: "continue".to_string(),
-                }],
-            }],
+            events: Vec::new(),
         });
         save_run(&state).unwrap();
+        let mut event_usage = state.usage.clone();
+        event_usage.elapsed_ms = 2_345;
+        append_stage_event(&state.id, "b", 1, &started, state.usage.clone()).unwrap();
+        append_stage_event(
+            &state.id,
+            "b",
+            1,
+            &AgentLoopEvent::UserMessage {
+                content: "one more detail".to_string(),
+            },
+            event_usage,
+        )
+        .unwrap();
         let loaded = load_run(&state.id).unwrap();
         assert_eq!(loaded.position, 1);
         assert_eq!(loaded.previous.as_deref(), Some("a says hi"));
         assert_eq!(loaded.stage_names, vec!["a", "b"]);
-        assert_eq!(loaded.usage.elapsed_ms, 1_234);
+        assert_eq!(loaded.usage.elapsed_ms, 2_345);
         assert_eq!(loaded.usage.models["coder"].requests, 2);
         assert_eq!(loaded.active_stage.as_ref().unwrap().stage, "b");
-        assert_eq!(loaded.active_stage.as_ref().unwrap().events.len(), 1);
-        assert!(!runs_dir().join(format!("{}.json.tmp", state.id)).exists());
+        assert_eq!(loaded.active_stage.as_ref().unwrap().events.len(), 2);
+        assert!(!runs_dir().join(format!(".{}.json.tmp", state.id)).exists());
+
+        // Saving a hydrated active stage folds its event prefix into the
+        // snapshot without making the still-append-only sidecar replay it.
+        save_run(&loaded).unwrap();
+        assert_eq!(
+            load_run(&state.id)
+                .unwrap()
+                .active_stage
+                .unwrap()
+                .events
+                .len(),
+            2
+        );
+        let mut later_usage = loaded.usage.clone();
+        later_usage.elapsed_ms = 3_456;
+        append_stage_event(
+            &state.id,
+            "b",
+            1,
+            &AgentLoopEvent::UserMessage {
+                content: "after another interruption".to_string(),
+            },
+            later_usage,
+        )
+        .unwrap();
+        let resumed_again = load_run(&state.id).unwrap();
+        assert_eq!(
+            resumed_again.active_stage.as_ref().unwrap().events.len(),
+            3
+        );
+        assert_eq!(resumed_again.usage.elapsed_ms, 3_456);
 
         let mut legacy = serde_json::to_value(&loaded).unwrap();
         legacy.as_object_mut().unwrap().remove("usage");
@@ -223,6 +365,7 @@ mod tests {
         // Finished runs disappear.
         remove_run(&state.id).unwrap();
         assert!(load_run(&state.id).is_err());
+        assert!(!event_log_path(&state.id).exists());
         assert_eq!(list_runs().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -78,14 +78,29 @@ impl OpenAiChatCompletions {
             return Ok(result);
         }
 
-        // SSE: buffer complete lines so UTF-8 split across chunks remains intact.
+        // SSE framing is independent of HTTP chunk boundaries: one network
+        // chunk may contain many events, and one event (or UTF-8 sequence)
+        // may span many chunks.
         let mut accumulator = StreamAccumulator::default();
-        let mut buffer: Vec<u8> = Vec::new();
+        let mut decoder = SseDecoder::default();
         'stream: loop {
             let chunk = match response.chunk().await {
                 Ok(Some(chunk)) => chunk,
-                Ok(None) if accumulator.finished => break,
                 Ok(None) => {
+                    let events = decoder.finish().map_err(|error| {
+                        AdapterError::fatal(
+                            anyhow::Error::new(error)
+                                .context(format!("invalid UTF-8 in stream from {url}")),
+                        )
+                    })?;
+                    for event in events {
+                        if apply_sse_event(event, &mut accumulator, on_delta, &url)? {
+                            break 'stream;
+                        }
+                    }
+                    if accumulator.finished {
+                        break;
+                    }
                     return Err(AdapterError::transient(anyhow!(
                         "stream from {url} ended before the generation finished"
                     )));
@@ -97,34 +112,192 @@ impl OpenAiChatCompletions {
                     ));
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(newline) = buffer.iter().position(|&byte| byte == b'\n') {
-                let line: Vec<u8> = buffer.drain(..=newline).collect();
-                let line = String::from_utf8_lossy(&line);
-                let line = line.trim_end();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim_start();
-                if data == "[DONE]" {
+            let events = decoder.push(&chunk).map_err(|error| {
+                AdapterError::fatal(
+                    anyhow::Error::new(error)
+                        .context(format!("invalid UTF-8 in stream from {url}")),
+                )
+            })?;
+            for event in events {
+                if apply_sse_event(event, &mut accumulator, on_delta, &url)? {
                     break 'stream;
-                }
-                let parsed: StreamChunk = serde_json::from_str(data).map_err(|error| {
-                    AdapterError::fatal(
-                        anyhow::Error::new(error)
-                            .context(format!("unexpected stream chunk from {url}: {data}")),
-                    )
-                })?;
-                if let Some(fragment) = accumulator.apply(parsed)
-                    && let Some(handler) = on_delta
-                {
-                    handler(&fragment);
                 }
             }
         }
 
         Ok(accumulator.finish())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseEvent {
+    Data(String),
+    Done,
+}
+
+/// Incremental Server-Sent Events decoder. It handles LF, CRLF, and CR line
+/// endings, comments/other fields, multiple `data:` lines, fragmented UTF-8,
+/// and a final event without a trailing blank line. Consumed bytes are
+/// compacted once per HTTP chunk rather than drained once per line.
+#[derive(Default)]
+struct SseDecoder {
+    buffer: Vec<u8>,
+    data: Vec<u8>,
+    has_data: bool,
+    first_line: bool,
+}
+
+impl SseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
+        self.buffer.extend_from_slice(chunk);
+        self.parse(false)
+    }
+
+    fn finish(&mut self) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
+        self.parse(true)
+    }
+
+    fn parse(&mut self, eof: bool) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
+        let mut events = Vec::new();
+        let mut consumed = 0usize;
+        loop {
+            let mut terminator = None;
+            for index in consumed..self.buffer.len() {
+                match self.buffer[index] {
+                    b'\n' => {
+                        terminator = Some((index, index + 1));
+                        break;
+                    }
+                    b'\r' if index + 1 < self.buffer.len() => {
+                        terminator = Some((
+                            index,
+                            index + 1 + usize::from(self.buffer[index + 1] == b'\n'),
+                        ));
+                        break;
+                    }
+                    b'\r' if eof => {
+                        terminator = Some((index, index + 1));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            let Some((line_end, next)) = terminator else {
+                if eof && consumed < self.buffer.len() {
+                    let line = &self.buffer[consumed..];
+                    process_sse_line(
+                        line,
+                        &mut self.data,
+                        &mut self.has_data,
+                        &mut self.first_line,
+                        &mut events,
+                    )?;
+                    consumed = self.buffer.len();
+                }
+                break;
+            };
+            let line = &self.buffer[consumed..line_end];
+            process_sse_line(
+                line,
+                &mut self.data,
+                &mut self.has_data,
+                &mut self.first_line,
+                &mut events,
+            )?;
+            consumed = next;
+        }
+
+        if consumed == self.buffer.len() {
+            self.buffer.clear();
+        } else if consumed > 0 {
+            self.buffer.drain(..consumed);
+        }
+        if eof && self.has_data {
+            dispatch_sse_data(&mut self.data, &mut self.has_data, &mut events)?;
+        }
+        Ok(events)
+    }
+}
+
+fn process_sse_line(
+    mut line: &[u8],
+    data: &mut Vec<u8>,
+    has_data: &mut bool,
+    first_line: &mut bool,
+    events: &mut Vec<SseEvent>,
+) -> Result<(), std::string::FromUtf8Error> {
+    if !*first_line {
+        *first_line = true;
+        line = line.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(line);
+    }
+    if line.is_empty() {
+        if *has_data {
+            dispatch_sse_data(data, has_data, events)?;
+        }
+        return Ok(());
+    }
+    if line[0] == b':' {
+        return Ok(());
+    }
+    let colon = line
+        .iter()
+        .position(|byte| *byte == b':')
+        .unwrap_or(line.len());
+    if &line[..colon] != b"data" {
+        return Ok(());
+    }
+    let mut value = if colon < line.len() {
+        &line[colon + 1..]
+    } else {
+        b""
+    };
+    if value.first() == Some(&b' ') {
+        value = &value[1..];
+    }
+    if *has_data {
+        data.push(b'\n');
+    }
+    data.extend_from_slice(value);
+    *has_data = true;
+    Ok(())
+}
+
+fn dispatch_sse_data(
+    data: &mut Vec<u8>,
+    has_data: &mut bool,
+    events: &mut Vec<SseEvent>,
+) -> Result<(), std::string::FromUtf8Error> {
+    let value = String::from_utf8(std::mem::take(data))?;
+    *has_data = false;
+    if value == "[DONE]" {
+        events.push(SseEvent::Done);
+    } else {
+        events.push(SseEvent::Data(value));
+    }
+    Ok(())
+}
+
+fn apply_sse_event(
+    event: SseEvent,
+    accumulator: &mut StreamAccumulator,
+    on_delta: Option<DeltaHandler<'_>>,
+    url: &str,
+) -> std::result::Result<bool, AdapterError> {
+    let SseEvent::Data(data) = event else {
+        return Ok(true);
+    };
+    if data.is_empty() {
+        return Ok(false);
+    }
+    let parsed: StreamChunk = serde_json::from_str(&data).map_err(|error| {
+        AdapterError::fatal(
+            anyhow::Error::new(error)
+                .context(format!("unexpected stream event from {url}: {data}")),
+        )
+    })?;
+    accumulator.apply(parsed, on_delta);
+    Ok(false)
 }
 
 impl ProviderAdapter for OpenAiChatCompletions {
@@ -399,8 +572,7 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
-    fn apply(&mut self, chunk: StreamChunk) -> Option<String> {
-        let mut fragment = None;
+    fn apply(&mut self, chunk: StreamChunk, on_delta: Option<DeltaHandler<'_>>) {
         if chunk.usage.is_some() {
             self.usage = chunk.usage.map(Into::into);
         }
@@ -411,8 +583,10 @@ impl StreamAccumulator {
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
             {
+                if let Some(handler) = on_delta {
+                    handler(&text);
+                }
                 self.content.push_str(&text);
-                fragment.get_or_insert_with(String::new).push_str(&text);
             }
             for delta in choice.delta.tool_calls.unwrap_or_default() {
                 while self.tool_calls.len() <= delta.index {
@@ -440,7 +614,6 @@ impl StreamAccumulator {
                 }
             }
         }
-        fragment
     }
 
     fn finish(self) -> ModelResponse {
@@ -553,27 +726,24 @@ mod tests {
     #[test]
     fn accumulates_content_deltas() {
         let mut accumulator = StreamAccumulator::default();
-        assert_eq!(
-            accumulator.apply(chunk(
-                r#"{"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#
-            )),
-            Some("Hel".to_string())
+        accumulator.apply(
+            chunk(r#"{"choices":[{"delta":{"role":"assistant","content":"Hel"}}]}"#),
+            None,
         );
-        assert_eq!(
-            accumulator.apply(chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#)),
-            Some("lo".to_string())
-        );
+        accumulator.apply(chunk(r#"{"choices":[{"delta":{"content":"lo"}}]}"#), None);
+        assert_eq!(accumulator.content, "Hello");
         assert!(!accumulator.finished);
-        assert_eq!(
-            accumulator.apply(chunk(
-                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#
-            )),
-            None
+        accumulator.apply(
+            chunk(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            None,
         );
         assert!(accumulator.finished);
-        accumulator.apply(chunk(
-            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
-        ));
+        accumulator.apply(
+            chunk(
+                r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+            ),
+            None,
+        );
         let response = accumulator.finish();
         assert_eq!(response.content.as_deref(), Some("Hello"));
         assert!(response.tool_calls.is_empty());
@@ -583,15 +753,24 @@ mod tests {
     #[test]
     fn assembles_fragmented_tool_calls() {
         let mut accumulator = StreamAccumulator::default();
-        accumulator.apply(chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write_file","arguments":""}}]}}]}"#,
-        ));
-        accumulator.apply(chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
-        ));
-        accumulator.apply(chunk(
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}},{"index":1,"id":"c2","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
-        ));
+        accumulator.apply(
+            chunk(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write_file","arguments":""}}]}}]}"#,
+            ),
+            None,
+        );
+        accumulator.apply(
+            chunk(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
+            ),
+            None,
+        );
+        accumulator.apply(
+            chunk(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}},{"index":1,"id":"c2","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            ),
+            None,
+        );
         let response = accumulator.finish();
         assert_eq!(response.tool_calls.len(), 2);
         assert_eq!(response.tool_calls[0].id, "c1");
@@ -599,6 +778,51 @@ mod tests {
         assert_eq!(response.tool_calls[0].function.arguments, r#"{"path":"x"}"#);
         assert_eq!(response.tool_calls[1].function.name, "read_file");
         assert!(response.content.is_none());
+    }
+
+    #[test]
+    fn sse_decoder_handles_fragmented_multiline_events_and_crlf() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(b": keepalive\r\nid: 1\r\nda")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(decoder.push(b"ta: {\"value\":\r\n").unwrap().is_empty());
+        assert_eq!(
+            decoder.push(b"data: 1}\r\n\r\n").unwrap(),
+            vec![SseEvent::Data("{\"value\":\n1}".to_string())]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_preserves_split_utf8_and_finishes_unterminated_event() {
+        let mut decoder = SseDecoder::default();
+        let event = "data: {\"text\":\"hé\"}".as_bytes();
+        let split = event.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
+        assert!(decoder.push(&event[..split]).unwrap().is_empty());
+        assert!(decoder.push(&event[split..]).unwrap().is_empty());
+        assert_eq!(
+            decoder.finish().unwrap(),
+            vec![SseEvent::Data("{\"text\":\"hé\"}".to_string())]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_handles_many_events_done_and_bom() {
+        let mut decoder = SseDecoder::default();
+        let events = decoder
+            .push(b"\xef\xbb\xbfdata: one\n\ndata: two\r\rdata: [DONE]\n\n")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                SseEvent::Data("one".to_string()),
+                SseEvent::Data("two".to_string()),
+                SseEvent::Done,
+            ]
+        );
     }
 
     #[test]

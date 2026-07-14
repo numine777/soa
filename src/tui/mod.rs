@@ -125,6 +125,13 @@ pub async fn run(
             event = agent_rx.recv() => {
                 if let Some(event) = event {
                     app.on_agent_event(event);
+                    // Streaming providers can enqueue many tiny deltas
+                    // between terminal frames. Fold everything already
+                    // waiting into app state before redrawing instead of
+                    // rendering once per token.
+                    while let Ok(event) = agent_rx.try_recv() {
+                        app.on_agent_event(event);
+                    }
                 }
             }
             request = approval_rx.recv() => {

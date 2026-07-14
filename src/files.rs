@@ -10,6 +10,7 @@
 //! All failures are returned as `ERROR: …` strings so the model can react
 //! without killing the stage.
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -611,15 +612,87 @@ fn list_dir(cwd: &Path, path: &str) -> String {
     names.join("\n")
 }
 
-/// Walk the tree under `root`, calling `visit` with each file's
-/// cwd-relative path. Skips [`IGNORED_DIRS`] and hidden entries, and stops
-/// after [`MAX_WALK_ENTRIES`] (returning whether it was cut short).
-fn walk_files(cwd: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path)) -> bool {
-    let mut pending = vec![root.to_path_buf()];
+fn searchable_path(relative: &Path) -> bool {
+    relative.components().all(|component| match component {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_ref())
+        }
+        _ => true,
+    })
+}
+
+/// Use Git's index and ignore engine when the workspace is a repository.
+/// This avoids statting every ignored build artifact while still including
+/// untracked, non-ignored files. Returns `None` outside a repository.
+fn walk_git_files(
+    cwd: &Path,
+    root: &Path,
+    visit: &mut dyn FnMut(&str, &Path) -> bool,
+) -> Option<bool> {
+    let pathspec = root
+        .strip_prefix(cwd)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty());
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(["ls-files", "-co", "--exclude-standard", "-z", "--"])
+        .arg(pathspec.unwrap_or_else(|| Path::new(".")));
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
     let mut seen = 0usize;
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        seen += 1;
+        if seen > MAX_WALK_ENTRIES {
+            return Some(true);
+        }
+        let relative = PathBuf::from(String::from_utf8_lossy(raw).into_owned());
+        if !searchable_path(&relative) {
+            continue;
+        }
+        let path = cwd.join(&relative);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let relative_text = relative.to_string_lossy();
+        if !visit(&relative_text, &path) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Walk the tree under `root`, calling `visit` with each file's
+/// cwd-relative path. Git repositories use the index plus standard ignore
+/// rules; other directories use a deterministic in-process walk. Returning
+/// `false` from `visit` stops immediately. The return value says whether
+/// traversal was cut short.
+fn walk_files(cwd: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> bool) -> bool {
+    if let Some(truncated) = walk_git_files(cwd, root, visit) {
+        return truncated;
+    }
+
+    let mut pending = VecDeque::from([root.to_path_buf()]);
+    let mut seen = 0usize;
+    while let Some(dir) = pending.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
             seen += 1;
             if seen > MAX_WALK_ENTRIES {
                 return true;
@@ -637,12 +710,13 @@ fn walk_files(cwd: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path)) -> bo
             }
             if file_type.is_dir() {
                 if !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_str()) {
-                    pending.push(path);
+                    pending.push_back(path);
                 }
             } else if !name.starts_with('.')
                 && let Ok(relative) = path.strip_prefix(cwd)
+                && !visit(&relative.to_string_lossy(), &path)
             {
-                visit(&relative.to_string_lossy(), &path);
+                return true;
             }
         }
     }
@@ -659,9 +733,10 @@ fn glob(cwd: &Path, pattern: &str) -> String {
     };
     let mut matches: Vec<String> = Vec::new();
     let truncated_walk = walk_files(&workspace, &workspace, &mut |relative, _| {
-        if matches.len() < MAX_GLOB_RESULTS && crate::tools::wildcard_match(pattern, relative) {
+        if crate::tools::wildcard_match(pattern, relative) {
             matches.push(relative.to_string());
         }
+        matches.len() < MAX_GLOB_RESULTS
     });
     if matches.is_empty() {
         return format!("no files match `{pattern}`");
@@ -691,21 +766,23 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
 
     let mut lines: Vec<String> = Vec::new();
     let mut files_matched = 0usize;
-    let mut search = |relative: &str, path: &Path| {
+    let mut search = |relative: &str, path: &Path| -> bool {
         if lines.len() >= MAX_GREP_MATCHES {
-            return;
+            return false;
         }
         if let Some(filter) = filter
             && !crate::tools::wildcard_match(filter, relative)
         {
-            return;
+            return true;
         }
         if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES) {
-            return;
+            return true;
         }
-        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(bytes) = std::fs::read(path) else {
+            return true;
+        };
         if bytes[..bytes.len().min(8192)].contains(&0) {
-            return; // binary
+            return true; // binary
         }
         let content = String::from_utf8_lossy(&bytes);
         let mut matched = false;
@@ -722,24 +799,32 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
         if matched {
             files_matched += 1;
         }
+        lines.len() < MAX_GREP_MATCHES
     };
 
-    if root.is_file() {
-        let relative =
-            root.strip_prefix(&workspace).unwrap_or(&root).to_string_lossy().into_owned();
+    let truncated_walk = if root.is_file() {
+        let relative = root
+            .strip_prefix(&workspace)
+            .unwrap_or(&root)
+            .to_string_lossy()
+            .into_owned();
         search(&relative, &root);
+        false
     } else {
-        walk_files(&workspace, &root, &mut search);
-    }
+        walk_files(&workspace, &root, &mut search)
+    };
 
     if lines.is_empty() {
         return format!("no matches for `{pattern}`");
     }
     let mut out = lines.join("\n");
-    if lines.len() >= MAX_GREP_MATCHES {
+    if lines.len() >= MAX_GREP_MATCHES || truncated_walk {
         out.push_str("\n… [matches truncated — narrow the pattern or path]");
     } else {
-        out.push_str(&format!("\n({} match(es) in {files_matched} file(s))", lines.len()));
+        out.push_str(&format!(
+            "\n({} match(es) in {files_matched} file(s))",
+            lines.len()
+        ));
     }
     out
 }
@@ -757,9 +842,49 @@ mod tests {
         std::fs::write(root.join("src/main.rs"), "fn main() {\n    println!(\"hi\");\n}\n")
             .unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn add() {}\npub fn add2() {}\n").unwrap();
-        std::fs::write(root.join(".git/config"), "secret").unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
         std::fs::write(root.join("README.md"), "# readme\n").unwrap();
         root
+    }
+
+    #[test]
+    fn repository_walk_stops_immediately_when_consumer_is_full() {
+        let cwd = project("early-stop").canonicalize().unwrap();
+        let mut visited = 0usize;
+        let truncated = walk_files(&cwd, &cwd, &mut |_, _| {
+            visited += 1;
+            false
+        });
+        assert!(truncated);
+        assert_eq!(visited, 1);
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn repository_search_uses_standard_git_ignores() {
+        let cwd = project("git-ignore");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&cwd)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(cwd.join(".gitignore"), "ignored.log\n").unwrap();
+        std::fs::write(cwd.join("ignored.log"), "needle\n").unwrap();
+        std::fs::write(cwd.join("visible.txt"), "needle\n").unwrap();
+
+        let files = glob(&cwd, "*");
+        assert!(files.contains("visible.txt"), "{files}");
+        assert!(!files.contains("ignored.log"), "{files}");
+        let matches = grep(&cwd, "needle", "", None);
+        assert!(matches.contains("visible.txt:1"), "{matches}");
+        assert!(!matches.contains("ignored.log"), "{matches}");
+        let _ = std::fs::remove_dir_all(cwd);
     }
 
     #[test]

@@ -52,15 +52,17 @@ soa -c other.toml …    # use a different config file
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
 
-**Checkpoints.** Pipeline runs are checkpointed atomically under
-`<data dir>/runs/`. Stage-boundary state includes the task, stage outputs,
-workflow position (including reprompt jumps), and cumulative usage/budgets.
-While a stage is active, an append-only event log also checkpoints its exact
-starting conversation, every model tool-call response, each completed tool
-result (including results as parallel calls finish), context shedding, and
-the final outcome. `soa run --resume` replays that log and continues with only
-the unfinished calls instead of rerunning the stage from its prompt. Completed
-stages, model requests, and tool calls are not repeated.
+**Checkpoints.** Pipeline runs are checkpointed under `<data dir>/runs/`.
+Stage-boundary snapshots are replaced atomically and include the task, stage
+outputs, workflow position (including reprompt jumps), and cumulative
+usage/budgets. While a stage is active, each event is appended to a compact
+JSONL sidecar instead of rewriting the growing snapshot. The log records the
+exact starting conversation, every model tool-call response, each completed
+tool result (including results as parallel calls finish), context shedding,
+and the final outcome; it is folded into the next boundary snapshot.
+`soa run --resume` replays that log and continues with only the unfinished
+calls instead of rerunning the stage from its prompt. Completed stages, model
+requests, and tool calls are not repeated.
 
 The one unavoidable ambiguity is work interrupted after an external request
 or tool took effect but before its completion event reached disk; that
@@ -294,7 +296,10 @@ Responses stream token-by-token everywhere: live in the chat TUI (with a
 `▌` cursor while text arrives), and to stderr during `soa run` so you can
 watch stages think. Stdout still receives only the final answer, and only
 when it isn't the same terminal that just showed the stream — so piping
-`soa run` output stays clean while interactive runs aren't duplicated.
+`soa run` output stays clean while interactive runs aren't duplicated. TUI
+redraws and terminal writes are coalesced under heavy token traffic, while
+provider adapters parse complete SSE events correctly even when delimiters,
+UTF-8 characters, or multi-line `data:` fields cross network chunks.
 
 ### `[models.<name>]`
 
@@ -361,6 +366,10 @@ provider requests so parallel subagents cannot race the same remaining
 allowance; their non-model tool calls can still run concurrently.
 
 ### `[mcp.<name>]`
+
+All MCP servers needed by the selected workflow are connected concurrently
+at startup. If any required server fails, successful connections are closed
+before the aggregated startup error is returned; shutdown is concurrent too.
 
 ```toml
 [mcp.filesystem]
@@ -438,11 +447,13 @@ read) is rejected with the line's fresh anchor instead of corrupting the
 file, and every successful edit returns re-anchored context around the
 change so nearby follow-ups don't need a re-read. `edit_file`
 (exact-string replacement with a unique-match requirement) remains for
-cross-line rewrites. Everything is rooted at the working
-directory (paths that escape it lexically or through symlinks are
-rejected), `glob`/`grep` skip symlinks, `.git`, `node_modules`, `target`,
-and hidden entries, and results are capped so one call can't flood the
-context. Writes participate in approvals
+cross-line rewrites. Everything is rooted at the working directory (paths
+that escape it lexically or through symlinks are rejected). In Git
+repositories, `glob`/`grep` use the tracked and untracked file inventory plus
+standard ignore rules; elsewhere they use a deterministic early-stopping
+walk. Both paths skip symlinks, hidden entries, `.git`, `node_modules`, and
+`target`, and cap results so one call can't flood the context. Writes
+participate in approvals
 (`require_approval`, patterns like `edit_file *`) and chat diff capture
 like any other mutating tool. No MCP filesystem server required.
 

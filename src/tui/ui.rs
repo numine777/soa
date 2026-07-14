@@ -401,8 +401,19 @@ fn build_transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // The in-progress streamed reply, with a cursor mark.
     if !app.stream_buffer.is_empty() {
         lines.push(Line::raw(""));
-        let live = format!("{}▌", app.stream_buffer);
-        push_wrapped(&mut lines, &live, width, "", "", Style::default());
+        push_wrapped(
+            &mut lines,
+            &app.stream_buffer,
+            width,
+            "",
+            "",
+            Style::default(),
+        );
+        if lines.last().is_some_and(|line| line.width() >= width.max(16)) {
+            lines.push(Line::raw("▌"));
+        } else if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::raw("▌"));
+        }
     }
 
     lines

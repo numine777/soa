@@ -200,21 +200,60 @@ impl McpManager {
         config: &crate::config::Config,
         quiet: bool,
     ) -> Result<McpManager> {
-        let mut manager = McpManager::default();
+        let mut seen = HashSet::new();
+        let mut requested = Vec::new();
         for name in servers {
-            if manager.connections.contains_key(&name) {
+            if !seen.insert(name.clone()) {
                 continue;
             }
             let server_config = config
                 .mcp
                 .get(&name)
-                .ok_or_else(|| anyhow!("unknown mcp server `{name}`"))?;
-            tracing::info!(server = %name, "connecting to MCP server");
-            let connection = McpConnection::connect(&name, server_config, quiet).await?;
-            tracing::info!(server = %name, tools = connection.tools.len(), "connected");
-            manager.connections.insert(name, connection);
+                .ok_or_else(|| anyhow!("unknown mcp server `{name}`"))?
+                .clone();
+            requested.push((name, server_config));
         }
-        Ok(manager)
+
+        // Handshakes and tools/list calls are independent and can dominate
+        // startup for process-backed servers. Resolve every name first, then
+        // connect all of them concurrently so an invalid reference never
+        // leaves a partially started manager.
+        let results = futures_util::future::join_all(requested.into_iter().map(
+            |(name, server_config)| async move {
+                tracing::info!(server = %name, "connecting to MCP server");
+                let result = McpConnection::connect(&name, &server_config, quiet).await;
+                (name, result)
+            },
+        ))
+        .await;
+
+        let mut manager = McpManager::default();
+        let mut errors = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(connection) => {
+                    tracing::info!(server = %name, tools = connection.tools.len(), "connected");
+                    manager.connections.insert(name, connection);
+                }
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(manager)
+        } else {
+            futures_util::future::join_all(
+                manager
+                    .connections
+                    .into_values()
+                    .map(McpConnection::shutdown),
+            )
+            .await;
+            Err(anyhow!(
+                "failed to connect to {} MCP server(s):\n- {}",
+                errors.len(),
+                errors.join("\n- ")
+            ))
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&McpConnection> {
@@ -222,8 +261,7 @@ impl McpManager {
     }
 
     pub async fn shutdown(self) {
-        for (_, connection) in self.connections {
-            connection.shutdown().await;
-        }
+        futures_util::future::join_all(self.connections.into_values().map(McpConnection::shutdown))
+            .await;
     }
 }

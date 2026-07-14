@@ -8,6 +8,7 @@ mod insights;
 mod mcp;
 mod mentions;
 mod model;
+mod persistence;
 mod providers;
 mod reflect;
 mod runs;
@@ -18,7 +19,7 @@ mod tui;
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -432,11 +433,56 @@ fn terminal_approvals() -> std::sync::Arc<approval::Approvals> {
     std::sync::Arc::new(Approvals::new(tx))
 }
 
-/// Streams stage output to stderr as it arrives.
-fn stream_to_stderr(fragment: &str) {
-    let mut err = std::io::stderr();
-    let _ = err.write_all(fragment.as_bytes());
-    let _ = err.flush();
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const STREAM_BUFFER_BYTES: usize = 4096;
+
+struct StderrStream {
+    state: std::sync::Mutex<StderrStreamState>,
+}
+
+struct StderrStreamState {
+    pending: Vec<u8>,
+    last_flush: Instant,
+}
+
+impl StderrStream {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            state: std::sync::Mutex::new(StderrStreamState {
+                pending: Vec::with_capacity(STREAM_BUFFER_BYTES),
+                // Let the first fragment appear immediately; bursts after
+                // that coalesce to roughly one terminal write per frame.
+                last_flush: now.checked_sub(STREAM_FLUSH_INTERVAL).unwrap_or(now),
+            }),
+        }
+    }
+
+    fn push(&self, fragment: &str) {
+        let mut state = self.state.lock().expect("stderr stream lock");
+        state.pending.extend_from_slice(fragment.as_bytes());
+        if fragment.contains('\n')
+            || state.pending.len() >= STREAM_BUFFER_BYTES
+            || state.last_flush.elapsed() >= STREAM_FLUSH_INTERVAL
+        {
+            Self::flush_locked(&mut state);
+        }
+    }
+
+    fn flush(&self) {
+        Self::flush_locked(&mut self.state.lock().expect("stderr stream lock"));
+    }
+
+    fn flush_locked(state: &mut StderrStreamState) {
+        if state.pending.is_empty() {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(&state.pending);
+        let _ = err.flush();
+        state.pending.clear();
+        state.last_flush = Instant::now();
+    }
 }
 
 /// The final answer goes to stdout for pipes — except when both stdout and
@@ -489,6 +535,8 @@ async fn run_pipeline(
         let approvals = terminal_approvals();
         let context = stage::PipelineContext::new(task);
         eprintln!("── stage {} ──", stage.name);
+        let stream = StderrStream::new();
+        let on_delta = |fragment: &str| stream.push(fragment);
         let result = stage::run_stage(
             config,
             stage,
@@ -500,11 +548,12 @@ async fn run_pipeline(
             &[],
             None,
             &[],
-            Some(&stream_to_stderr),
+            Some(&on_delta),
             None,
             &approvals,
         );
         let result = usage.within_time(result).await;
+        stream.flush();
         manager.shutdown().await;
         print_usage_summary(&usage);
         return match result? {
@@ -644,6 +693,9 @@ async fn run_workflow(
             Some(progress) => (progress.events.clone(), true),
             None => {
                 runs += 1;
+                if let Err(error) = runs::clear_stage_events(&state.id) {
+                    eprintln!("⚠ cannot reset mid-stage checkpoint: {error:#}");
+                }
                 state.active_stage = Some(runs::StageProgress {
                     stage: stage.name.clone(),
                     run: runs,
@@ -675,21 +727,30 @@ async fn run_workflow(
             .filter(|t| workflow_stage_names.contains(&t.as_str()))
             .cloned()
             .collect();
+        let run_id = state.id.clone();
+        let stage_name = stage.name.clone();
         let event_state = std::sync::Mutex::new(&mut state);
         let on_event = |event: stage::AgentLoopEvent| {
-            let mut state = event_state.lock().expect("run checkpoint lock");
-            state
-                .active_stage
-                .as_mut()
-                .expect("active stage exists while its loop runs")
-                .events
-                .push(event);
-            state.usage = usage.snapshot();
-            state.updated_at = tui::store::now_epoch();
-            if let Err(error) = runs::save_run(&state) {
+            let usage = usage.snapshot();
+            {
+                let mut state = event_state.lock().expect("run checkpoint lock");
+                state
+                    .active_stage
+                    .as_mut()
+                    .expect("active stage exists while its loop runs")
+                    .events
+                    .push(event.clone());
+                state.usage = usage.clone();
+                state.updated_at = tui::store::now_epoch();
+            }
+            if let Err(error) =
+                runs::append_stage_event(&run_id, &stage_name, runs, &event, usage)
+            {
                 eprintln!("⚠ cannot write mid-stage checkpoint: {error:#}");
             }
         };
+        let stream = StderrStream::new();
+        let on_delta = |fragment: &str| stream.push(fragment);
         let stage_result = usage
             .within_time(stage::run_stage(
                 config,
@@ -702,11 +763,12 @@ async fn run_workflow(
                 &resume_events,
                 Some(&on_event),
                 &reprompt_targets,
-                Some(&stream_to_stderr),
+                Some(&on_delta),
                 None,
                 &approvals,
             ))
             .await;
+        stream.flush();
         drop(event_state);
         match stage_result {
             Ok(stage::StageOutcome::Final(output)) => {
@@ -792,7 +854,15 @@ fn checkpoint(
     state.outputs = context.outputs.clone();
     state.usage = usage.snapshot();
     state.updated_at = tui::store::now_epoch();
-    if let Err(e) = runs::save_run(state) {
-        eprintln!("⚠ cannot write run checkpoint: {e:#}");
+    match runs::save_run(state) {
+        Ok(()) if state.active_stage.is_none() => {
+            if let Err(error) = runs::clear_stage_events(&state.id) {
+                eprintln!("⚠ cannot clear completed stage event log: {error:#}");
+            }
+        }
+        Ok(()) => {}
+        Err(error) => {
+            eprintln!("⚠ cannot write run checkpoint: {error:#}");
+        }
     }
 }

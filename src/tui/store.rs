@@ -168,12 +168,8 @@ pub struct Session {
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
-    let dir = sessions_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = dir.join(format!("{}.json", session.id));
-    let json = serde_json::to_string(session)?;
-    std::fs::write(&path, json).with_context(|| format!("cannot write {}", path.display()))
+    let path = sessions_dir().join(format!("{}.json", session.id));
+    crate::persistence::atomic_write(&path, &serde_json::to_vec(session)?)
 }
 
 pub fn load_session(id: &str) -> Result<Session> {

@@ -191,12 +191,7 @@ pub fn save_git_marks(marks: &BTreeMap<String, String>) -> Result<()> {
 }
 
 fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(value)?)
-        .with_context(|| format!("cannot write {}", path.display()))
+    crate::persistence::atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }
 
 #[cfg(test)]

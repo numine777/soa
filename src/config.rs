@@ -111,6 +111,9 @@ pub struct Settings {
     /// are sourced in the listed order, missing ones are skipped.
     #[serde(default = "default_context_files")]
     pub context_files: Vec<PathBuf>,
+    /// Model used by `soa reflect` to distill sessions into lessons and
+    /// skills (default: the first stage's model).
+    pub reflect_model: Option<String>,
 }
 
 /// A named pipeline over the stage library.
@@ -142,6 +145,7 @@ impl Default for Settings {
             skills_dir: None,
             default_workflow: None,
             context_files: default_context_files(),
+            reflect_model: None,
         }
     }
 }

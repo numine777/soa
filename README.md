@@ -44,6 +44,7 @@ soa run --resume       # continue this directory's interrupted run (--resume <id
 soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
+soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
 soa -c other.toml …    # use a different config file
 ```
 
@@ -69,7 +70,7 @@ Slash commands:
 | command | effect |
 |---|---|
 | `/compact` | Ask the model to summarize the conversation, then replace the history with that summary — frees context while keeping the thread. The status bar shows a live `ctx` gauge: real provider-reported token usage when available (with percentage of the model's `context_tokens`), otherwise a `~` estimate. This also happens automatically when usage crosses `settings.auto_compact_threshold` — see [Configuration](#configuration). |
-| `/clear` | Drop all conversation context. |
+| `/clear` | Drop all conversation context and start the display fresh: a `── context cleared ──` divider is shown, and everything above it — messages *and* diff entries — is hidden from the chat and diff views. Nothing is deleted: the session file keeps the full record, `/export` still writes all of it, and rewinding to session start brings the hidden history back into view. |
 | `/usage` | Cumulative token usage per model since launch (requests, prompt and completion tokens), plus the current context gauge. |
 | `/diff` | Open the diff viewer (also `Ctrl+G`). |
 | `/rewind` | Open the checkpoint picker: every turn-starting message is a rewind target (newest first, plus a session-start row). Selecting one restores every file touched afterwards to its state at that moment, truncates the conversation back to before the message, and puts the message text back in the input for editing. File restores are recorded as `rewind` diff entries, so a rewind can be re-applied forward from the diff viewer. Compaction and `/clear` rewrite the history, so checkpoints from before them are dropped. |
@@ -169,6 +170,54 @@ order — so a shared `AGENTS.md` can be combined with soa-specific
 instructions. Missing and blank files are skipped, absolute paths are read
 as-is, and `soa check` reports what was found. Files are read once at
 startup — restart `soa chat` to pick up edits.
+
+## Reflection (`soa reflect`)
+
+`soa reflect` is how soa gets better at your project over time. It reads
+this directory's saved chat sessions (skipping ones already reflected on)
+and extracts the ground-truth failure signals each one recorded: tool
+calls the user **denied** at the approval prompt, tool calls that returned
+`ERROR:` results, and file changes that were **rolled back** via the diff
+viewer or `/rewind`.
+
+It also mines **git history** — the one place where every actor's work
+converges, including other AI harnesses and hand edits. Commits since the
+last reflection (up to 20, tracked per repository in
+`<data dir>/git_reflected.json`) are digested with heuristic markers:
+
+- **reverts** — commits that explicitly undo earlier work;
+- **possible corrections** — commits rewriting lines that another recent
+  commit introduced, the classic fix-up shape;
+- **revisions of soa-written code** — commits changing lines soa's own
+  session diff log recorded as written by soa: direct downstream feedback
+  on soa's output, whoever made the edit;
+- `Co-Authored-By:` trailers, so AI-assisted commits are identifiable.
+
+Markers are presented to the model as candidates, not certainties (code
+also changes because requirements changed), and lessons derived from
+commits cite the short hash so they stay auditable.
+
+A model (`settings.reflect_model`, default: the first stage's model) then
+rewrites two kinds of durable memory:
+
+- **Lessons** — short imperative rules kept in a marker-delimited block of
+  `SOA.md`, which reaches every stage and agent automatically via
+  `context_files`. The model returns the complete replacement list each
+  run, so lessons are consolidated and pruned instead of accreting
+  forever; hand-written content outside the block is never touched.
+- **Skills** — occasionally, a recurring multi-step procedure is written
+  up as a skill file in the project skills directory, ready to attach with
+  `skills = [...]`. Reflect only overwrites skill files it authored
+  (marked `generated: soa reflect` in their frontmatter).
+
+Everything is plain files, so the "learning" is reviewable: `git diff`
+shows what a reflection changed, `git checkout` reverts it, and
+`soa reflect --dry-run` previews the proposal without writing. Extracted
+signals are also appended to `<data dir>/insights.jsonl` — a persistent,
+greppable record that future tooling (search, evals, embeddings) can build
+on without re-parsing sessions — and `<data dir>/reflected.json` tracks
+which sessions have been processed, so reflection is incremental and a
+session that grows later is reflected again.
 
 ## Configuration
 

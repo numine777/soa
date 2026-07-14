@@ -30,6 +30,10 @@ provider_retries = 3
 # All candidates that exist are sourced in the listed order; missing ones
 # are skipped.
 # context_files = ["AGENTS.md", "SOA.md"]     # default: ["SOA.md"]
+# Model used by `soa reflect`, which distills saved sessions (denied calls,
+# tool errors, rolled-back changes) into a lessons block in SOA.md and,
+# occasionally, new skill files. Defaults to the first stage's model.
+# reflect_model = "planner"
 
 # ---------------------------------------------------------------------------
 # Providers: OpenAI-compatible chat-completions endpoints.

@@ -2,10 +2,13 @@ mod approval;
 mod config;
 mod diff;
 mod files;
+mod git;
 mod hooks;
+mod insights;
 mod mcp;
 mod mentions;
 mod provider;
+mod reflect;
 mod runs;
 mod skills;
 mod stage;
@@ -78,6 +81,18 @@ enum Command {
     Sessions,
     /// List discoverable skills.
     Skills,
+    /// Distill recent sessions into lessons (SOA.md) and skills: failure
+    /// signals (denied calls, tool errors, rollbacks) become durable
+    /// instructions that reach every stage. Review the result with git.
+    Reflect {
+        /// Print the proposal without writing any files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Model to reflect with (default: settings.reflect_model, then the
+        /// first stage's model).
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
@@ -300,6 +315,9 @@ async fn main() -> Result<()> {
         Command::Chat { stage, no_mouse, resume } => {
             tui::run(config, cli.config.clone(), stage.as_deref(), !no_mouse, resume.as_deref())
                 .await
+        }
+        Command::Reflect { dry_run, model } => {
+            reflect::run(&config, model.as_deref(), dry_run).await
         }
         Command::Sessions => {
             let sessions = tui::store::list_sessions()?;

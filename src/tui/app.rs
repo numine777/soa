@@ -56,6 +56,11 @@ pub enum AgentEvent {
     /// the last reported token usage.
     Turn { history: Vec<ChatMessage>, text: String, usage: Option<Usage> },
     Compacted { summary: String },
+    /// A `/run` workflow entered a stage (`run` counts reprompt re-runs).
+    StageStart { stage: String, run: u32 },
+    /// A `/run` workflow finished: the last stage's output, or the error
+    /// that stopped the pipeline. `task` is the mention-expanded task.
+    WorkflowDone { workflow: String, task: String, result: Result<String, String> },
     Error(String),
 }
 
@@ -123,6 +128,9 @@ pub struct App {
     turn: Option<JoinHandle<()>>,
     /// True while the running task is a compaction rather than a chat turn.
     compacting: bool,
+    /// Name of the workflow the running task is executing, if it is a
+    /// `/run` pipeline rather than a chat turn.
+    workflow_running: Option<String>,
     /// Messages submitted while a turn is running, shared with the worker,
     /// which injects them into the conversation between tool rounds.
     steer_queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -199,6 +207,7 @@ impl App {
             quit: false,
             turn: None,
             compacting: false,
+            workflow_running: None,
             steer_queue: Arc::default(),
             steered_this_turn: Vec::new(),
             tx,
@@ -690,6 +699,7 @@ impl App {
         let stage_names: Vec<String> =
             self.config.stages.iter().map(|s| s.name.clone()).collect();
         let model_names: Vec<String> = self.config.models.keys().cloned().collect();
+        let workflow_names: Vec<String> = self.config.workflows.keys().cloned().collect();
         self.completion = completion::compute(
             &line,
             col,
@@ -697,6 +707,7 @@ impl App {
             std::path::Path::new(&self.cwd),
             &stage_names,
             &model_names,
+            &workflow_names,
         );
     }
 
@@ -915,7 +926,11 @@ impl App {
         // delivers it to the model after the current tool round. Anything
         // still queued when the turn ends becomes the next turn.
         if self.is_running() {
-            self.info("↪ queued — delivered after the current tool round");
+            self.info(if self.workflow_running.is_some() {
+                "↪ queued — becomes a chat turn after the workflow finishes"
+            } else {
+                "↪ queued — delivered after the current tool round"
+            });
             self.steered_this_turn.push(expanded.clone());
             self.steer_queue.lock().unwrap().push_back(expanded);
             return;
@@ -945,6 +960,9 @@ impl App {
                  /rewind         pick a past message to rewind to (conversation + files)\n\
                  /branch <name>  save the conversation as a branch and keep going\n\
                  /branches       switch between saved conversation lines (d deletes)\n\
+                 /run [wf] <task> run a stage pipeline on a task from here; the final\n\
+                                 output joins this conversation (default workflow unless\n\
+                                 the first word names one — see soa stages)\n\
                  /stage <name>   switch the active stage\n\
                  /model <name>   override the model for this session (/model default reverts)\n\
                  /reload         re-read the config file (MCP changes need a restart)\n\
@@ -999,6 +1017,7 @@ impl App {
                 ));
             }
             "diff" => self.toggle_diff_view(),
+            "run" => self.start_workflow(arg),
             "rewind" => self.open_rewind(),
             "branch" => self.stash_branch(arg),
             "branches" => self.open_branches(),
@@ -1224,6 +1243,77 @@ impl App {
         self.turn = Some(tokio::spawn(worker));
     }
 
+    /// `/run [workflow] <task>`: execute a stage pipeline from the chat.
+    /// Progress streams into the transcript; the final stage's output joins
+    /// the conversation history, so the chat can continue from the result.
+    fn start_workflow(&mut self, arg: &str) {
+        if self.is_running() {
+            return self.error("busy — wait for the current turn to finish (Esc cancels)");
+        }
+        let workflow_names: Vec<&str> =
+            self.config.workflows.keys().map(String::as_str).collect();
+        let Some((workflow, task)) = parse_run(arg, &workflow_names) else {
+            return self.info(format!(
+                "usage: /run [workflow] <task>{}",
+                if workflow_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — workflows: {}", workflow_names.join(", "))
+                },
+            ));
+        };
+        let order = match self.config.resolve_workflow(workflow) {
+            Ok(order) if order.is_empty() => return self.error("the selected workflow is empty"),
+            Ok(order) => order,
+            Err(e) => return self.error(format!("{e:#}")),
+        };
+        let label = workflow.unwrap_or("default").to_string();
+        let banner = format!(
+            "▶ workflow `{label}`: {}",
+            order
+                .iter()
+                .map(|&i| self.config.stages[i].name.as_str())
+                .collect::<Vec<_>>()
+                .join(" → "),
+        );
+
+        self.has_activity = true;
+        // A workflow run is a rewind target like any turn-starting message.
+        self.checkpoints.push(Checkpoint {
+            transcript_index: self.transcript.len(),
+            history_len: self.history.len(),
+            diff_len: self.diffs.len(),
+        });
+        let (expanded, reports) = crate::mentions::expand_mentions(
+            task,
+            std::path::Path::new(&self.cwd),
+            self.config.settings.max_tool_output_chars,
+        );
+        self.transcript.push(TranscriptItem::User(task.to_string()));
+        for report in &reports {
+            self.info(report.describe());
+        }
+        self.info(banner);
+        self.scroll_from_bottom = 0;
+
+        self.steer_queue.lock().unwrap().clear();
+        self.steered_this_turn.clear();
+        let worker = workflow_worker(
+            Arc::clone(&self.config),
+            Arc::clone(&self.mcp),
+            self.http.clone(),
+            Arc::clone(&self.approvals),
+            order,
+            label.clone(),
+            expanded,
+            self.tx.clone(),
+        );
+        self.compacting = false;
+        self.workflow_running = Some(label);
+        self.turn = Some(tokio::spawn(worker));
+        self.persist();
+    }
+
     fn start_compact(&mut self) {
         if self.is_running() {
             return self.error("busy — wait for the current turn to finish");
@@ -1293,10 +1383,17 @@ impl App {
         if let Some(handle) = self.turn.take() {
             handle.abort();
             self.compacting = false;
+            let workflow = self.workflow_running.take();
             self.pending_approval = None; // dropped responder reads as deny
             self.flush_stream_buffer();
             self.preserve_steered();
-            self.info("cancelled");
+            self.info(match workflow {
+                Some(name) => format!(
+                    "cancelled workflow `{name}` — file changes it already made remain \
+                     (Ctrl+G to review or restore)"
+                ),
+                None => "cancelled".to_string(),
+            });
         }
     }
 
@@ -1579,7 +1676,13 @@ impl App {
     }
 
     pub fn status_word(&self) -> &'static str {
-        if self.compacting { "compacting" } else { "thinking" }
+        if self.compacting {
+            "compacting"
+        } else if self.workflow_running.is_some() {
+            "running workflow"
+        } else {
+            "thinking"
+        }
     }
 
     /// Steered messages waiting to be delivered to the running turn.
@@ -1598,6 +1701,7 @@ impl App {
                 | AgentEvent::Compacted { .. }
                 | AgentEvent::Error(_)
                 | AgentEvent::Diff(_)
+                | AgentEvent::WorkflowDone { .. }
         );
         match event {
             AgentEvent::Delta(fragment) => {
@@ -1669,6 +1773,56 @@ impl App {
                     fmt_tokens(after as u64)
                 ));
             }
+            AgentEvent::StageStart { stage, run } => {
+                // Keep the previous stage's streamed output as transcript
+                // content, then mark the boundary.
+                self.flush_stream_buffer();
+                self.info(format!("── stage {stage} (run {run}) ──"));
+            }
+            AgentEvent::WorkflowDone { workflow, task, result } => {
+                self.turn = None;
+                self.workflow_running = None;
+                match result {
+                    Ok(output) => {
+                        // The buffer holds the final stage's streamed text;
+                        // the event's copy is authoritative.
+                        self.stream_buffer.clear();
+                        // The exchange joins the conversation, so the chat
+                        // model can discuss what the pipeline produced.
+                        self.history.push(ChatMessage::User { content: task });
+                        self.history.push(ChatMessage::Assistant {
+                            content: Some(output.clone()),
+                            tool_calls: None,
+                        });
+                        if output.trim().is_empty() {
+                            self.info(format!("workflow `{workflow}` finished (empty output)"));
+                        } else {
+                            self.transcript.push(TranscriptItem::Assistant(output));
+                        }
+                        self.info(format!(
+                            "✔ workflow `{workflow}` finished — its result is in this \
+                             conversation's context"
+                        ));
+                        self.last_usage = None; // per-turn usage doesn't span pipelines
+                        // Messages typed during the run become the next turn.
+                        let leftovers: Vec<String> =
+                            self.steer_queue.lock().unwrap().drain(..).collect();
+                        self.steered_this_turn.clear();
+                        if !leftovers.is_empty() {
+                            for content in leftovers {
+                                self.history.push(ChatMessage::User { content });
+                            }
+                            self.info("↪ sending queued message(s)");
+                            self.start_turn();
+                        }
+                    }
+                    Err(message) => {
+                        self.flush_stream_buffer();
+                        self.error(format!("workflow `{workflow}` failed: {message}"));
+                        self.preserve_steered();
+                    }
+                }
+            }
             AgentEvent::Error(message) => {
                 self.flush_stream_buffer();
                 self.error(message);
@@ -1681,6 +1835,114 @@ impl App {
             self.persist();
         }
     }
+}
+
+/// Split a `/run` argument into an optional workflow name and the task:
+/// the first word selects a workflow when it names one, otherwise the
+/// whole argument is the task for the default workflow. None means there
+/// is no task to run (empty, or a workflow name with nothing after it).
+fn parse_run<'a>(arg: &'a str, workflows: &[&str]) -> Option<(Option<&'a str>, &'a str)> {
+    let arg = arg.trim();
+    let (first, rest) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    if workflows.contains(&first) {
+        let task = rest.trim();
+        return (!task.is_empty()).then_some((Some(first), task));
+    }
+    (!arg.is_empty()).then_some((None, arg))
+}
+
+/// A `/run` pipeline as a background task: the stage loop from `soa run`,
+/// reporting through [`AgentEvent`]s instead of stderr — stage banners,
+/// streamed content, captured file diffs, and a final [`AgentEvent::WorkflowDone`].
+#[allow(clippy::too_many_arguments)]
+async fn workflow_worker(
+    config: Arc<Config>,
+    mcp: Arc<McpManager>,
+    http: reqwest::Client,
+    approvals: Arc<Approvals>,
+    order: Vec<usize>,
+    workflow: String,
+    task: String,
+    tx: UnboundedSender<AgentEvent>,
+) {
+    let delta_tx = tx.clone();
+    let on_delta = move |fragment: &str| {
+        let _ = delta_tx.send(AgentEvent::Delta(fragment.to_string()));
+    };
+    let diff_tx = tx.clone();
+    let on_diff = move |entry: crate::diff::DiffEntry| {
+        let _ = diff_tx.send(AgentEvent::Diff(entry));
+    };
+    let done = |result: Result<String, String>| AgentEvent::WorkflowDone {
+        workflow: workflow.clone(),
+        task: task.clone(),
+        result,
+    };
+
+    let stage_names: Vec<&str> =
+        order.iter().map(|&i| config.stages[i].name.as_str()).collect();
+    let mut context = crate::stage::PipelineContext::new(&task);
+    let mut position = 0usize;
+    let mut runs = 0u32;
+    let mut last_output = String::new();
+
+    while position < order.len() {
+        let stage = &config.stages[order[position]];
+        runs += 1;
+        if runs > config.settings.max_stage_runs {
+            let _ = tx.send(done(Err(format!(
+                "stopped after {} stage runs without finishing — likely a reprompt \
+                 loop; raise settings.max_stage_runs if this is intentional",
+                config.settings.max_stage_runs
+            ))));
+            return;
+        }
+        let _ = tx.send(AgentEvent::StageStart { stage: stage.name.clone(), run: runs });
+
+        let is_first = context.previous.is_none();
+        let reprompt_targets: Vec<String> = stage
+            .can_reprompt
+            .iter()
+            .filter(|t| stage_names.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        match crate::stage::run_stage(
+            &config,
+            stage,
+            is_first,
+            &context,
+            &mcp,
+            &http,
+            &reprompt_targets,
+            Some(&on_delta),
+            Some(&on_diff),
+            &approvals,
+        )
+        .await
+        {
+            Ok(crate::stage::StageOutcome::Final(output)) => {
+                context.record(&stage.name, output.clone());
+                last_output = output;
+                position += 1;
+            }
+            Ok(crate::stage::StageOutcome::Reprompt { target, instructions }) => {
+                let _ = tx.send(AgentEvent::Notice(format!(
+                    "↩ {} reprompts {}: {instructions}",
+                    stage.name, target
+                )));
+                context.record(&stage.name, instructions);
+                position = stage_names
+                    .iter()
+                    .position(|name| *name == target)
+                    .expect("reprompt targets are filtered to the workflow");
+            }
+            Err(e) => {
+                let _ = tx.send(done(Err(format!("{e:#}"))));
+                return;
+            }
+        }
+    }
+    let _ = tx.send(done(Ok(last_output)));
 }
 
 /// One full agentic turn, run as a background task. Owns a clone of the
@@ -1979,6 +2241,67 @@ mod tests {
         // Conversation truncated (only the rewind notice remains)…
         assert!(matches!(app.transcript.as_slice(), [TranscriptItem::Info(_)]));
         assert_eq!(app.diffs.len(), 1); // …but the diff log survives
+    }
+
+    #[test]
+    fn parse_run_splits_workflow_and_task() {
+        let workflows = ["default", "quickfix"];
+        // First word naming a workflow selects it; the rest is the task.
+        assert_eq!(parse_run("quickfix fix the bug", &workflows), Some((Some("quickfix"), "fix the bug")));
+        // Otherwise the whole argument is the task for the default workflow.
+        assert_eq!(parse_run("fix the bug", &workflows), Some((None, "fix the bug")));
+        // A task that merely starts with a workflow-like word still works.
+        assert_eq!(parse_run("quickfixes are bad", &workflows), Some((None, "quickfixes are bad")));
+        // No task → no run.
+        assert_eq!(parse_run("", &workflows), None);
+        assert_eq!(parse_run("   ", &workflows), None);
+        assert_eq!(parse_run("quickfix", &workflows), None);
+        assert_eq!(parse_run("quickfix   ", &workflows), None);
+    }
+
+    #[test]
+    fn workflow_done_joins_the_conversation() {
+        let mut app = test_app();
+        app.transcript.push(TranscriptItem::User("do the thing".to_string()));
+
+        app.on_agent_event(AgentEvent::StageStart { stage: "s".to_string(), run: 1 });
+        assert!(matches!(app.transcript.last(), Some(TranscriptItem::Info(text))
+            if text.contains("stage s")));
+
+        app.workflow_running = Some("default".to_string());
+        app.stream_buffer = "the final answer".to_string(); // streamed copy
+        app.on_agent_event(AgentEvent::WorkflowDone {
+            workflow: "default".to_string(),
+            task: "do the thing (expanded)".to_string(),
+            result: Ok("the final answer".to_string()),
+        });
+
+        // The exchange landed in the model history (expanded task, output),
+        // the transcript shows the output once, and the run state cleared.
+        assert!(app.workflow_running.is_none());
+        assert!(!app.is_running());
+        assert!(app.stream_buffer.is_empty());
+        assert!(matches!(&app.history[..], [
+            ChatMessage::User { content },
+            ChatMessage::Assistant { content: Some(output), .. },
+        ] if content == "do the thing (expanded)" && output == "the final answer"));
+        let answers = app
+            .transcript
+            .iter()
+            .filter(|t| matches!(t, TranscriptItem::Assistant(text) if text == "the final answer"))
+            .count();
+        assert_eq!(answers, 1);
+
+        // A failed workflow reports the error and leaves history untouched.
+        app.workflow_running = Some("default".to_string());
+        app.on_agent_event(AgentEvent::WorkflowDone {
+            workflow: "default".to_string(),
+            task: "again".to_string(),
+            result: Err("stage `s` blew up".to_string()),
+        });
+        assert_eq!(app.history.len(), 2);
+        assert!(matches!(app.transcript.last(), Some(TranscriptItem::Error(text))
+            if text.contains("blew up")));
     }
 
     #[test]

@@ -779,10 +779,15 @@ pub fn build_client(
     Ok(ChatClient::new(http.clone(), targets, config.settings.provider_retries))
 }
 
+/// Receives a [`crate::diff::DiffEntry`] for each file change a stage's
+/// write tools make, when the caller wants them (the chat TUI's diff
+/// viewer does; plain CLI runs pass None).
+pub type DiffSink<'a> = Option<&'a (dyn Fn(crate::diff::DiffEntry) + Send + Sync)>;
+
 /// Run one stage to completion. `reprompt_targets` are the stages the model
 /// may hand control to via `reprompt_stage` (empty = tool not offered, as in
 /// chat mode and single-stage runs). `on_delta` receives streamed content
-/// fragments for live display.
+/// fragments for live display; `on_diff` receives captured file changes.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stage(
     config: &Config,
@@ -793,6 +798,7 @@ pub async fn run_stage(
     http: &reqwest::Client,
     reprompt_targets: &[String],
     on_delta: Option<crate::provider::DeltaHandler<'_>>,
+    on_diff: DiffSink<'_>,
     approvals: &Approvals,
 ) -> Result<StageOutcome> {
     let client =
@@ -932,13 +938,23 @@ pub async fn run_stage(
             }
             let output = match bindings.get(call.function.name.as_str()) {
                 Some(tool) => {
+                    // Snapshot files a write tool might touch, for the
+                    // caller's diff sink.
+                    let snapshots = if on_diff.is_some()
+                        && !tool.read_only
+                        && matches!(tool.binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
+                    {
+                        crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
+                    } else {
+                        Vec::new()
+                    };
                     let policy = CallPolicy::for_tool(
                         stage.require_approval,
                         &stage.auto_approve,
                         approvals,
                         tool.read_only,
                     );
-                    dispatch_tool_call(
+                    let output = dispatch_tool_call(
                         &tool.binding,
                         &call.function.arguments,
                         config,
@@ -947,7 +963,15 @@ pub async fn run_stage(
                         0,
                         &policy,
                     )
-                    .await?
+                    .await?;
+                    if let Some(on_diff) = on_diff {
+                        for entry in
+                            crate::diff::collect_changes(&call.function.name, snapshots)
+                        {
+                            on_diff(entry);
+                        }
+                    }
+                    output
                 }
                 None => format!("ERROR: unknown tool `{}`", call.function.name),
             };

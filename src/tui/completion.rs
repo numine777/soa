@@ -21,6 +21,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit"),
     ("reload", "re-read the config file"),
     ("rewind", "rewind conversation and files to a previous message"),
+    ("run", "run a workflow on a task from this chat"),
     ("sessions", "open the session picker"),
     ("stage", "switch the active stage"),
     ("usage", "cumulative token usage per model"),
@@ -58,6 +59,7 @@ pub fn compute(
     cwd: &Path,
     stage_names: &[String],
     model_names: &[String],
+    workflow_names: &[String],
 ) -> Option<Completion> {
     let chars: Vec<char> = line.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -78,7 +80,7 @@ pub fn compute(
                 .collect();
             return build(items, 1);
         }
-        // `/stage <partial>` and `/model <partial>`: complete the argument.
+        // `/stage`, `/model`, and `/run`: complete the first argument.
         let (partial, candidates): (&str, Vec<&str>) =
             if let Some(partial) = token.strip_prefix("stage ") {
                 (partial, stage_names.iter().map(String::as_str).collect())
@@ -86,6 +88,8 @@ pub fn compute(
                 let mut names: Vec<&str> = model_names.iter().map(String::as_str).collect();
                 names.push("default");
                 (partial, names)
+            } else if let Some(partial) = token.strip_prefix("run ") {
+                (partial, workflow_names.iter().map(String::as_str).collect())
             } else {
                 return None;
             };
@@ -191,6 +195,7 @@ mod tests {
             cwd,
             &["research".into(), "review".into()],
             &["planner".into(), "coder".into()],
+            &["default".into(), "quickfix".into()],
         )
     }
 
@@ -224,9 +229,15 @@ mod tests {
             vec!["planner", "coder", "default"]
         );
 
+        // `/run` completes workflow names for its first argument only —
+        // after that the argument is free-form task text.
+        let c = compute_at("/run qu", &cwd).unwrap();
+        assert_eq!(c.items[0].label, "quickfix");
+        assert!(compute_at("/run quickfix fix the", &cwd).is_none());
+
         // Unknown prefixes and non-first lines don't pop up.
         assert!(compute_at("/zzz", &cwd).is_none());
-        assert!(compute("/c", 2, false, &cwd, &[], &[]).is_none());
+        assert!(compute("/c", 2, false, &cwd, &[], &[], &[]).is_none());
         // Other commands take no arguments.
         assert!(compute_at("/help me", &cwd).is_none());
     }

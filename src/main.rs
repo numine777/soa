@@ -425,6 +425,7 @@ async fn run_pipeline(
             &http,
             &[],
             Some(&stream_to_stderr),
+            None,
             &approvals,
         )
         .await;
@@ -546,6 +547,7 @@ async fn run_workflow(
             http,
             &reprompt_targets,
             Some(&stream_to_stderr),
+            None,
             &approvals,
         )
         .await

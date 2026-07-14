@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::app::TranscriptItem;
 use crate::diff::DiffEntry;
-use crate::provider::ChatMessage;
+use crate::model::Message;
 
 const PROMPT_HISTORY_LIMIT: usize = 1000;
 
@@ -113,7 +113,7 @@ pub struct Branch {
     pub name: String,
     pub created_at: u64,
     pub transcript: Vec<TranscriptItem>,
-    pub history: Vec<ChatMessage>,
+    pub history: Vec<Message>,
     pub checkpoints: Vec<Checkpoint>,
     /// Display baselines this line had when stashed (see [`Session`]).
     #[serde(default)]
@@ -149,7 +149,7 @@ pub struct Session {
     /// shows sessions for the current directory. Empty on legacy sessions.
     #[serde(default)]
     pub cwd: String,
-    pub history: Vec<ChatMessage>,
+    pub history: Vec<Message>,
     pub transcript: Vec<TranscriptItem>,
     pub diffs: Vec<DiffEntry>,
     /// Rewind targets (empty on sessions saved by older soa versions).
@@ -293,7 +293,7 @@ mod tests {
                 stage: "review".to_string(),
                 title: "fix the widget".to_string(),
                 cwd: "/tmp/proj".to_string(),
-                history: vec![ChatMessage::User { content: "hi".to_string() }],
+                history: vec![Message::User { content: "hi".to_string() }],
                 transcript: vec![TranscriptItem::User("hi".to_string())],
                 diffs: vec![],
                 checkpoints: vec![Checkpoint {

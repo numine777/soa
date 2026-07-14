@@ -14,7 +14,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::provider::ToolFunction;
+use crate::model::ToolDefinition;
 
 /// Directory names never descended into by `glob` and `grep`.
 const IGNORED_DIRS: &[&str] = &[".git", "node_modules", "target"];
@@ -55,7 +55,7 @@ impl FileOp {
 
 /// The file tools a context exposes: read-only ones always, write ones
 /// only when `read_write` is true. The bool is the read-only flag.
-pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
+pub fn definitions(read_write: bool) -> Vec<(ToolDefinition, FileOp, bool)> {
     let path_property = |description: &str| {
         json!({ "type": "string", "description": description })
     };
@@ -75,7 +75,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
     };
     let mut tools = vec![
         (
-            ToolFunction {
+            ToolDefinition {
                 name: read_op.tool_name().to_string(),
                 description: read_description.to_string(),
                 parameters: json!({
@@ -92,7 +92,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
             true,
         ),
         (
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::List.tool_name().to_string(),
                 description: "List a directory: entries sorted name-ascending, \
                     directories marked with a trailing `/`."
@@ -108,7 +108,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
             true,
         ),
         (
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::Glob.tool_name().to_string(),
                 description: format!(
                     "Find files whose working-directory-relative path matches a `*` \
@@ -128,7 +128,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
             true,
         ),
         (
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::Grep.tool_name().to_string(),
                 description: format!(
                     "Search file contents with a regular expression (prefix `(?i)` for \
@@ -152,7 +152,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
     ];
     if read_write {
         tools.push((
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::Write.tool_name().to_string(),
                 description: "Write a file, creating it (and parent directories) or \
                     replacing its content entirely. For small changes to an existing \
@@ -171,7 +171,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
             false,
         ));
         tools.push((
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::EditLines.tool_name().to_string(),
                 description: "Replace a range of lines using anchors from read_file. \
                     `first` and `last` are anchors like `42:9f3a` copied verbatim from \
@@ -198,7 +198,7 @@ pub fn definitions(read_write: bool) -> Vec<(ToolFunction, FileOp, bool)> {
             false,
         ));
         tools.push((
-            ToolFunction {
+            ToolDefinition {
                 name: FileOp::Edit.tool_name().to_string(),
                 description: "Replace an exact string in a file. `old_string` must \
                     match exactly once (include surrounding lines to disambiguate), \

@@ -221,11 +221,14 @@ fn default_hook_match() -> String {
     "*".to_string()
 }
 
-/// An OpenAI-compatible chat-completions endpoint (Ollama, LM Studio,
-/// llama.cpp, vLLM, or a hosted API).
+/// A model API endpoint plus the wire adapter used to reach it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
+    /// Provider wire protocol. Defaults to the existing OpenAI-compatible
+    /// `/chat/completions` adapter.
+    #[serde(default)]
+    pub adapter: ProviderAdapterKind,
     /// e.g. "http://localhost:11434/v1"
     pub base_url: String,
     /// Optional bearer token. Supports `${ENV_VAR}` expansion.
@@ -239,6 +242,13 @@ pub struct Provider {
     /// fallback unless the model explicitly opts in.
     #[serde(default)]
     pub data_boundary: DataBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAdapterKind {
+    #[default]
+    OpenAiChatCompletions,
 }
 
 fn default_true() -> bool {
@@ -920,6 +930,23 @@ mod tests {
         assert_eq!(config.stages.len(), 1);
         assert_eq!(config.stages[0].mode, Mode::ReadOnly);
         assert_eq!(config.settings.default_max_turns, 16);
+        assert_eq!(
+            config.providers["local"].adapter,
+            ProviderAdapterKind::OpenAiChatCompletions
+        );
+    }
+
+    #[test]
+    fn provider_adapter_can_be_selected_explicitly() {
+        let explicit = MINIMAL.replace(
+            "base_url = \"http://localhost:11434/v1\"",
+            "adapter = \"open_ai_chat_completions\"\nbase_url = \"http://localhost:11434/v1\"",
+        );
+        assert!(parse(&explicit).is_ok());
+
+        let unknown = explicit.replace("open_ai_chat_completions", "mystery_protocol");
+        let error = parse(&unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown variant"), "{error}");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::model::JsonObject;
@@ -11,7 +12,9 @@ use serde_json::Value;
 use crate::approval::{Approvals, Decision};
 use crate::config::{Config, DataBoundary, McpServer, Mode, Stage, ToolEffect};
 use crate::mcp::McpManager;
-use crate::provider::{ChatClient, ChatMessage, SamplingParams, ToolFunction};
+use crate::model::{
+    Message, ModelClient, ModelTarget, ProviderAdapter, SamplingParams, ToolDefinition,
+};
 use crate::tools;
 
 /// Render `{{input}}`, `{{previous}}`, and `{{stage.<name>}}` placeholders.
@@ -127,7 +130,7 @@ impl ToolEffects {
 }
 
 pub struct StageTool {
-    pub definition: ToolFunction,
+    pub definition: ToolDefinition,
     pub binding: ToolBinding,
     pub effects: ToolEffects,
 }
@@ -187,8 +190,8 @@ pub enum StageOutcome {
 pub const REPROMPT_TOOL: &str = "reprompt_stage";
 
 /// The routing tool offered to stages with a non-empty `can_reprompt` list.
-fn reprompt_tool(targets: &[String]) -> ToolFunction {
-    ToolFunction {
+fn reprompt_tool(targets: &[String]) -> ToolDefinition {
+    ToolDefinition {
         name: REPROMPT_TOOL.to_string(),
         description: "Hand control to another stage because more work is needed. \
             The pipeline resumes from that stage and continues in order (so a stage \
@@ -258,7 +261,7 @@ pub fn assemble_tools(
                 effects.insert(ToolEffect::NetworkEgress);
             }
             stage_tools.push(StageTool {
-                definition: ToolFunction {
+                definition: ToolDefinition {
                     name: sanitize_tool_name(&format!("{server_name}__{}", tool.name)),
                     description: tool.description.clone().unwrap_or_default().into_owned(),
                     parameters: Value::Object((*tool.input_schema).clone()),
@@ -353,7 +356,7 @@ pub fn assemble_tools(
                 agent.description.clone()
             };
             stage_tools.push(StageTool {
-                definition: ToolFunction {
+                definition: ToolDefinition {
                     name: sanitize_tool_name(&format!("agent__{agent_name}")),
                     description: format!(
                         "{about} Runs as a separate agent with its own tools and no memory \
@@ -453,7 +456,7 @@ impl<'a> CallPolicy<'a> {
 /// knows how to answer them.
 pub fn parallel_round(
     enabled: bool,
-    calls: &[crate::provider::ToolCall],
+    calls: &[crate::model::ToolCall],
     parallel_safe_of: impl Fn(&str) -> Option<bool>,
 ) -> bool {
     enabled
@@ -727,10 +730,10 @@ pub fn run_agent<'a>(
             .get(agent_name)
             .ok_or_else(|| anyhow!("unknown agent `{agent_name}`"))?;
         let client =
-            build_client(config, &agent.model, agent.temperature, agent.max_tokens, http)?;
+            build_model_client(config, &agent.model, agent.temperature, agent.max_tokens, http)?;
 
         let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
-        let definitions: Vec<ToolFunction> =
+        let definitions: Vec<ToolDefinition> =
             agent_tools.iter().map(|t| t.definition.clone()).collect();
         let bindings: BTreeMap<&str, &StageTool> = agent_tools
             .iter()
@@ -745,9 +748,9 @@ pub fn run_agent<'a>(
         )?;
         let mut messages = Vec::new();
         if let Some(system) = system {
-            messages.push(ChatMessage::System { content: system });
+            messages.push(Message::System { content: system });
         }
-        messages.push(ChatMessage::User { content: task.to_string() });
+        messages.push(Message::User { content: task.to_string() });
 
         let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
         tracing::info!(
@@ -756,7 +759,7 @@ pub fn run_agent<'a>(
         );
 
         for turn in 1..=max_turns {
-            let reply = client.chat(&messages, &definitions).await?;
+            let reply = client.complete(&messages, &definitions).await?;
 
             if reply.tool_calls.is_empty() {
                 tracing::info!(agent = %agent_name, turns = turn, "agent complete");
@@ -776,7 +779,7 @@ pub fn run_agent<'a>(
             }
 
             let tool_calls = reply.tool_calls.clone();
-            messages.push(ChatMessage::Assistant {
+            messages.push(Message::Assistant {
                 content: reply.content,
                 tool_calls: Some(reply.tool_calls),
             });
@@ -821,7 +824,7 @@ pub fn run_agent<'a>(
                 }))
                 .await;
                 for (call, output) in tool_calls.iter().zip(outputs) {
-                    messages.push(ChatMessage::Tool {
+                    messages.push(Message::Tool {
                         content: output?,
                         tool_call_id: call.id.clone(),
                     });
@@ -857,7 +860,7 @@ pub fn run_agent<'a>(
                     }
                     None => format!("ERROR: unknown tool `{}`", call.function.name),
                 };
-                messages.push(ChatMessage::Tool { content: output, tool_call_id: call.id });
+                messages.push(Message::Tool { content: output, tool_call_id: call.id });
             }
         }
 
@@ -888,18 +891,19 @@ impl PipelineContext {
     }
 }
 
-/// Build a chat client for a named model, with optional caller-level
-/// sampling overrides taking precedence over each model's defaults. The
-/// client's targets are the model followed by its fallback chain,
-/// resolved breadth-first with cycles ignored.
-pub fn build_client(
+/// Build a canonical model client for a named model, with optional
+/// caller-level sampling overrides taking precedence over each model's
+/// defaults. The client's targets are the model followed by its fallback
+/// chain, resolved breadth-first with cycles ignored.
+pub fn build_model_client(
     config: &Config,
     model_name: &str,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
     http: &reqwest::Client,
-) -> Result<ChatClient> {
+) -> Result<ModelClient> {
     let mut targets = Vec::new();
+    let mut adapters: BTreeMap<String, Arc<dyn ProviderAdapter>> = BTreeMap::new();
     let mut queue = std::collections::VecDeque::from([model_name.to_string()]);
     let mut seen = std::collections::BTreeSet::new();
     while let Some(name) = queue.pop_front() {
@@ -914,23 +918,26 @@ pub fn build_client(
             .providers
             .get(&model.provider)
             .ok_or_else(|| anyhow!("unknown provider `{}`", model.provider))?;
-        targets.push(crate::provider::Target {
-            base_url: provider.base_url.clone(),
-            api_key: provider.api_key.clone(),
+        let adapter = adapters
+            .entry(model.provider.clone())
+            .or_insert_with(|| crate::providers::build_adapter(provider, http.clone()))
+            .clone();
+        targets.push(ModelTarget {
             model: model.model.clone(),
             label: name,
-            params: SamplingParams {
+            sampling: SamplingParams {
                 temperature: temperature.or(model.temperature),
                 top_p: model.top_p,
                 max_tokens: max_tokens.or(model.max_tokens),
             },
             stream: provider.stream,
             external: provider.data_boundary == DataBoundary::External,
+            adapter,
         });
         queue.extend(model.fallback.iter().cloned());
     }
 
-    Ok(ChatClient::new(http.clone(), targets, config.settings.provider_retries))
+    Ok(ModelClient::new(targets, config.settings.provider_retries))
 }
 
 /// Receives a [`crate::diff::DiffEntry`] for each file change a stage's
@@ -951,15 +958,15 @@ pub async fn run_stage(
     mcp: &McpManager,
     http: &reqwest::Client,
     reprompt_targets: &[String],
-    on_delta: Option<crate::provider::DeltaHandler<'_>>,
+    on_delta: Option<crate::model::DeltaHandler<'_>>,
     on_diff: DiffSink<'_>,
     approvals: &Approvals,
 ) -> Result<StageOutcome> {
     let client =
-        build_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
+        build_model_client(config, &stage.model, stage.temperature, stage.max_tokens, http)?;
 
     let stage_tools = assemble_tools(&stage.tool_profile(), config, mcp, 0)?;
-    let mut definitions: Vec<ToolFunction> =
+    let mut definitions: Vec<ToolDefinition> =
         stage_tools.iter().map(|t| t.definition.clone()).collect();
     if !reprompt_targets.is_empty() {
         definitions.push(reprompt_tool(reprompt_targets));
@@ -984,9 +991,9 @@ pub async fn run_stage(
     )?;
     let mut messages = Vec::new();
     if let Some(system) = system {
-        messages.push(ChatMessage::System { content: system });
+        messages.push(Message::System { content: system });
     }
-    messages.push(ChatMessage::User { content: user_prompt });
+    messages.push(Message::User { content: user_prompt });
 
     let max_turns = stage.max_turns.unwrap_or(config.settings.default_max_turns);
     tracing::info!(
@@ -995,7 +1002,7 @@ pub async fn run_stage(
     );
 
     for turn in 1..=max_turns {
-        let reply = client.chat_streamed(&messages, &definitions, on_delta).await?;
+        let reply = client.complete_streamed(&messages, &definitions, on_delta).await?;
 
         // Terminate the streamed text before anything else (logs, tool
         // lines) writes to the same terminal.
@@ -1025,7 +1032,7 @@ pub async fn run_stage(
         }
 
         let tool_calls = reply.tool_calls.clone();
-        messages.push(ChatMessage::Assistant {
+        messages.push(Message::Assistant {
             content: reply.content,
             tool_calls: Some(reply.tool_calls),
         });
@@ -1070,7 +1077,7 @@ pub async fn run_stage(
             }))
             .await;
             for (call, output) in tool_calls.iter().zip(outputs) {
-                messages.push(ChatMessage::Tool {
+                messages.push(Message::Tool {
                     content: output?,
                     tool_call_id: call.id.clone(),
                 });
@@ -1090,7 +1097,7 @@ pub async fn run_stage(
                     Ok(outcome) => return Ok(outcome),
                     Err(problem) => {
                         // Give the model the validation error and let it retry.
-                        messages.push(ChatMessage::Tool {
+                        messages.push(Message::Tool {
                             content: format!("ERROR: {problem}"),
                             tool_call_id: call.id,
                         });
@@ -1139,7 +1146,7 @@ pub async fn run_stage(
                 None => format!("ERROR: unknown tool `{}`", call.function.name),
             };
             tracing::debug!(stage = %stage.name, tool = %call.function.name, output = %truncate(&output, 500));
-            messages.push(ChatMessage::Tool {
+            messages.push(Message::Tool {
                 content: output,
                 tool_call_id: call.id,
             });
@@ -1159,7 +1166,7 @@ pub async fn run_stage(
 pub fn context_pressure(
     config: &Config,
     model_name: &str,
-    usage: Option<&crate::provider::Usage>,
+    usage: Option<&crate::model::Usage>,
 ) -> Option<(u64, u64)> {
     let threshold = config.settings.auto_compact_threshold;
     if threshold <= 0.0 {
@@ -1173,12 +1180,12 @@ pub fn context_pressure(
 /// Free context by truncating older tool results in place, keeping the
 /// most recent `keep_recent` intact. Returns how many were trimmed.
 /// Deterministic (no model call), so it's safe mid-stage.
-pub fn shed_context(messages: &mut [ChatMessage], keep_recent: usize) -> usize {
+pub fn shed_context(messages: &mut [Message], keep_recent: usize) -> usize {
     const MARKER: &str = "[trimmed: an earlier tool result was truncated to save context]";
     let tool_indices: Vec<usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, ChatMessage::Tool { .. }))
+        .filter(|(_, m)| matches!(m, Message::Tool { .. }))
         .map(|(i, _)| i)
         .collect();
     if tool_indices.len() <= keep_recent {
@@ -1186,7 +1193,7 @@ pub fn shed_context(messages: &mut [ChatMessage], keep_recent: usize) -> usize {
     }
     let mut trimmed = 0;
     for &index in &tool_indices[..tool_indices.len() - keep_recent] {
-        if let ChatMessage::Tool { content, .. } = &mut messages[index] {
+        if let Message::Tool { content, .. } = &mut messages[index] {
             if content.starts_with(MARKER) || content.chars().count() <= 400 {
                 continue;
             }
@@ -1335,20 +1342,19 @@ mod tests {
         )
         .unwrap();
         let http = reqwest::Client::new();
-        let client = build_client(&config, "a", None, None, &http).unwrap();
+        let client = build_model_client(&config, "a", None, None, &http).unwrap();
         // a's own fallbacks first, then theirs; the cycle back to `a` is cut.
         assert_eq!(client.target_labels(), vec!["a", "b", "c", "d"]);
         // A model with no fallbacks yields a single target.
-        let solo = build_client(&config, "c", None, None, &http).unwrap();
+        let solo = build_model_client(&config, "c", None, None, &http).unwrap();
         assert_eq!(solo.target_labels(), vec!["c"]);
     }
 
     #[test]
     fn parallel_round_requires_every_call_to_be_safe() {
-        let call = |name: &str| crate::provider::ToolCall {
+        let call = |name: &str| crate::model::ToolCall {
             id: "x".into(),
-            kind: "function".into(),
-            function: crate::provider::FunctionCall { name: name.into(), arguments: "{}".into() },
+            function: crate::model::FunctionCall { name: name.into(), arguments: "{}".into() },
         };
         let parallel_safe = |name: &str| match name {
             "read" => Some(true),
@@ -1481,7 +1487,7 @@ mod tests {
         )
         .unwrap();
         let usage = |prompt, completion| {
-            Some(crate::provider::Usage { prompt_tokens: prompt, completion_tokens: completion })
+            Some(crate::model::Usage { prompt_tokens: prompt, completion_tokens: completion })
         };
 
         // Default threshold 0.8 of 1000: fires at 800 (prompt + completion), not below.
@@ -1503,25 +1509,25 @@ mod tests {
     fn sheds_older_tool_results_only() {
         let big = "x".repeat(1000);
         let mut messages = vec![
-            ChatMessage::System { content: "s".into() },
-            ChatMessage::User { content: "u".into() },
-            ChatMessage::Tool { content: big.clone(), tool_call_id: "1".into() },
-            ChatMessage::Tool { content: big.clone(), tool_call_id: "2".into() },
-            ChatMessage::Tool { content: big.clone(), tool_call_id: "3".into() },
+            Message::System { content: "s".into() },
+            Message::User { content: "u".into() },
+            Message::Tool { content: big.clone(), tool_call_id: "1".into() },
+            Message::Tool { content: big.clone(), tool_call_id: "2".into() },
+            Message::Tool { content: big.clone(), tool_call_id: "3".into() },
         ];
         assert_eq!(shed_context(&mut messages, 2), 1);
-        let ChatMessage::Tool { content, .. } = &messages[2] else { panic!() };
+        let Message::Tool { content, .. } = &messages[2] else { panic!() };
         assert!(content.starts_with("[trimmed"));
         assert!(content.len() < 400);
         // Recent two untouched.
-        let ChatMessage::Tool { content, .. } = &messages[4] else { panic!() };
+        let Message::Tool { content, .. } = &messages[4] else { panic!() };
         assert_eq!(content, &big);
         // Idempotent: already-trimmed entries aren't re-counted.
         assert_eq!(shed_context(&mut messages, 2), 0);
         // Small results aren't worth trimming.
         let mut small = vec![
-            ChatMessage::Tool { content: "tiny".into(), tool_call_id: "1".into() },
-            ChatMessage::Tool { content: big.clone(), tool_call_id: "2".into() },
+            Message::Tool { content: "tiny".into(), tool_call_id: "1".into() },
+            Message::Tool { content: big.clone(), tool_call_id: "2".into() },
         ];
         assert_eq!(shed_context(&mut small, 1), 0);
     }

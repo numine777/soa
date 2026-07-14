@@ -7,12 +7,12 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::provider::ToolFunction;
+use crate::model::ToolDefinition;
 
 pub const WEB_SEARCH_TOOL: &str = "web_search";
 
-pub fn web_search_definition() -> ToolFunction {
-    ToolFunction {
+pub fn web_search_definition() -> ToolDefinition {
+    ToolDefinition {
         name: WEB_SEARCH_TOOL.to_string(),
         description: "Search the web. Returns a numbered list of results with title, URL, and snippet.".to_string(),
         parameters: json!({
@@ -27,7 +27,7 @@ pub fn web_search_definition() -> ToolFunction {
 
 pub const SHELL_TOOL: &str = "shell";
 
-pub fn shell_definition(timeout_secs: u64, allow: &[String]) -> ToolFunction {
+pub fn shell_definition(timeout_secs: u64, allow: &[String]) -> ToolDefinition {
     let mut description = format!(
         "Run a shell command (`sh -c`) in the project working directory and get its \
          exit code, stdout, and stderr. Commands are killed after {timeout_secs}s."
@@ -40,7 +40,7 @@ pub fn shell_definition(timeout_secs: u64, allow: &[String]) -> ToolFunction {
             allow.join(", ")
         ));
     }
-    ToolFunction {
+    ToolDefinition {
         name: SHELL_TOOL.to_string(),
         description,
         parameters: json!({

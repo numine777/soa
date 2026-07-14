@@ -26,7 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::Config;
 use crate::insights::{self, Signal};
-use crate::provider::ChatMessage;
+use crate::model::Message;
 use crate::tui::store::{self, Session};
 
 /// Hard caps that keep the prompt bounded and the written files reviewable.
@@ -235,12 +235,12 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         .timeout(std::time::Duration::from_secs(config.settings.request_timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
-    let client = crate::stage::build_client(config, &model, None, None, &http)?;
+    let client = crate::stage::build_model_client(config, &model, None, None, &http)?;
     let messages = vec![
-        ChatMessage::System { content: SYSTEM_PROMPT.to_string() },
-        ChatMessage::User { content: user_prompt },
+        Message::System { content: SYSTEM_PROMPT.to_string() },
+        Message::User { content: user_prompt },
     ];
-    let reply = client.chat(&messages, &[]).await?;
+    let reply = client.complete(&messages, &[]).await?;
     let text = reply.content.unwrap_or_default();
     let proposal = parse_proposal(&text)
         .with_context(|| format!("model did not return usable JSON:\n{}", excerpt(&text, 400)))?;
@@ -380,7 +380,7 @@ fn digest_session(session: &Session, signals: &[Signal]) -> String {
         .history
         .iter()
         .filter_map(|m| match m {
-            ChatMessage::User { content } => Some(content.as_str()),
+            Message::User { content } => Some(content.as_str()),
             _ => None,
         })
         .collect();
@@ -390,11 +390,11 @@ fn digest_session(session: &Session, signals: &[Signal]) -> String {
     if user_messages.len() > 8 {
         let _ = writeln!(out, "… {} more user message(s)", user_messages.len() - 8);
     }
-    if let Some(ChatMessage::Assistant { content: Some(content), .. }) = session
+    if let Some(Message::Assistant { content: Some(content), .. }) = session
         .history
         .iter()
         .rev()
-        .find(|m| matches!(m, ChatMessage::Assistant { content: Some(_), .. }))
+        .find(|m| matches!(m, Message::Assistant { content: Some(_), .. }))
     {
         let _ = writeln!(out, "final reply: {}", excerpt(content, 240));
     }
@@ -658,11 +658,11 @@ mod tests {
 
     #[test]
     fn digest_names_signals_and_caps_messages() {
-        let mut history = vec![ChatMessage::User { content: "fix the bug".to_string() }];
+        let mut history = vec![Message::User { content: "fix the bug".to_string() }];
         for i in 0..10 {
-            history.push(ChatMessage::User { content: format!("more {i}") });
+            history.push(Message::User { content: format!("more {i}") });
         }
-        history.push(ChatMessage::Assistant {
+        history.push(Message::Assistant {
             content: Some("done, tests pass".to_string()),
             tool_calls: None,
         });

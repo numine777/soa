@@ -7,7 +7,8 @@ mod hooks;
 mod insights;
 mod mcp;
 mod mentions;
-mod provider;
+mod model;
+mod providers;
 mod reflect;
 mod runs;
 mod skills;
@@ -602,7 +603,7 @@ async fn run_workflow(
 /// Per-model token totals for this run, on stderr with the other progress
 /// output. Resumed runs only count the resumed portion.
 fn print_usage_summary() {
-    let lines = provider::usage_stats::report_lines();
+    let lines = model::usage_stats::report_lines();
     if lines.is_empty() {
         return;
     }

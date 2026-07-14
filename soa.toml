@@ -36,14 +36,17 @@ provider_retries = 3
 # reflect_model = "planner"
 
 # ---------------------------------------------------------------------------
-# Providers: OpenAI-compatible chat-completions endpoints.
+# Providers: model endpoints plus their wire adapters. The default adapter is
+# OpenAI-compatible `/chat/completions`; future protocols stay isolated here.
 # ---------------------------------------------------------------------------
 
 [providers.spark]
+adapter = "open_ai_chat_completions"
 base_url = "http://192.168.6.7:8000/v1"
 data_boundary = "local"            # mark hosted/proprietary APIs "external"
 
 [providers.threadripper]
+adapter = "open_ai_chat_completions"
 base_url = "http://192.168.5.188:8000/v1"
 data_boundary = "local"
 # api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment

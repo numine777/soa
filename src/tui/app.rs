@@ -17,9 +17,9 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage, ToolEffect};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
-use crate::provider::{ChatClient, ChatMessage, ToolFunction, Usage, fmt_tokens, usage_stats};
+use crate::model::{Message, ModelClient, ToolDefinition, Usage, fmt_tokens, usage_stats};
 use crate::stage::{
-    CallPolicy, ToolBinding, assemble_tools, build_client, context_pressure,
+    CallPolicy, ToolBinding, assemble_tools, build_model_client, context_pressure,
     dispatch_tool_call, shed_context, ToolEffects,
 };
 
@@ -54,7 +54,7 @@ pub enum AgentEvent {
     Notice(String),
     /// Turn finished: the updated history, the assistant's final text, and
     /// the last reported token usage.
-    Turn { history: Vec<ChatMessage>, text: String, usage: Option<Usage> },
+    Turn { history: Vec<Message>, text: String, usage: Option<Usage> },
     Compacted { summary: String },
     /// A `/run` workflow entered a stage (`run` counts reprompt re-runs).
     StageStart { stage: String, run: u32 },
@@ -83,7 +83,7 @@ pub struct App {
     pub stage_index: usize,
     /// Provider-format conversation history (system prompt excluded; it is
     /// re-resolved from the active stage on every turn).
-    pub history: Vec<ChatMessage>,
+    pub history: Vec<Message>,
     pub transcript: Vec<TranscriptItem>,
     pub diffs: Vec<DiffEntry>,
     /// `/clear` display baselines: transcript items and diff entries before
@@ -390,14 +390,14 @@ impl App {
             .history
             .iter()
             .map(|message| match message {
-                ChatMessage::System { content } | ChatMessage::User { content } => content.len(),
-                ChatMessage::Assistant { content, tool_calls } => {
+                Message::System { content } | Message::User { content } => content.len(),
+                Message::Assistant { content, tool_calls } => {
                     content.as_deref().map_or(0, str::len)
                         + tool_calls.as_ref().map_or(0, |calls| {
                             calls.iter().map(|c| c.function.arguments.len() + 32).sum()
                         })
                 }
-                ChatMessage::Tool { content, .. } => content.len(),
+                Message::Tool { content, .. } => content.len(),
             })
             .sum();
         chars / 4
@@ -936,7 +936,7 @@ impl App {
             return;
         }
 
-        self.history.push(ChatMessage::User { content: expanded });
+        self.history.push(Message::User { content: expanded });
         self.start_turn();
         self.persist();
     }
@@ -1183,7 +1183,7 @@ impl App {
         let config = Arc::clone(&self.config);
         let model_name = self.active_model().to_string();
         let stage = &config.stages[self.stage_index];
-        let client = match build_client(
+        let client = match build_model_client(
             &self.config,
             &model_name,
             stage.temperature,
@@ -1213,7 +1213,7 @@ impl App {
             };
         self.tool_count = stage_tools.len();
 
-        let definitions: Vec<ToolFunction> =
+        let definitions: Vec<ToolDefinition> =
             stage_tools.iter().map(|t| t.definition.clone()).collect();
         let bindings: HashMap<String, (ToolBinding, ToolEffects)> = stage_tools
             .into_iter()
@@ -1326,7 +1326,7 @@ impl App {
             return self.info("nothing to compact");
         }
         let stage = self.stage();
-        let client = match build_client(
+        let client = match build_model_client(
             &self.config,
             self.active_model(),
             stage.temperature,
@@ -1337,11 +1337,11 @@ impl App {
             Err(e) => return self.error(format!("{e:#}")),
         };
         let mut request = self.history.clone();
-        request.push(ChatMessage::User { content: COMPACT_INSTRUCTION.to_string() });
+        request.push(Message::User { content: COMPACT_INSTRUCTION.to_string() });
         let tx = self.tx.clone();
         self.compacting = true;
         self.turn = Some(tokio::spawn(async move {
-            let event = match client.chat(&request, &[]).await {
+            let event = match client.complete(&request, &[]).await {
                 Ok(reply) => AgentEvent::Compacted {
                     summary: reply.content.unwrap_or_default(),
                 },
@@ -1668,7 +1668,7 @@ impl App {
             return;
         }
         for content in queued {
-            self.history.push(ChatMessage::User { content });
+            self.history.push(Message::User { content });
         }
         self.info("queued message(s) kept in context for the next turn");
     }
@@ -1746,7 +1746,7 @@ impl App {
                     self.maybe_auto_compact();
                 } else {
                     for content in leftovers {
-                        self.history.push(ChatMessage::User { content });
+                        self.history.push(Message::User { content });
                     }
                     self.info("↪ sending queued message(s)");
                     self.start_turn();
@@ -1757,12 +1757,12 @@ impl App {
                 // Checkpoints index into the history being replaced.
                 self.checkpoints.clear();
                 self.history = vec![
-                    ChatMessage::User {
+                    Message::User {
                         content: format!(
                             "[Summary of the conversation so far — earlier messages were compacted]\n\n{summary}"
                         ),
                     },
-                    ChatMessage::Assistant {
+                    Message::Assistant {
                         content: Some("Understood — continuing with that context.".to_string()),
                         tool_calls: None,
                     },
@@ -1793,8 +1793,8 @@ impl App {
                         self.stream_buffer.clear();
                         // The exchange joins the conversation, so the chat
                         // model can discuss what the pipeline produced.
-                        self.history.push(ChatMessage::User { content: task });
-                        self.history.push(ChatMessage::Assistant {
+                        self.history.push(Message::User { content: task });
+                        self.history.push(Message::Assistant {
                             content: Some(output.clone()),
                             tool_calls: None,
                         });
@@ -1814,7 +1814,7 @@ impl App {
                         self.steered_this_turn.clear();
                         if !leftovers.is_empty() {
                             for content in leftovers {
-                                self.history.push(ChatMessage::User { content });
+                                self.history.push(Message::User { content });
                             }
                             self.info("↪ sending queued message(s)");
                             self.start_turn();
@@ -1953,14 +1953,14 @@ async fn workflow_worker(
 /// history; the updated history is handed back via [`AgentEvent::Turn`].
 #[allow(clippy::too_many_arguments)]
 async fn turn_worker(
-    client: ChatClient,
-    definitions: Vec<ToolFunction>,
+    client: ModelClient,
+    definitions: Vec<ToolDefinition>,
     bindings: HashMap<String, (ToolBinding, ToolEffects)>,
     config: Arc<Config>,
     mcp: Arc<McpManager>,
     http: reqwest::Client,
     system: Option<String>,
-    mut history: Vec<ChatMessage>,
+    mut history: Vec<Message>,
     max_turns: u32,
     tx: UnboundedSender<AgentEvent>,
     (require_approval, approval_effects, auto_approve): (bool, Vec<ToolEffect>, Vec<String>),
@@ -1976,11 +1976,11 @@ async fn turn_worker(
     for _ in 0..max_turns {
         let mut request = Vec::with_capacity(history.len() + 1);
         if let Some(system) = &system {
-            request.push(ChatMessage::System { content: system.clone() });
+            request.push(Message::System { content: system.clone() });
         }
         request.extend(history.iter().cloned());
 
-        let reply = match client.chat_streamed(&request, &definitions, Some(&on_delta)).await {
+        let reply = match client.complete_streamed(&request, &definitions, Some(&on_delta)).await {
             Ok(reply) => reply,
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
@@ -1990,7 +1990,7 @@ async fn turn_worker(
 
         if reply.tool_calls.is_empty() {
             let text = reply.content.clone().unwrap_or_default();
-            history.push(ChatMessage::Assistant { content: reply.content, tool_calls: None });
+            history.push(Message::Assistant { content: reply.content, tool_calls: None });
             let _ = tx.send(AgentEvent::Turn { history, text, usage: reply.usage });
             return;
         }
@@ -2011,7 +2011,7 @@ async fn turn_worker(
         }
 
         let calls = reply.tool_calls.clone();
-        history.push(ChatMessage::Assistant {
+        history.push(Message::Assistant {
             content: reply.content,
             tool_calls: Some(reply.tool_calls),
         });
@@ -2066,7 +2066,7 @@ async fn turn_worker(
                 let preview: String =
                     output.lines().next().unwrap_or("").chars().take(100).collect();
                 let _ = tx.send(AgentEvent::ToolDone { preview });
-                history.push(ChatMessage::Tool {
+                history.push(Message::Tool {
                     content: output,
                     tool_call_id: call.id.clone(),
                 });
@@ -2079,7 +2079,7 @@ async fn turn_worker(
                     steered.len()
                 )));
                 for content in steered {
-                    history.push(ChatMessage::User { content });
+                    history.push(Message::User { content });
                 }
             }
             continue;
@@ -2140,7 +2140,7 @@ async fn turn_worker(
                 .take(100)
                 .collect();
             let _ = tx.send(AgentEvent::ToolDone { preview });
-            history.push(ChatMessage::Tool { content: output, tool_call_id: call.id });
+            history.push(Message::Tool { content: output, tool_call_id: call.id });
         }
 
         // Steering: deliver messages the user typed during this round before
@@ -2152,7 +2152,7 @@ async fn turn_worker(
                 steered.len()
             )));
             for content in steered {
-                history.push(ChatMessage::User { content });
+                history.push(Message::User { content });
             }
         }
     }
@@ -2210,7 +2210,7 @@ mod tests {
     fn clear_hides_but_preserves_conversation_and_diffs() {
         let mut app = test_app();
         let greeting_len = app.transcript.len();
-        app.history.push(ChatMessage::User { content: "hi".to_string() });
+        app.history.push(Message::User { content: "hi".to_string() });
         app.transcript.push(TranscriptItem::User("hi".to_string()));
         app.transcript.push(TranscriptItem::Assistant("hello".to_string()));
         app.diffs.push(entry("a.rs"));
@@ -2299,8 +2299,8 @@ mod tests {
         assert!(!app.is_running());
         assert!(app.stream_buffer.is_empty());
         assert!(matches!(&app.history[..], [
-            ChatMessage::User { content },
-            ChatMessage::Assistant { content: Some(output), .. },
+            Message::User { content },
+            Message::Assistant { content: Some(output), .. },
         ] if content == "do the thing (expanded)" && output == "the final answer"));
         let answers = app
             .transcript

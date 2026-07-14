@@ -16,7 +16,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::provider::ChatMessage;
+use crate::model::Message;
 use crate::tui::store::{self, Session};
 
 /// How long an excerpt is kept: enough to understand the failure, short
@@ -83,12 +83,12 @@ pub fn extract_signals(session: &Session) -> Vec<Signal> {
     let mut call_names: BTreeMap<&str, &str> = BTreeMap::new();
     for message in &session.history {
         match message {
-            ChatMessage::Assistant { tool_calls: Some(calls), .. } => {
+            Message::Assistant { tool_calls: Some(calls), .. } => {
                 for call in calls {
                     call_names.insert(&call.id, &call.function.name);
                 }
             }
-            ChatMessage::Tool { content, tool_call_id } => {
+            Message::Tool { content, tool_call_id } => {
                 let kind = if content.starts_with("DENIED:") {
                     Some(SignalKind::Denied)
                 } else if content.starts_with("ERROR:") {
@@ -202,9 +202,9 @@ fn write_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{FunctionCall, ToolCall};
+    use crate::model::{FunctionCall, ToolCall};
 
-    fn session_with(history: Vec<ChatMessage>, diffs: Vec<crate::diff::DiffEntry>) -> Session {
+    fn session_with(history: Vec<Message>, diffs: Vec<crate::diff::DiffEntry>) -> Session {
         Session {
             id: "20260713-120000".to_string(),
             started_at: 1,
@@ -225,7 +225,6 @@ mod tests {
     fn tool_call(id: &str, name: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
-            kind: "function".to_string(),
             function: FunctionCall { name: name.to_string(), arguments: "{}".to_string() },
         }
     }
@@ -233,21 +232,21 @@ mod tests {
     #[test]
     fn extracts_denials_errors_and_rollbacks() {
         let history = vec![
-            ChatMessage::User { content: "do it".into() },
-            ChatMessage::Assistant {
+            Message::User { content: "do it".into() },
+            Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("1", "write_file"), tool_call("2", "grep")]),
             },
-            ChatMessage::Tool {
+            Message::Tool {
                 content: "DENIED: the user declined `write_file src/x.rs`.".into(),
                 tool_call_id: "1".into(),
             },
-            ChatMessage::Tool { content: "3 matches".into(), tool_call_id: "2".into() },
-            ChatMessage::Assistant {
+            Message::Tool { content: "3 matches".into(), tool_call_id: "2".into() },
+            Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("3", "edit_lines")]),
             },
-            ChatMessage::Tool {
+            Message::Tool {
                 content: "ERROR: stale anchor `4:9f3a` — re-read the file.".into(),
                 tool_call_id: "3".into(),
             },
@@ -285,7 +284,7 @@ mod tests {
         assert_eq!(signals[0].session_id, "20260713-120000");
         // Successful tool results and plain messages yield nothing.
         assert!(extract_signals(&session_with(
-            vec![ChatMessage::User { content: "hi".into() }],
+            vec![Message::User { content: "hi".into() }],
             Vec::new()
         ))
         .is_empty());
@@ -295,11 +294,11 @@ mod tests {
     fn excerpts_are_squashed_and_capped() {
         let long = format!("ERROR: {}", "word ".repeat(200));
         let history = vec![
-            ChatMessage::Assistant {
+            Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("1", "shell")]),
             },
-            ChatMessage::Tool { content: long, tool_call_id: "1".into() },
+            Message::Tool { content: long, tool_call_id: "1".into() },
         ];
         let signals = extract_signals(&session_with(history, Vec::new()));
         assert_eq!(signals.len(), 1);

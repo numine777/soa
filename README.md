@@ -245,17 +245,27 @@ See [soa.toml](soa.toml) for a complete annotated example.
 
 ### `[providers.<name>]`
 
-Any OpenAI-compatible chat-completions endpoint: Ollama, LM Studio,
-llama.cpp, vLLM, or a hosted API.
+Each entry selects a provider wire adapter. The default and currently
+built-in adapter is `open_ai_chat_completions`, which supports any
+OpenAI-compatible chat-completions endpoint: Ollama, LM Studio, llama.cpp,
+vLLM, or a hosted API.
 
 ```toml
 [providers.ollama]
+adapter = "open_ai_chat_completions" # default; may be omitted
 base_url = "http://localhost:11434/v1"
 api_key = "${SOME_KEY}"     # optional; ${VAR} expands from the environment
 stream = true               # default: stream responses over SSE; set false
                             # for servers that don't support it
 data_boundary = "local"     # default; use "external" for hosted providers
 ```
+
+Internally, stages and agents use a canonical model contract for messages,
+tool definitions, tool calls, sampling, usage, and streamed text. The adapter
+is the only layer that knows the selected provider's JSON, authentication,
+endpoint paths, error classification, or streaming protocol. This keeps
+provider-specific fields out of saved conversations and the agent loop, and
+makes another API a contained adapter addition rather than a workflow rewrite.
 
 `data_boundary = "external"` marks requests as leaving the trusted local
 boundary. Directly selecting such a provider is explicit consent to send the

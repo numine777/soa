@@ -52,16 +52,23 @@ soa -c other.toml …    # use a different config file
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
 
-**Checkpoints.** Pipeline runs are checkpointed to `<data dir>/runs/` after
-every completed stage: the task, each stage's output, the position in the
-workflow (including reprompt jumps), and cumulative usage/budget state. If a run fails or is interrupted,
-`soa run --resume` picks it up at the first incomplete stage instead of
-starting over — completed stages are not re-run. Mid-stage progress isn't
-checkpointed (the interrupted stage restarts from its prompt), stage names
-must still exist in the config, and the checkpoint is deleted when the
-pipeline finishes. Single-stage runs (`--stage`) are not checkpointed.
-Resuming carries forward tokens, cost, and active time already spent; time
-while the run was suspended does not consume its wall-clock budget.
+**Checkpoints.** Pipeline runs are checkpointed atomically under
+`<data dir>/runs/`. Stage-boundary state includes the task, stage outputs,
+workflow position (including reprompt jumps), and cumulative usage/budgets.
+While a stage is active, an append-only event log also checkpoints its exact
+starting conversation, every model tool-call response, each completed tool
+result (including results as parallel calls finish), context shedding, and
+the final outcome. `soa run --resume` replays that log and continues with only
+the unfinished calls instead of rerunning the stage from its prompt. Completed
+stages, model requests, and tool calls are not repeated.
+
+The one unavoidable ambiguity is work interrupted after an external request
+or tool took effect but before its completion event reached disk; that
+in-flight operation may run again on resume. Stage names must still exist in
+the config, checkpoints are deleted when the pipeline finishes, and
+single-stage runs (`--stage`) are not checkpointed. Resuming carries forward
+recorded tokens, cost, and active time; time while suspended does not consume
+the wall-clock budget.
 
 ## Interactive chat (`soa chat`)
 
@@ -271,8 +278,11 @@ Internally, stages and agents use a canonical model contract for messages,
 tool definitions, tool calls, sampling, usage, and streamed text. The adapter
 is the only layer that knows the selected provider's JSON, authentication,
 endpoint paths, error classification, or streaming protocol. This keeps
-provider-specific fields out of saved conversations and the agent loop, and
-makes another API a contained adapter addition rather than a workflow rewrite.
+provider-specific fields out of saved conversations and the agent loop. Stage
+pipelines, configured subagents, and interactive chat all use that same
+event-driven loop, so retry, parallel-tool, approval, context-shedding, and
+tool-result ordering semantics stay aligned across entry points. Another API
+remains a contained adapter addition rather than a workflow rewrite.
 
 `data_boundary = "external"` marks requests as leaving the trusted local
 boundary. Directly selecting such a provider is explicit consent to send the

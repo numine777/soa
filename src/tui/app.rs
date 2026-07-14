@@ -1,6 +1,5 @@
 //! Chat TUI state, input handling, and the background agent worker.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,10 +16,10 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 use crate::config::{Config, Mode, Stage, ToolEffect};
 use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
-use crate::model::{Message, ModelClient, ToolDefinition, Usage, UsageTracker, fmt_tokens};
+use crate::model::{Message, ModelClient, Usage, UsageTracker, fmt_tokens};
 use crate::stage::{
-    CallPolicy, ToolBinding, ToolEffects, assemble_tools, build_model_client, context_pressure,
-    dispatch_tool_call, shed_context,
+    AgentLoopObservation, AgentLoopOptions, StageTool, assemble_tools, build_model_client,
+    run_agent_loop,
 };
 
 const COMPACT_INSTRUCTION: &str = "\
@@ -1303,12 +1302,6 @@ impl App {
         };
         self.tool_count = stage_tools.len();
 
-        let definitions: Vec<ToolDefinition> =
-            stage_tools.iter().map(|t| t.definition.clone()).collect();
-        let bindings: HashMap<String, (ToolBinding, ToolEffects)> = stage_tools
-            .into_iter()
-            .map(|t| (t.definition.name, (t.binding, t.effects)))
-            .collect();
         let max_turns = stage
             .max_turns
             .unwrap_or(self.config.settings.default_max_turns);
@@ -1317,8 +1310,7 @@ impl App {
         self.steered_this_turn.clear();
         let worker = turn_worker(
             client,
-            definitions,
-            bindings,
+            stage_tools,
             Arc::clone(&self.config),
             Arc::clone(&self.mcp),
             self.http.clone(),
@@ -1333,6 +1325,7 @@ impl App {
                 stage.auto_approve.clone(),
             ),
             Arc::clone(&self.approvals),
+            stage.name.clone(),
             model_name,
             Arc::clone(&self.steer_queue),
         );
@@ -2066,6 +2059,8 @@ async fn workflow_worker(
             &mcp,
             &http,
             &usage,
+            &[],
+            None,
             &reprompt_targets,
             Some(&on_delta),
             Some(&on_diff),
@@ -2105,18 +2100,18 @@ async fn workflow_worker(
 #[allow(clippy::too_many_arguments)]
 async fn turn_worker(
     client: ModelClient,
-    definitions: Vec<ToolDefinition>,
-    bindings: HashMap<String, (ToolBinding, ToolEffects)>,
+    tools: Vec<StageTool>,
     config: Arc<Config>,
     mcp: Arc<McpManager>,
     http: reqwest::Client,
     usage: UsageTracker,
     system: Option<String>,
-    mut history: Vec<Message>,
+    history: Vec<Message>,
     max_turns: u32,
     tx: UnboundedSender<AgentEvent>,
     (require_approval, approval_effects, auto_approve): (bool, Vec<ToolEffect>, Vec<String>),
     approvals: Arc<Approvals>,
+    stage_name: String,
     model_name: String,
     steer: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 ) {
@@ -2124,212 +2119,71 @@ async fn turn_worker(
     let on_delta = move |fragment: &str| {
         let _ = delta_tx.send(AgentEvent::Delta(fragment.to_string()));
     };
-
-    for _ in 0..max_turns {
-        let mut request = Vec::with_capacity(history.len() + 1);
-        if let Some(system) = &system {
-            request.push(Message::System {
-                content: system.clone(),
-            });
+    let observation_tx = tx.clone();
+    let on_observation = move |event: AgentLoopObservation| match event {
+        AgentLoopObservation::ToolCall { name, args } => {
+            let _ = observation_tx.send(AgentEvent::ToolCall { name, args });
         }
-        request.extend(history.iter().cloned());
-
-        let reply = match client
-            .complete_streamed(&request, &definitions, Some(&on_delta))
-            .await
-        {
-            Ok(reply) => reply,
-            Err(e) => {
-                let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
-                return;
-            }
-        };
-
-        if reply.tool_calls.is_empty() {
-            let text = reply.content.clone().unwrap_or_default();
-            history.push(Message::Assistant {
-                content: reply.content,
-                tool_calls: None,
-            });
-            let _ = tx.send(AgentEvent::Turn {
-                history,
-                text,
-                usage: reply.usage,
-            });
-            return;
+        AgentLoopObservation::ToolDone { preview } => {
+            let _ = observation_tx.send(AgentEvent::ToolDone { preview });
         }
-
-        // Mid-turn context pressure: truncate older tool results in the
-        // history before the next request.
-        if let Some((used, capacity)) = context_pressure(&config, &model_name, reply.usage.as_ref())
-        {
-            let trimmed = shed_context(&mut history, 2);
-            if trimmed > 0 {
-                let _ = tx.send(AgentEvent::Notice(format!(
-                    "context at {} of {} — truncated {trimmed} older tool result(s)",
-                    fmt_tokens(used),
-                    fmt_tokens(capacity),
-                )));
-            }
+        AgentLoopObservation::Notice(message) => {
+            let _ = observation_tx.send(AgentEvent::Notice(message));
         }
+    };
+    let diff_tx = tx.clone();
+    let on_diff = move |entry: DiffEntry| {
+        let _ = diff_tx.send(AgentEvent::Diff(entry));
+    };
 
-        let calls = reply.tool_calls.clone();
-        history.push(Message::Assistant {
-            content: reply.content,
-            tool_calls: Some(reply.tool_calls),
-        });
-
-        // A round of parallel-safe, non-gated effects dispatches
-        // concurrently; results are reported and recorded in call order.
-        if crate::stage::parallel_round(config.settings.parallel_tools, &calls, |name| {
-            bindings.get(name).map(|(_, effects)| {
-                effects.parallel_safe()
-                    && !CallPolicy::approval_required(require_approval, &approval_effects, *effects)
-            })
-        }) {
-            for call in &calls {
-                let _ = tx.send(AgentEvent::ToolCall {
-                    name: call.function.name.clone(),
-                    args: call.function.arguments.clone(),
+    match run_agent_loop(
+        &client,
+        &tools,
+        history,
+        &[],
+        &config,
+        &mcp,
+        &http,
+        &usage,
+        &approvals,
+        AgentLoopOptions {
+            owner_kind: "stage",
+            owner: &stage_name,
+            model_name: &model_name,
+            system: system.as_deref(),
+            max_turns,
+            depth: 0,
+            require_approval,
+            approval_effects: &approval_effects,
+            auto_approve: &auto_approve,
+            reprompt_targets: &[],
+            on_delta: Some(&on_delta),
+            terminate_streamed_response: false,
+            on_diff: Some(&on_diff),
+            on_event: None,
+            on_observation: Some(&on_observation),
+            steer: Some(&steer),
+            tool_errors_as_results: true,
+        },
+    )
+    .await
+    {
+        Ok(result) => match result.outcome {
+            crate::stage::StageOutcome::Final(text) => {
+                let _ = tx.send(AgentEvent::Turn {
+                    history: result.messages,
+                    text,
+                    usage: result.usage,
                 });
             }
-            let (config, mcp, http) = (&config, &mcp, &http);
-            let outputs = futures_util::future::join_all(calls.iter().map(|call| {
-                let (binding, effects) = &bindings[&call.function.name];
-                let policy = CallPolicy::for_tool(
-                    require_approval,
-                    &approval_effects,
-                    &auto_approve,
-                    &approvals,
-                    *effects,
-                );
-                let usage = usage.clone();
-                async move {
-                    match dispatch_tool_call(
-                        binding,
-                        &call.function.arguments,
-                        config,
-                        mcp,
-                        http,
-                        &usage,
-                        0,
-                        &policy,
-                    )
-                    .await
-                    {
-                        Ok(output) => output,
-                        Err(e) => format!("ERROR: {e:#}"),
-                    }
-                }
-            }))
-            .await;
-            for (call, output) in calls.iter().zip(outputs) {
-                let preview: String = output
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(100)
-                    .collect();
-                let _ = tx.send(AgentEvent::ToolDone { preview });
-                history.push(Message::Tool {
-                    content: output,
-                    tool_call_id: call.id.clone(),
-                });
+            crate::stage::StageOutcome::Reprompt { .. } => {
+                unreachable!("chat turns have no reprompt targets")
             }
-            // Steering: deliver messages typed during the parallel round.
-            let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
-            if !steered.is_empty() {
-                let _ = tx.send(AgentEvent::Notice(format!(
-                    "↪ delivered {} queued message(s) to the model",
-                    steered.len()
-                )));
-                for content in steered {
-                    history.push(Message::User { content });
-                }
-            }
-            continue;
-        }
-
-        for call in calls {
-            let name = call.function.name.clone();
-            let _ = tx.send(AgentEvent::ToolCall {
-                name: name.clone(),
-                args: call.function.arguments.clone(),
-            });
-
-            let output = match bindings.get(&name) {
-                None => format!("ERROR: unknown tool `{name}`"),
-                Some((binding, effects)) => {
-                    // Snapshot files a write tool might touch, for the diff viewer.
-                    let snapshots = if effects.mutating_or_process()
-                        && matches!(binding, ToolBinding::Mcp { .. } | ToolBinding::File { .. })
-                    {
-                        diff::snapshot(&diff::extract_paths(&call.function.arguments))
-                    } else {
-                        Vec::new()
-                    };
-                    let policy = CallPolicy::for_tool(
-                        require_approval,
-                        &approval_effects,
-                        &auto_approve,
-                        &approvals,
-                        *effects,
-                    );
-                    match dispatch_tool_call(
-                        binding,
-                        &call.function.arguments,
-                        &config,
-                        &mcp,
-                        &http,
-                        &usage,
-                        0,
-                        &policy,
-                    )
-                    .await
-                    {
-                        Ok(output) => {
-                            for entry in diff::collect_changes(&name, snapshots) {
-                                let _ = tx.send(AgentEvent::Diff(entry));
-                            }
-                            output
-                        }
-                        Err(e) => format!("ERROR: {e:#}"),
-                    }
-                }
-            };
-
-            let preview: String = output
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(100)
-                .collect();
-            let _ = tx.send(AgentEvent::ToolDone { preview });
-            history.push(Message::Tool {
-                content: output,
-                tool_call_id: call.id,
-            });
-        }
-
-        // Steering: deliver messages the user typed during this round before
-        // the model's next request.
-        let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
-        if !steered.is_empty() {
-            let _ = tx.send(AgentEvent::Notice(format!(
-                "↪ delivered {} queued message(s) to the model",
-                steered.len()
-            )));
-            for content in steered {
-                history.push(Message::User { content });
-            }
+        },
+        Err(error) => {
+            let _ = tx.send(AgentEvent::Error(format!("{error:#}")));
         }
     }
-
-    let _ = tx.send(AgentEvent::Error(format!(
-        "no final answer within {max_turns} tool turns — raise max_turns on the stage"
-    )));
 }
 
 #[cfg(test)]

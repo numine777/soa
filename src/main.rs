@@ -498,6 +498,8 @@ async fn run_pipeline(
             &http,
             &usage,
             &[],
+            None,
+            &[],
             Some(&stream_to_stderr),
             None,
             &approvals,
@@ -569,8 +571,8 @@ async fn resume_pipeline(config: &Config, state: runs::RunState) -> Result<()> {
 }
 
 /// Execute a workflow from the point described by `state`, checkpointing
-/// after every completed stage. The checkpoint is removed when the
-/// pipeline finishes.
+/// stage boundaries plus each durable event inside the active agent loop.
+/// The checkpoint is removed when the pipeline finishes.
 async fn run_workflow(
     config: &Config,
     http: &reqwest::Client,
@@ -578,6 +580,21 @@ async fn run_workflow(
     mut state: runs::RunState,
 ) -> Result<()> {
     let usage = model::UsageTracker::new(config.settings.run_limits(), state.usage.clone());
+    if let Some(active) = &state.active_stage {
+        let expected = order
+            .get(state.position)
+            .and_then(|index| config.stages.get(*index))
+            .map(|stage| stage.name.as_str());
+        if expected != Some(active.stage.as_str()) || active.run != state.runs {
+            bail!(
+                "run checkpoint has inconsistent active-stage progress: expected {:?} at run {}, found `{}` at run {}",
+                expected,
+                state.runs,
+                active.stage,
+                active.run,
+            );
+        }
+    }
     // Agents can be reached from any stage, so connect their servers too.
     let needed_servers: Vec<String> = order
         .iter()
@@ -623,7 +640,19 @@ async fn run_workflow(
     let mut result = Ok(());
     while position < order.len() {
         let stage = &config.stages[order[position]];
-        runs += 1;
+        let (resume_events, resuming_stage) = match &state.active_stage {
+            Some(progress) => (progress.events.clone(), true),
+            None => {
+                runs += 1;
+                state.active_stage = Some(runs::StageProgress {
+                    stage: stage.name.clone(),
+                    run: runs,
+                    events: Vec::new(),
+                });
+                checkpoint(&mut state, position, runs, &context, &usage);
+                (Vec::new(), false)
+            }
+        };
         if runs > config.settings.max_stage_runs {
             result = Err(anyhow::anyhow!(
                 "stopped after {} stage runs without finishing — likely a reprompt \
@@ -633,7 +662,11 @@ async fn run_workflow(
             break;
         }
 
-        eprintln!("── run {runs} · stage {} ──", stage.name);
+        eprintln!(
+            "── {}run {runs} · stage {} ──",
+            if resuming_stage { "resuming " } else { "" },
+            stage.name
+        );
         let is_first = context.previous.is_none();
         // Only offer reprompt targets that are part of the active workflow.
         let reprompt_targets: Vec<String> = stage
@@ -642,23 +675,44 @@ async fn run_workflow(
             .filter(|t| workflow_stage_names.contains(&t.as_str()))
             .cloned()
             .collect();
-        let stage_run = stage::run_stage(
-            config,
-            stage,
-            is_first,
-            &context,
-            &manager,
-            http,
-            &usage,
-            &reprompt_targets,
-            Some(&stream_to_stderr),
-            None,
-            &approvals,
-        );
-        match usage.within_time(stage_run).await {
+        let event_state = std::sync::Mutex::new(&mut state);
+        let on_event = |event: stage::AgentLoopEvent| {
+            let mut state = event_state.lock().expect("run checkpoint lock");
+            state
+                .active_stage
+                .as_mut()
+                .expect("active stage exists while its loop runs")
+                .events
+                .push(event);
+            state.usage = usage.snapshot();
+            state.updated_at = tui::store::now_epoch();
+            if let Err(error) = runs::save_run(&state) {
+                eprintln!("⚠ cannot write mid-stage checkpoint: {error:#}");
+            }
+        };
+        let stage_result = usage
+            .within_time(stage::run_stage(
+                config,
+                stage,
+                is_first,
+                &context,
+                &manager,
+                http,
+                &usage,
+                &resume_events,
+                Some(&on_event),
+                &reprompt_targets,
+                Some(&stream_to_stderr),
+                None,
+                &approvals,
+            ))
+            .await;
+        drop(event_state);
+        match stage_result {
             Ok(stage::StageOutcome::Final(output)) => {
                 context.record(&stage.name, output.clone());
                 position += 1;
+                state.active_stage = None;
                 checkpoint(&mut state, position, runs, &context, &usage);
                 // The output already streamed to stderr; just separate stages.
                 eprintln!("\n");
@@ -677,6 +731,7 @@ async fn run_workflow(
                     .iter()
                     .position(|name| *name == target)
                     .expect("reprompt targets are filtered to the active workflow");
+                state.active_stage = None;
                 checkpoint(&mut state, position, runs, &context, &usage);
             }
             Err(e) => {

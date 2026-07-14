@@ -1,20 +1,22 @@
 //! Stage execution: template rendering, effect-aware tool assembly and
 //! approval policy, and the per-stage agentic tool-call loop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rmcp::model::JsonObject;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::approval::{Approvals, Decision};
 use crate::config::{Config, DataBoundary, McpServer, Mode, Stage, ToolEffect};
 use crate::mcp::McpManager;
 use crate::model::{
-    Message, ModelClient, ModelPricing, ModelTarget, ProviderAdapter, SamplingParams,
-    ToolDefinition, UsageTracker,
+    DeltaHandler, Message, ModelClient, ModelPricing, ModelTarget, ProviderAdapter, SamplingParams,
+    ToolCall, ToolDefinition, Usage, UsageTracker,
 };
 use crate::tools;
 
@@ -191,13 +193,82 @@ impl crate::config::Agent {
 
 /// How a stage finished: with a final answer, or by handing control to
 /// another stage.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StageOutcome {
     Final(String),
     Reprompt {
         target: String,
         instructions: String,
     },
+}
+
+/// Append-only events emitted by the canonical model/tool loop. Pipeline
+/// checkpoints persist these during an active stage and replay them on
+/// resume, so completed model responses and tool calls are not repeated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentLoopEvent {
+    Started {
+        system: Option<String>,
+        messages: Vec<Message>,
+    },
+    ContextShed {
+        keep_recent: usize,
+    },
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<ToolCall>,
+        usage: Option<Usage>,
+    },
+    ToolResult {
+        call_index: usize,
+        content: String,
+    },
+    UserMessage {
+        content: String,
+    },
+    Finished {
+        outcome: StageOutcome,
+        usage: Option<Usage>,
+    },
+}
+
+/// Non-durable progress notifications used by the chat UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentLoopObservation {
+    ToolCall { name: String, args: String },
+    ToolDone { preview: String },
+    Notice(String),
+}
+
+pub type LoopEventSink<'a> = Option<&'a (dyn Fn(AgentLoopEvent) + Send + Sync)>;
+pub type LoopObservationSink<'a> = Option<&'a (dyn Fn(AgentLoopObservation) + Send + Sync)>;
+
+/// Per-caller behavior around the one canonical agent loop.
+pub struct AgentLoopOptions<'a> {
+    pub owner_kind: &'static str,
+    pub owner: &'a str,
+    pub model_name: &'a str,
+    pub system: Option<&'a str>,
+    pub max_turns: u32,
+    pub depth: u32,
+    pub require_approval: bool,
+    pub approval_effects: &'a [ToolEffect],
+    pub auto_approve: &'a [String],
+    pub reprompt_targets: &'a [String],
+    pub on_delta: Option<DeltaHandler<'a>>,
+    pub terminate_streamed_response: bool,
+    pub on_diff: DiffSink<'a>,
+    pub on_event: LoopEventSink<'a>,
+    pub on_observation: LoopObservationSink<'a>,
+    pub steer: Option<&'a Mutex<VecDeque<String>>>,
+    pub tool_errors_as_results: bool,
+}
+
+pub struct AgentLoopResult {
+    pub outcome: StageOutcome,
+    pub messages: Vec<Message>,
+    pub usage: Option<Usage>,
 }
 
 pub const REPROMPT_TOOL: &str = "reprompt_stage";
@@ -769,6 +840,540 @@ async fn dispatch_tool_call_inner(
     }
 }
 
+#[derive(Debug)]
+struct PendingToolRound {
+    calls: Vec<ToolCall>,
+    results: BTreeMap<usize, String>,
+}
+
+struct ReplayedAgentLoop {
+    system: Option<String>,
+    messages: Vec<Message>,
+    pending: Option<PendingToolRound>,
+    finished: Option<StageOutcome>,
+    turns: u32,
+    usage: Option<Usage>,
+}
+
+fn flush_completed_round(
+    messages: &mut Vec<Message>,
+    pending: &mut Option<PendingToolRound>,
+) -> Result<()> {
+    let Some(round) = pending.as_ref() else {
+        return Ok(());
+    };
+    if round.results.len() != round.calls.len() {
+        return Ok(());
+    }
+    for (index, call) in round.calls.iter().enumerate() {
+        let content = round
+            .results
+            .get(&index)
+            .with_context(|| format!("agent event log is missing tool result {index}"))?
+            .clone();
+        messages.push(Message::Tool {
+            content,
+            tool_call_id: call.id.clone(),
+        });
+    }
+    *pending = None;
+    Ok(())
+}
+
+/// Rebuild the canonical conversation from an append-only loop event log.
+/// Tool results may be logged in completion order, but are materialized in
+/// the assistant's original call order before the next model request.
+fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
+    let mut system = None;
+    let mut messages = Vec::new();
+    let mut pending: Option<PendingToolRound> = None;
+    let mut finished = None;
+    let mut turns = 0u32;
+    let mut usage = None;
+    let mut started = false;
+
+    for (event_index, event) in events.iter().enumerate() {
+        if finished.is_some() {
+            bail!("agent event log contains entries after its finished event");
+        }
+        match event {
+            AgentLoopEvent::Started {
+                system: saved_system,
+                messages: saved_messages,
+            } => {
+                if started || event_index != 0 {
+                    bail!("agent event log contains a misplaced started event");
+                }
+                started = true;
+                system = saved_system.clone();
+                messages = saved_messages.clone();
+            }
+            AgentLoopEvent::ContextShed { keep_recent } => {
+                if !started {
+                    bail!("agent event log does not start with a started event");
+                }
+                flush_completed_round(&mut messages, &mut pending)?;
+                if pending.is_some() {
+                    bail!("agent event log sheds context during an incomplete tool round");
+                }
+                shed_context(&mut messages, *keep_recent);
+            }
+            AgentLoopEvent::Assistant {
+                content,
+                tool_calls,
+                usage: reported_usage,
+            } => {
+                if !started {
+                    bail!("agent event log does not start with a started event");
+                }
+                flush_completed_round(&mut messages, &mut pending)?;
+                if pending.is_some() {
+                    bail!("agent event log starts a model turn before all tools completed");
+                }
+                if tool_calls.is_empty() {
+                    bail!("agent event log has an assistant event without tool calls");
+                }
+                messages.push(Message::Assistant {
+                    content: content.clone(),
+                    tool_calls: Some(tool_calls.clone()),
+                });
+                pending = Some(PendingToolRound {
+                    calls: tool_calls.clone(),
+                    results: BTreeMap::new(),
+                });
+                turns = turns.saturating_add(1);
+                usage = *reported_usage;
+            }
+            AgentLoopEvent::ToolResult {
+                call_index,
+                content,
+            } => {
+                let round = pending
+                    .as_mut()
+                    .context("agent event log has a tool result outside a tool round")?;
+                if *call_index >= round.calls.len() {
+                    bail!("agent event log has out-of-range tool result {call_index}");
+                }
+                if round.results.insert(*call_index, content.clone()).is_some() {
+                    bail!("agent event log repeats tool result {call_index}");
+                }
+                flush_completed_round(&mut messages, &mut pending)?;
+            }
+            AgentLoopEvent::UserMessage { content } => {
+                flush_completed_round(&mut messages, &mut pending)?;
+                if pending.is_some() {
+                    bail!("agent event log steers during an incomplete tool round");
+                }
+                messages.push(Message::User {
+                    content: content.clone(),
+                });
+            }
+            AgentLoopEvent::Finished {
+                outcome,
+                usage: reported_usage,
+            } => {
+                if matches!(outcome, StageOutcome::Final(_)) {
+                    flush_completed_round(&mut messages, &mut pending)?;
+                    if pending.is_some() {
+                        bail!("agent event log finishes normally during an incomplete tool round");
+                    }
+                    let StageOutcome::Final(content) = outcome else {
+                        unreachable!()
+                    };
+                    messages.push(Message::Assistant {
+                        content: Some(content.clone()),
+                        tool_calls: None,
+                    });
+                }
+                finished = Some(outcome.clone());
+                usage = *reported_usage;
+            }
+        }
+    }
+
+    if !started {
+        bail!("agent event log does not start with a started event");
+    }
+    flush_completed_round(&mut messages, &mut pending)?;
+    Ok(ReplayedAgentLoop {
+        system,
+        messages,
+        pending,
+        finished,
+        turns,
+        usage,
+    })
+}
+
+fn record_loop_event(
+    events: &mut Vec<AgentLoopEvent>,
+    sink: LoopEventSink<'_>,
+    event: AgentLoopEvent,
+) {
+    if let Some(sink) = sink {
+        sink(event.clone());
+    }
+    events.push(event);
+}
+
+fn observe_loop(sink: LoopObservationSink<'_>, event: AgentLoopObservation) {
+    if let Some(sink) = sink {
+        sink(event);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_agent_loop_tool(
+    call: &ToolCall,
+    bindings: &BTreeMap<&str, &StageTool>,
+    config: &Config,
+    mcp: &McpManager,
+    http: &reqwest::Client,
+    usage: &UsageTracker,
+    approvals: &Approvals,
+    options: &AgentLoopOptions<'_>,
+) -> Result<String> {
+    observe_loop(
+        options.on_observation,
+        AgentLoopObservation::ToolCall {
+            name: call.function.name.clone(),
+            args: call.function.arguments.clone(),
+        },
+    );
+    tracing::info!(
+        owner_kind = options.owner_kind,
+        owner = options.owner,
+        tool = %call.function.name,
+        args = %truncate(&call.function.arguments, 200),
+        "agent loop tool call"
+    );
+
+    let output = match bindings.get(call.function.name.as_str()) {
+        None => format!("ERROR: unknown tool `{}`", call.function.name),
+        Some(tool) => {
+            let snapshots = if options.on_diff.is_some()
+                && tool.effects.mutating_or_process()
+                && matches!(
+                    tool.binding,
+                    ToolBinding::Mcp { .. } | ToolBinding::File { .. }
+                ) {
+                crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
+            } else {
+                Vec::new()
+            };
+            let policy = CallPolicy::for_tool(
+                options.require_approval,
+                options.approval_effects,
+                options.auto_approve,
+                approvals,
+                tool.effects,
+            );
+            match dispatch_tool_call(
+                &tool.binding,
+                &call.function.arguments,
+                config,
+                mcp,
+                http,
+                usage,
+                options.depth,
+                &policy,
+            )
+            .await
+            {
+                Ok(output) => {
+                    if let Some(on_diff) = options.on_diff {
+                        for entry in crate::diff::collect_changes(&call.function.name, snapshots) {
+                            on_diff(entry);
+                        }
+                    }
+                    output
+                }
+                Err(error) if options.tool_errors_as_results => format!("ERROR: {error:#}"),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+
+    let preview = output
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect();
+    observe_loop(
+        options.on_observation,
+        AgentLoopObservation::ToolDone { preview },
+    );
+    tracing::debug!(
+        owner_kind = options.owner_kind,
+        owner = options.owner,
+        tool = %call.function.name,
+        output = %truncate(&output, 500),
+        "agent loop tool result"
+    );
+    Ok(output)
+}
+
+/// Canonical model/tool state machine shared by stages, configured
+/// subagents, and interactive chat turns.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_loop(
+    client: &ModelClient,
+    tools: &[StageTool],
+    initial_messages: Vec<Message>,
+    resume_events: &[AgentLoopEvent],
+    config: &Config,
+    mcp: &McpManager,
+    http: &reqwest::Client,
+    usage: &UsageTracker,
+    approvals: &Approvals,
+    options: AgentLoopOptions<'_>,
+) -> Result<AgentLoopResult> {
+    let mut definitions: Vec<ToolDefinition> =
+        tools.iter().map(|tool| tool.definition.clone()).collect();
+    if !options.reprompt_targets.is_empty() {
+        definitions.push(reprompt_tool(options.reprompt_targets));
+    }
+    let bindings: BTreeMap<&str, &StageTool> = tools
+        .iter()
+        .map(|tool| (tool.definition.name.as_str(), tool))
+        .collect();
+    let mut events = resume_events.to_vec();
+    if events.is_empty() {
+        record_loop_event(
+            &mut events,
+            options.on_event,
+            AgentLoopEvent::Started {
+                system: options.system.map(str::to_string),
+                messages: initial_messages,
+            },
+        );
+    }
+
+    loop {
+        let state = replay_agent_loop(&events)?;
+        if let Some(outcome) = state.finished {
+            // A final response checkpointed just before a crash was already
+            // paid for but was not committed at the stage boundary. Replay
+            // its saved text once for this new CLI invocation; freshly
+            // generated responses have already streamed and are not echoed.
+            if events.len() == resume_events.len()
+                && let StageOutcome::Final(content) = &outcome
+                && let Some(handler) = options.on_delta
+                && !content.is_empty()
+            {
+                handler(content);
+                if options.terminate_streamed_response {
+                    handler("\n");
+                }
+            }
+            return Ok(AgentLoopResult {
+                outcome,
+                messages: state.messages,
+                usage: state.usage,
+            });
+        }
+
+        if let Some(round) = state.pending {
+            let missing: Vec<(usize, ToolCall)> = round
+                .calls
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !round.results.contains_key(index))
+                .map(|(index, call)| (index, call.clone()))
+                .collect();
+            let missing_calls: Vec<ToolCall> =
+                missing.iter().map(|(_, call)| call.clone()).collect();
+            let run_parallel =
+                parallel_round(config.settings.parallel_tools, &missing_calls, |name| {
+                    bindings.get(name).map(|tool| {
+                        tool.effects.parallel_safe()
+                            && !CallPolicy::approval_required(
+                                options.require_approval,
+                                options.approval_effects,
+                                tool.effects,
+                            )
+                    })
+                });
+
+            if run_parallel {
+                tracing::info!(
+                    owner_kind = options.owner_kind,
+                    owner = options.owner,
+                    calls = missing.len(),
+                    "parallel agent loop tool round"
+                );
+                let mut futures = FuturesUnordered::new();
+                for (call_index, call) in &missing {
+                    futures.push(async {
+                        (
+                            *call_index,
+                            execute_agent_loop_tool(
+                                call, &bindings, config, mcp, http, usage, approvals, &options,
+                            )
+                            .await,
+                        )
+                    });
+                }
+                while let Some((call_index, output)) = futures.next().await {
+                    record_loop_event(
+                        &mut events,
+                        options.on_event,
+                        AgentLoopEvent::ToolResult {
+                            call_index,
+                            content: output?,
+                        },
+                    );
+                }
+            } else {
+                for (call_index, call) in missing {
+                    if call.function.name == REPROMPT_TOOL && !options.reprompt_targets.is_empty() {
+                        match parse_reprompt(&call.function.arguments, options.reprompt_targets) {
+                            Ok(outcome) => {
+                                record_loop_event(
+                                    &mut events,
+                                    options.on_event,
+                                    AgentLoopEvent::Finished {
+                                        outcome,
+                                        usage: state.usage,
+                                    },
+                                );
+                                break;
+                            }
+                            Err(problem) => {
+                                record_loop_event(
+                                    &mut events,
+                                    options.on_event,
+                                    AgentLoopEvent::ToolResult {
+                                        call_index,
+                                        content: format!("ERROR: {problem}"),
+                                    },
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let output = execute_agent_loop_tool(
+                        &call, &bindings, config, mcp, http, usage, approvals, &options,
+                    )
+                    .await?;
+                    record_loop_event(
+                        &mut events,
+                        options.on_event,
+                        AgentLoopEvent::ToolResult {
+                            call_index,
+                            content: output,
+                        },
+                    );
+                }
+            }
+
+            if replay_agent_loop(&events)?.finished.is_none()
+                && replay_agent_loop(&events)?.pending.is_none()
+                && let Some(steer) = options.steer
+            {
+                let steered: Vec<String> = steer.lock().unwrap().drain(..).collect();
+                if !steered.is_empty() {
+                    observe_loop(
+                        options.on_observation,
+                        AgentLoopObservation::Notice(format!(
+                            "↪ delivered {} queued message(s) to the model",
+                            steered.len()
+                        )),
+                    );
+                    for content in steered {
+                        record_loop_event(
+                            &mut events,
+                            options.on_event,
+                            AgentLoopEvent::UserMessage { content },
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        if state.turns >= options.max_turns {
+            bail!(
+                "{} `{}` did not produce a final answer within {} turns (raise `max_turns` on the {} or `default_max_turns` in settings)",
+                options.owner_kind,
+                options.owner,
+                options.max_turns,
+                options.owner_kind,
+            );
+        }
+
+        let mut request = Vec::with_capacity(state.messages.len() + 1);
+        if let Some(system) = &state.system {
+            request.push(Message::System {
+                content: system.clone(),
+            });
+        }
+        request.extend(state.messages.iter().cloned());
+        let reply = client
+            .complete_streamed(&request, &definitions, options.on_delta)
+            .await?;
+        if options.terminate_streamed_response
+            && let (Some(handler), Some(content)) = (options.on_delta, reply.content.as_deref())
+            && !content.is_empty()
+        {
+            handler("\n");
+        }
+
+        if reply.tool_calls.is_empty() {
+            record_loop_event(
+                &mut events,
+                options.on_event,
+                AgentLoopEvent::Finished {
+                    outcome: StageOutcome::Final(reply.content.unwrap_or_default()),
+                    usage: reply.usage,
+                },
+            );
+            continue;
+        }
+
+        if let Some((used, capacity)) =
+            context_pressure(config, options.model_name, reply.usage.as_ref())
+        {
+            let mut candidate = state.messages.clone();
+            let trimmed = shed_context(&mut candidate, 2);
+            if trimmed > 0 {
+                tracing::warn!(
+                    owner_kind = options.owner_kind,
+                    owner = options.owner,
+                    used,
+                    capacity,
+                    trimmed,
+                    "context pressure: truncated older tool results"
+                );
+                observe_loop(
+                    options.on_observation,
+                    AgentLoopObservation::Notice(format!(
+                        "context at {} of {} — truncated {trimmed} older tool result(s)",
+                        crate::model::fmt_tokens(used),
+                        crate::model::fmt_tokens(capacity),
+                    )),
+                );
+                record_loop_event(
+                    &mut events,
+                    options.on_event,
+                    AgentLoopEvent::ContextShed { keep_recent: 2 },
+                );
+            }
+        }
+        record_loop_event(
+            &mut events,
+            options.on_event,
+            AgentLoopEvent::Assistant {
+                content: reply.content,
+                tool_calls: reply.tool_calls,
+                usage: reply.usage,
+            },
+        );
+    }
+}
+
 /// Run a subagent to completion on a task and return its final answer.
 /// Boxed because agents may recursively spawn agents (bounded by
 /// `settings.max_agent_depth` via `assemble_tools`).
@@ -798,148 +1403,55 @@ pub fn run_agent<'a>(
         )?;
 
         let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
-        let definitions: Vec<ToolDefinition> =
-            agent_tools.iter().map(|t| t.definition.clone()).collect();
-        let bindings: BTreeMap<&str, &StageTool> = agent_tools
-            .iter()
-            .map(|t| (t.definition.name.as_str(), t))
-            .collect();
-
         let system = crate::skills::compose_system(
             config,
             &format!("agent `{agent_name}`"),
             agent.resolve_system_prompt(&config.base_dir)?,
             &agent.skills,
         )?;
-        let mut messages = Vec::new();
-        if let Some(system) = system {
-            messages.push(Message::System { content: system });
-        }
-        messages.push(Message::User {
-            content: task.to_string(),
-        });
-
         let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
         tracing::info!(
-            agent = %agent_name, model = %agent.model, tools = definitions.len(), depth,
+            agent = %agent_name, model = %agent.model, tools = agent_tools.len(), depth,
             task = %truncate(task, 200), "running agent"
         );
-
-        for turn in 1..=max_turns {
-            let reply = client.complete(&messages, &definitions).await?;
-
-            if reply.tool_calls.is_empty() {
-                tracing::info!(agent = %agent_name, turns = turn, "agent complete");
-                return Ok(reply.content.unwrap_or_default());
-            }
-
-            if let Some((used, capacity)) =
-                context_pressure(config, &agent.model, reply.usage.as_ref())
-            {
-                let trimmed = shed_context(&mut messages, 2);
-                if trimmed > 0 {
-                    tracing::warn!(
-                        agent = %agent_name, used, capacity, trimmed,
-                        "context pressure: truncated older tool results"
-                    );
-                }
-            }
-
-            let tool_calls = reply.tool_calls.clone();
-            messages.push(Message::Assistant {
-                content: reply.content,
-                tool_calls: Some(reply.tool_calls),
-            });
-
-            if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
-                bindings.get(name).map(|tool| {
-                    tool.effects.parallel_safe()
-                        && !CallPolicy::approval_required(
-                            agent.require_approval,
-                            &agent.approval_effects,
-                            tool.effects,
-                        )
-                })
-            }) {
-                tracing::info!(agent = %agent_name, calls = tool_calls.len(), "parallel tool round");
-                let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
-                    let tool = bindings[call.function.name.as_str()];
-                    let policy = CallPolicy::for_tool(
-                        agent.require_approval,
-                        &agent.approval_effects,
-                        &agent.auto_approve,
-                        approvals,
-                        tool.effects,
-                    );
-                    async move {
-                        tracing::info!(
-                            agent = %agent_name, tool = %call.function.name,
-                            args = %truncate(&call.function.arguments, 200),
-                            "agent tool call"
-                        );
-                        dispatch_tool_call(
-                            &tool.binding,
-                            &call.function.arguments,
-                            config,
-                            mcp,
-                            http,
-                            usage,
-                            depth,
-                            &policy,
-                        )
-                        .await
-                    }
-                }))
-                .await;
-                for (call, output) in tool_calls.iter().zip(outputs) {
-                    messages.push(Message::Tool {
-                        content: output?,
-                        tool_call_id: call.id.clone(),
-                    });
-                }
-                continue;
-            }
-
-            for call in tool_calls {
-                tracing::info!(
-                    agent = %agent_name, tool = %call.function.name,
-                    args = %truncate(&call.function.arguments, 200),
-                    "agent tool call"
-                );
-                let output = match bindings.get(call.function.name.as_str()) {
-                    Some(tool) => {
-                        let policy = CallPolicy::for_tool(
-                            agent.require_approval,
-                            &agent.approval_effects,
-                            &agent.auto_approve,
-                            approvals,
-                            tool.effects,
-                        );
-                        dispatch_tool_call(
-                            &tool.binding,
-                            &call.function.arguments,
-                            config,
-                            mcp,
-                            http,
-                            usage,
-                            depth,
-                            &policy,
-                        )
-                        .await?
-                    }
-                    None => format!("ERROR: unknown tool `{}`", call.function.name),
-                };
-                messages.push(Message::Tool {
-                    content: output,
-                    tool_call_id: call.id,
-                });
-            }
-        }
-
-        bail!(
-            "agent `{agent_name}` did not produce a final answer within {max_turns} turns \
-             (raise `max_turns` on the agent or `default_max_turns` in settings)"
+        let result = run_agent_loop(
+            &client,
+            &agent_tools,
+            vec![Message::User {
+                content: task.to_string(),
+            }],
+            &[],
+            config,
+            mcp,
+            http,
+            usage,
+            approvals,
+            AgentLoopOptions {
+                owner_kind: "agent",
+                owner: agent_name,
+                model_name: &agent.model,
+                system: system.as_deref(),
+                max_turns,
+                depth,
+                require_approval: agent.require_approval,
+                approval_effects: &agent.approval_effects,
+                auto_approve: &agent.auto_approve,
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: None,
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
         )
+        .await?;
+        tracing::info!(agent = %agent_name, "agent complete");
+        match result.outcome {
+            StageOutcome::Final(output) => Ok(output),
+            StageOutcome::Reprompt { .. } => unreachable!("agents have no reprompt targets"),
+        }
     })
 }
 
@@ -1042,6 +1554,8 @@ pub async fn run_stage(
     mcp: &McpManager,
     http: &reqwest::Client,
     usage: &UsageTracker,
+    resume_events: &[AgentLoopEvent],
+    on_event: LoopEventSink<'_>,
     reprompt_targets: &[String],
     on_delta: Option<crate::model::DeltaHandler<'_>>,
     on_diff: DiffSink<'_>,
@@ -1057,16 +1571,6 @@ pub async fn run_stage(
     )?;
 
     let stage_tools = assemble_tools(&stage.tool_profile(), config, mcp, 0)?;
-    let mut definitions: Vec<ToolDefinition> =
-        stage_tools.iter().map(|t| t.definition.clone()).collect();
-    if !reprompt_targets.is_empty() {
-        definitions.push(reprompt_tool(reprompt_targets));
-    }
-    let bindings: BTreeMap<&str, &StageTool> = stage_tools
-        .iter()
-        .map(|t| (t.definition.name.as_str(), t))
-        .collect();
-
     let user_prompt = render_template(
         &stage.prompt_template(is_first),
         &context.input,
@@ -1080,181 +1584,47 @@ pub async fn run_stage(
         stage.resolve_system_prompt(&config.base_dir)?,
         &stage.skills,
     )?;
-    let mut messages = Vec::new();
-    if let Some(system) = system {
-        messages.push(Message::System { content: system });
-    }
-    messages.push(Message::User {
-        content: user_prompt,
-    });
-
     let max_turns = stage.max_turns.unwrap_or(config.settings.default_max_turns);
     tracing::info!(
-        stage = %stage.name, model = %stage.model, tools = definitions.len(),
+        stage = %stage.name, model = %stage.model,
+        tools = stage_tools.len() + usize::from(!reprompt_targets.is_empty()),
         mode = ?stage.mode, "running stage"
     );
-
-    for turn in 1..=max_turns {
-        let reply = client
-            .complete_streamed(&messages, &definitions, on_delta)
-            .await?;
-
-        // Terminate the streamed text before anything else (logs, tool
-        // lines) writes to the same terminal.
-        if let (Some(handler), Some(content)) = (on_delta, reply.content.as_deref())
-            && !content.is_empty()
-        {
-            handler("\n");
-        }
-
-        if reply.tool_calls.is_empty() {
-            let content = reply.content.unwrap_or_default();
-            tracing::info!(stage = %stage.name, turns = turn, "stage complete");
-            return Ok(StageOutcome::Final(content));
-        }
-
-        // Under context pressure, truncate older tool results before the
-        // next request instead of overflowing the window.
-        if let Some((used, capacity)) = context_pressure(config, &stage.model, reply.usage.as_ref())
-        {
-            let trimmed = shed_context(&mut messages, 2);
-            if trimmed > 0 {
-                tracing::warn!(
-                    stage = %stage.name, used, capacity, trimmed,
-                    "context pressure: truncated older tool results"
-                );
-            }
-        }
-
-        let tool_calls = reply.tool_calls.clone();
-        messages.push(Message::Assistant {
-            content: reply.content,
-            tool_calls: Some(reply.tool_calls),
-        });
-
-        if parallel_round(config.settings.parallel_tools, &tool_calls, |name| {
-            bindings.get(name).map(|tool| {
-                tool.effects.parallel_safe()
-                    && !CallPolicy::approval_required(
-                        stage.require_approval,
-                        &stage.approval_effects,
-                        tool.effects,
-                    )
-            })
-        }) {
-            tracing::info!(stage = %stage.name, calls = tool_calls.len(), "parallel tool round");
-            let outputs = futures_util::future::join_all(tool_calls.iter().map(|call| {
-                let tool = bindings[call.function.name.as_str()];
-                let policy = CallPolicy::for_tool(
-                    stage.require_approval,
-                    &stage.approval_effects,
-                    &stage.auto_approve,
-                    approvals,
-                    tool.effects,
-                );
-                async move {
-                    tracing::info!(
-                        stage = %stage.name, tool = %call.function.name,
-                        args = %truncate(&call.function.arguments, 200),
-                        "tool call"
-                    );
-                    dispatch_tool_call(
-                        &tool.binding,
-                        &call.function.arguments,
-                        config,
-                        mcp,
-                        http,
-                        usage,
-                        0,
-                        &policy,
-                    )
-                    .await
-                }
-            }))
-            .await;
-            for (call, output) in tool_calls.iter().zip(outputs) {
-                messages.push(Message::Tool {
-                    content: output?,
-                    tool_call_id: call.id.clone(),
-                });
-            }
-            continue;
-        }
-
-        for call in tool_calls {
-            tracing::info!(
-                stage = %stage.name, tool = %call.function.name,
-                args = %truncate(&call.function.arguments, 200),
-                "tool call"
-            );
-            if call.function.name == REPROMPT_TOOL && !reprompt_targets.is_empty() {
-                match parse_reprompt(&call.function.arguments, reprompt_targets) {
-                    // Any tool calls batched after the handoff are dropped.
-                    Ok(outcome) => return Ok(outcome),
-                    Err(problem) => {
-                        // Give the model the validation error and let it retry.
-                        messages.push(Message::Tool {
-                            content: format!("ERROR: {problem}"),
-                            tool_call_id: call.id,
-                        });
-                        continue;
-                    }
-                }
-            }
-            let output = match bindings.get(call.function.name.as_str()) {
-                Some(tool) => {
-                    // Snapshot files a write tool might touch, for the
-                    // caller's diff sink.
-                    let snapshots = if on_diff.is_some()
-                        && tool.effects.mutating_or_process()
-                        && matches!(
-                            tool.binding,
-                            ToolBinding::Mcp { .. } | ToolBinding::File { .. }
-                        ) {
-                        crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
-                    } else {
-                        Vec::new()
-                    };
-                    let policy = CallPolicy::for_tool(
-                        stage.require_approval,
-                        &stage.approval_effects,
-                        &stage.auto_approve,
-                        approvals,
-                        tool.effects,
-                    );
-                    let output = dispatch_tool_call(
-                        &tool.binding,
-                        &call.function.arguments,
-                        config,
-                        mcp,
-                        http,
-                        usage,
-                        0,
-                        &policy,
-                    )
-                    .await?;
-                    if let Some(on_diff) = on_diff {
-                        for entry in crate::diff::collect_changes(&call.function.name, snapshots) {
-                            on_diff(entry);
-                        }
-                    }
-                    output
-                }
-                None => format!("ERROR: unknown tool `{}`", call.function.name),
-            };
-            tracing::debug!(stage = %stage.name, tool = %call.function.name, output = %truncate(&output, 500));
-            messages.push(Message::Tool {
-                content: output,
-                tool_call_id: call.id,
-            });
-        }
-    }
-
-    bail!(
-        "stage `{}` did not produce a final answer within {max_turns} turns \
-         (raise `max_turns` on the stage or `default_max_turns` in settings)",
-        stage.name
+    let result = run_agent_loop(
+        &client,
+        &stage_tools,
+        vec![Message::User {
+            content: user_prompt,
+        }],
+        resume_events,
+        config,
+        mcp,
+        http,
+        usage,
+        approvals,
+        AgentLoopOptions {
+            owner_kind: "stage",
+            owner: &stage.name,
+            model_name: &stage.model,
+            system: system.as_deref(),
+            max_turns,
+            depth: 0,
+            require_approval: stage.require_approval,
+            approval_effects: &stage.approval_effects,
+            auto_approve: &stage.auto_approve,
+            reprompt_targets,
+            on_delta,
+            terminate_streamed_response: true,
+            on_diff,
+            on_event,
+            on_observation: None,
+            steer: None,
+            tool_errors_as_results: false,
+        },
     )
+    .await?;
+    tracing::info!(stage = %stage.name, "stage complete");
+    Ok(result.outcome)
 }
 
 /// If the last reply's usage puts the conversation over the auto-compact
@@ -1338,6 +1708,233 @@ fn truncate(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ResumeAdapter {
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl ProviderAdapter for ResumeAdapter {
+        fn name(&self) -> &'static str {
+            "resume-test"
+        }
+
+        fn complete<'a>(
+            &'a self,
+            request: crate::model::ModelRequest<'a>,
+            _on_delta: Option<crate::model::DeltaHandler<'a>>,
+        ) -> crate::model::AdapterFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                Ok(crate::model::ModelResponse {
+                    content: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: Some(Usage {
+                        prompt_tokens: 20,
+                        completion_tokens: 1,
+                    }),
+                })
+            })
+        }
+    }
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            function: crate::model::FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn agent_event_log_replays_partial_parallel_round_in_call_order() {
+        let mut events = vec![
+            AgentLoopEvent::Started {
+                system: Some("system".to_string()),
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("first", "read_a"), tool_call("second", "read_b")],
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                }),
+            },
+            // Parallel completion order is intentionally reversed.
+            AgentLoopEvent::ToolResult {
+                call_index: 1,
+                content: "b".to_string(),
+            },
+        ];
+        let partial = replay_agent_loop(&events).unwrap();
+        assert_eq!(partial.turns, 1);
+        assert_eq!(partial.messages.len(), 2);
+        assert_eq!(partial.pending.unwrap().results.len(), 1);
+
+        events.push(AgentLoopEvent::ToolResult {
+            call_index: 0,
+            content: "a".to_string(),
+        });
+        let complete = replay_agent_loop(&events).unwrap();
+        assert!(complete.pending.is_none());
+        let ids: Vec<&str> = complete
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn agent_event_log_finished_response_is_immediately_resumable() {
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Finished {
+                outcome: StageOutcome::Final("done".to_string()),
+                usage: Some(Usage {
+                    prompt_tokens: 4,
+                    completion_tokens: 1,
+                }),
+            },
+        ];
+        let replayed = replay_agent_loop(&events).unwrap();
+        assert_eq!(replayed.finished, Some(StageOutcome::Final("done".into())));
+        assert!(matches!(
+            replayed.messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                tool_calls: None,
+            }) if content == "done"
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_loop_resumes_only_missing_tools_then_calls_model() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let adapter = Arc::new(ResumeAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![
+                    tool_call("first", "removed_tool_a"),
+                    tool_call("second", "removed_tool_b"),
+                ],
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                }),
+            },
+            AgentLoopEvent::ToolResult {
+                call_index: 1,
+                content: "saved second result".to_string(),
+            },
+        ];
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            &[],
+            Vec::new(),
+            &events,
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 2,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: None,
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+        let requests = adapter.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the saved assistant turn was not repeated"
+        );
+        let tools: Vec<(&str, &str)> = requests[0]
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools[0].0, "first");
+        assert!(tools[0].1.contains("unknown tool"));
+        assert_eq!(tools[1], ("second", "saved second result"));
+    }
 
     #[test]
     fn renders_all_placeholder_kinds() {

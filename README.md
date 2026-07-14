@@ -382,9 +382,10 @@ file, and every successful edit returns re-anchored context around the
 change so nearby follow-ups don't need a re-read. `edit_file`
 (exact-string replacement with a unique-match requirement) remains for
 cross-line rewrites. Everything is rooted at the working
-directory (paths that escape it are rejected), `glob`/`grep` skip `.git`,
-`node_modules`, `target`, and hidden entries, and results are capped so
-one call can't flood the context. Writes participate in approvals
+directory (paths that escape it lexically or through symlinks are
+rejected), `glob`/`grep` skip symlinks, `.git`, `node_modules`, `target`,
+and hidden entries, and results are capped so one call can't flood the
+context. Writes participate in approvals
 (`require_approval`, patterns like `edit_file *`) and chat diff capture
 like any other mutating tool. No MCP filesystem server required.
 
@@ -437,7 +438,11 @@ commands are killed after `settings.shell_timeout_secs`. `shell_allow`
 restricts commands to `*`-wildcard patterns anchored at both ends —
 `"cargo *"` permits `cargo test --all` but not `echo cargo` — and a
 disallowed command returns the pattern list to the model as an error it can
-adapt to. An empty `shell_allow` means unrestricted.
+adapt to. An allowlisted call must also be one simple command: active pipes,
+command lists (`;`, `&&`, newlines), redirections, subshells, and command
+substitutions are rejected even when the text matches a pattern. Quoted or
+escaped metacharacters remain ordinary arguments. An empty `shell_allow`
+means unrestricted.
 
 The grant is deliberately independent of `mode`: a `read_only` review stage
 can run the test suite without gaining any MCP write tools. That also means
@@ -471,7 +476,10 @@ auto_approve = ["shell cargo *", "agent__researcher"]
 - `auto_approve` patterns skip the prompt: they match tool names
   (`filesystem__edit_file`, `agent__*`) or `shell <command>` for the shell
   tool (`shell cargo *`), using the same anchored `*`-wildcards as
-  `shell_allow`.
+  `shell_allow`. Broad approval patterns only cover simple shell commands;
+  a compound command cannot inherit an `auto_approve` or session-wide grant
+  and needs an explicit one-off decision when the shell itself is
+  unrestricted.
 - Denials are returned to the model as tool results ("the user declined…
   adjust your approach"), so a refusal redirects the model instead of
   crashing the turn. Read-only tools are never gated.

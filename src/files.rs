@@ -275,16 +275,24 @@ fn missing(key: &str) -> String {
 }
 
 /// Resolve a path against the working directory, rejecting anything that
-/// escapes it. `..` and `.` are normalized lexically so not-yet-existing
-/// targets (writes) can still be checked.
+/// escapes it lexically or through a symlink. Existing targets are returned
+/// canonicalized. For not-yet-existing write targets, the nearest existing
+/// ancestor is canonicalized and checked before the lexical target is
+/// returned.
 fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     if path.trim().is_empty() {
         return Err("ERROR: `path` must not be empty".to_string());
     }
+    let root = cwd.canonicalize().map_err(|e| {
+        format!(
+            "ERROR: cannot resolve working directory {}: {e}",
+            cwd.display()
+        )
+    })?;
     let joined = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        cwd.join(path)
+        root.join(path)
     };
     let mut normalized = PathBuf::new();
     for component in joined.components() {
@@ -298,13 +306,48 @@ fn resolve(cwd: &Path, path: &str) -> Result<PathBuf, String> {
             other => normalized.push(other),
         }
     }
-    if !normalized.starts_with(cwd) {
+
+    // `exists()` follows symlinks and therefore misses dangling links. Use
+    // symlink_metadata so a dangling final link is rejected rather than
+    // treated as a safe, not-yet-created file.
+    let mut ancestor = normalized.as_path();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    format!("ERROR: cannot resolve an existing ancestor of `{path}`")
+                })?;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "ERROR: cannot inspect `{}` while resolving `{path}`: {e}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
+        format!(
+            "ERROR: cannot safely resolve `{path}` through `{}`: {e}",
+            ancestor.display()
+        )
+    })?;
+    if !canonical_ancestor.starts_with(&root) {
         return Err(format!(
             "ERROR: `{path}` is outside the working directory {}",
-            cwd.display()
+            root.display()
         ));
     }
-    Ok(normalized)
+
+    // Canonicalizing an existing target closes over its final symlink too.
+    // A new target cannot itself be a symlink, so the checked lexical path
+    // is the path its writer needs in order to create it.
+    if ancestor == normalized {
+        Ok(canonical_ancestor)
+    } else {
+        Ok(normalized)
+    }
 }
 
 /// A short content hash for line anchors: FNV-1a 32 folded to 16 bits,
@@ -583,7 +626,16 @@ fn walk_files(cwd: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path)) -> bo
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // Recursive traversal never follows symlinks. Direct file-tool
+            // paths go through `resolve`, which can safely allow links whose
+            // canonical target remains within the workspace.
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 if !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_str()) {
                     pending.push(path);
                 }
@@ -601,8 +653,12 @@ fn glob(cwd: &Path, pattern: &str) -> String {
     if pattern.trim().is_empty() {
         return "ERROR: `pattern` must not be empty".to_string();
     }
+    let workspace = match cwd.canonicalize() {
+        Ok(path) => path,
+        Err(e) => return format!("ERROR: cannot resolve working directory: {e}"),
+    };
     let mut matches: Vec<String> = Vec::new();
-    let truncated_walk = walk_files(cwd, cwd, &mut |relative, _| {
+    let truncated_walk = walk_files(&workspace, &workspace, &mut |relative, _| {
         if matches.len() < MAX_GLOB_RESULTS && crate::tools::wildcard_match(pattern, relative) {
             matches.push(relative.to_string());
         }
@@ -627,6 +683,10 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
     let root = match resolve(cwd, target) {
         Ok(p) => p,
         Err(e) => return e,
+    };
+    let workspace = match cwd.canonicalize() {
+        Ok(path) => path,
+        Err(e) => return format!("ERROR: cannot resolve working directory: {e}"),
     };
 
     let mut lines: Vec<String> = Vec::new();
@@ -666,10 +726,10 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
 
     if root.is_file() {
         let relative =
-            root.strip_prefix(cwd).unwrap_or(&root).to_string_lossy().into_owned();
+            root.strip_prefix(&workspace).unwrap_or(&root).to_string_lossy().into_owned();
         search(&relative, &root);
     } else {
-        walk_files(cwd, &root, &mut search);
+        walk_files(&workspace, &root, &mut search);
     }
 
     if lines.is_empty() {
@@ -714,6 +774,61 @@ mod tests {
         let inside_absolute = cwd.join("README.md");
         assert!(resolve(&cwd, &inside_absolute.to_string_lossy()).is_ok());
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_rejects_symlink_escapes_for_reads_and_new_writes() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = project("resolve-symlinks");
+        let outside = std::env::temp_dir().join(format!(
+            "soa-files-test-{}-outside",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+        symlink(&outside, cwd.join("outside-link")).unwrap();
+        assert!(
+            resolve(&cwd, "outside-link/secret.txt")
+                .unwrap_err()
+                .contains("outside")
+        );
+        let write = write_file(&cwd, "outside-link/new.txt", "must stay contained");
+        assert!(write.contains("outside"), "{write}");
+        assert!(!outside.join("new.txt").exists());
+
+        symlink(outside.join("secret.txt"), cwd.join("outside-file-link")).unwrap();
+        let grep_result = grep(&cwd, "secret", "", None);
+        assert!(!grep_result.contains("outside-file-link"), "{grep_result}");
+        assert_eq!(
+            glob(&cwd, "*outside-file-link*"),
+            "no files match `*outside-file-link*`"
+        );
+
+        // A dangling final symlink is an existing filesystem entry and must
+        // not be mistaken for a safe new file.
+        symlink(
+            outside.join("dangling-target.txt"),
+            cwd.join("dangling-link"),
+        )
+        .unwrap();
+        let write = write_file(&cwd, "dangling-link", "must not follow");
+        assert!(write.contains("cannot safely resolve"), "{write}");
+        assert!(!outside.join("dangling-target.txt").exists());
+
+        // Symlinks whose canonical target remains in the workspace continue
+        // to work.
+        symlink(cwd.join("src"), cwd.join("inside-link")).unwrap();
+        assert_eq!(
+            read_file(&cwd, "inside-link/main.rs", None, None, false),
+            "fn main() {\n    println!(\"hi\");\n}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

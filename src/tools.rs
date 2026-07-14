@@ -34,7 +34,9 @@ pub fn shell_definition(timeout_secs: u64, allow: &[String]) -> ToolFunction {
     );
     if !allow.is_empty() {
         description.push_str(&format!(
-            " Only commands matching these patterns are permitted: {}.",
+            " Only a single simple command matching one of these patterns is permitted; \
+             pipes, command lists, redirections, subshells, and command substitutions are \
+             rejected: {}.",
             allow.join(", ")
         ));
     }
@@ -80,10 +82,66 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     position <= end_limit
 }
 
+/// Whether `command` is one simple shell command rather than a compound
+/// expression. Quoted or escaped metacharacters are literal and therefore
+/// safe; executable control operators, redirections, subshells, and command
+/// substitutions are not.
+///
+/// This is deliberately narrower than a complete POSIX-shell parser. Its
+/// purpose is to keep broad patterns such as `cargo *` from also authorizing
+/// `cargo test; dangerous-command` while retaining ordinary quoting.
+pub fn shell_command_is_simple(command: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut quote = None;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(Quote::Double) => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    // An escaped character cannot terminate the quote or
+                    // become active shell syntax.
+                    chars.next();
+                }
+                '`' => return false,
+                '$' if chars.peek() == Some(&'(') => return false,
+                _ => {}
+            },
+            None => match ch {
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '\\' => {
+                    // Escaped metacharacters are literal arguments.
+                    chars.next();
+                }
+                ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '\r' | '`' => {
+                    return false;
+                }
+                '$' if chars.peek() == Some(&'(') => return false,
+                _ => {}
+            },
+        }
+    }
+    true
+}
+
 /// An empty allowlist permits everything (the stage already opted in with
-/// `shell = true`); otherwise the command must match one pattern.
+/// `shell = true`); otherwise the command must be a single simple command
+/// matching one pattern.
 pub fn command_allowed(allow: &[String], command: &str) -> bool {
-    allow.is_empty() || allow.iter().any(|pattern| wildcard_match(pattern, command.trim()))
+    allow.is_empty()
+        || (shell_command_is_simple(command)
+            && allow.iter().any(|pattern| wildcard_match(pattern, command.trim())))
 }
 
 /// Run a command, capturing everything. Failures (bad exit, timeout, spawn
@@ -200,6 +258,28 @@ mod tests {
         assert!(command_allowed(&allow, "cargo build"));
         assert!(command_allowed(&allow, "  git status  ")); // trimmed
         assert!(!command_allowed(&allow, "git push"));
+
+        // A textual prefix match must not grant a second command, a pipe,
+        // redirection, subshell, or command substitution.
+        for command in [
+            "cargo test; rm -rf important",
+            "cargo test && curl https://example.invalid",
+            "cargo test | tee result",
+            "cargo test > result",
+            "cargo test\nrm -rf important",
+            "cargo test $(dangerous-command)",
+            "cargo test `dangerous-command`",
+            "cargo test (dangerous-command)",
+        ] {
+            assert!(!command_allowed(&allow, command), "allowed: {command}");
+        }
+
+        // Metacharacters that the shell treats literally remain ordinary
+        // arguments; command substitution stays inert inside single quotes.
+        assert!(command_allowed(&allow, r#"cargo test "name;with;semicolons""#));
+        assert!(command_allowed(&allow, r"cargo test escaped\;semicolon"));
+        assert!(command_allowed(&allow, "cargo test '$(literal)'"));
+        assert!(!command_allowed(&allow, r#"cargo test "$(dangerous-command)""#));
     }
 
     #[tokio::test]

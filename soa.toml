@@ -143,6 +143,8 @@ skills = ["careful-editing"]     # from skills/ next to this file (settings.skil
 shell = true                     # unrestricted shell (stage is read_write anyway)
 # Pause writes and non-cargo shell commands for interactive y/n/always
 # approval; cargo builds and researcher delegations run unprompted.
+# Broad shell approvals cover only simple commands, never compound shell
+# expressions such as `cargo test; other-command`.
 # Non-interactive runs deny gated calls instead of prompting.
 require_approval = true
 auto_approve = ["shell cargo *", "agent__researcher"]
@@ -170,7 +172,9 @@ mode = "read_only"
 mcp = ["filesystem"]
 can_reprompt = ["implement", "review"]
 # The shell grant is independent of mode: review can run the test suite
-# without gaining any file-write tools.
+# without gaining any file-write tools. A non-empty shell_allow accepts only
+# simple commands; pipes, command lists, redirections, and substitutions are
+# rejected even if their text matches a wildcard.
 shell = true
 shell_allow = ["cargo check*", "cargo test*", "cargo build*", "cargo clippy*", "git status*", "git diff*", "git log*"]
 system_prompt = """

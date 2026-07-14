@@ -341,6 +341,10 @@ pub struct CallDescriptor {
     pub detail: String,
     /// What an "always" grant would cover for the rest of the session.
     pub always_pattern: String,
+    /// Broad approval patterns are safe only for simple shell commands.
+    /// Compound commands must receive an explicit one-off approval even if
+    /// their textual prefix matches an `auto_approve` or session grant.
+    pub pattern_safe: bool,
 }
 
 pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescriptor {
@@ -352,12 +356,14 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
                 descriptor: name.clone(),
                 detail: truncate(arguments_json, 200),
                 always_pattern: name,
+                pattern_safe: true,
             }
         }
         ToolBinding::WebSearch => CallDescriptor {
             descriptor: tools::WEB_SEARCH_TOOL.to_string(),
             detail: truncate(arguments_json, 200),
             always_pattern: tools::WEB_SEARCH_TOOL.to_string(),
+            pattern_safe: true,
         },
         ToolBinding::Shell { .. } => {
             let command =
@@ -367,6 +373,7 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
                 descriptor: format!("shell {}", truncate(command, 160)),
                 detail: command.to_string(),
                 always_pattern: format!("shell {first_word} *"),
+                pattern_safe: tools::shell_command_is_simple(command),
             }
         }
         ToolBinding::Agent { agent } => {
@@ -375,6 +382,7 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
                 descriptor: format!("agent__{agent}"),
                 detail: truncate(task, 200),
                 always_pattern: format!("agent__{agent}"),
+                pattern_safe: true,
             }
         }
         ToolBinding::File { op } => {
@@ -383,6 +391,7 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
                 descriptor: format!("{} {}", op.tool_name(), truncate(path, 160)),
                 detail: truncate(arguments_json, 200),
                 always_pattern: format!("{} *", op.tool_name()),
+                pattern_safe: true,
             }
         }
     }
@@ -411,11 +420,12 @@ pub async fn dispatch_tool_call(
     }
 
     if policy.require_approval {
-        let pre_approved = policy
-            .auto_approve
-            .iter()
-            .any(|pattern| tools::wildcard_match(pattern, &described.descriptor))
-            || policy.approvals.session_allowed(&described.descriptor);
+        let pre_approved = described.pattern_safe
+            && (policy
+                .auto_approve
+                .iter()
+                .any(|pattern| tools::wildcard_match(pattern, &described.descriptor))
+                || policy.approvals.session_allowed(&described.descriptor));
         if !pre_approved {
             if !policy.approvals.is_interactive() {
                 return Ok(format!(
@@ -543,6 +553,14 @@ async fn dispatch_tool_call_inner(
                 arguments.get("command").and_then(Value::as_str).unwrap_or_default();
             if command.trim().is_empty() {
                 return Ok("ERROR: `command` must be a non-empty string".to_string());
+            }
+            if !allow.is_empty() && !tools::shell_command_is_simple(command) {
+                return Ok(
+                    "ERROR: command not permitted — shell_allow accepts one simple command; \
+                     pipes, command lists, redirections, subshells, and command substitutions \
+                     require an unrestricted shell grant"
+                        .to_string(),
+                );
             }
             if !tools::command_allowed(allow, command) {
                 return Ok(format!(
@@ -1190,6 +1208,21 @@ mod tests {
         assert!(!parallel_round(true, &reads[..1], read_only));
         assert!(!parallel_round(true, &[call("read"), call("write")], read_only));
         assert!(!parallel_round(true, &[call("read"), call("reprompt_stage")], read_only));
+    }
+
+    #[test]
+    fn compound_shell_commands_cannot_use_pattern_approvals() {
+        let binding = ToolBinding::Shell { allow: Vec::new() };
+        let simple = call_descriptor(&binding, r#"{"command":"cargo test --all"}"#);
+        assert!(simple.pattern_safe);
+        assert!(tools::wildcard_match("shell cargo *", &simple.descriptor));
+
+        let compound =
+            call_descriptor(&binding, r#"{"command":"cargo test; dangerous-command"}"#);
+        assert!(!compound.pattern_safe);
+        // It still textually matches the broad pattern, proving that the
+        // separate pattern_safe gate is what prevents auto-approval.
+        assert!(tools::wildcard_match("shell cargo *", &compound.descriptor));
     }
 
     #[test]

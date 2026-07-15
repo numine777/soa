@@ -925,6 +925,10 @@ struct ReplayedAgentLoop {
     finished: Option<StageOutcome>,
     turns: u32,
     usage: Option<Usage>,
+    /// Context was shed after the last usage measurement, so `usage` no
+    /// longer reflects the conversation's real size — pre-flight sizing
+    /// must fall back to the character estimate.
+    shed_since_usage: bool,
 }
 
 /// Rebuild the conversation a cancelled (or failed) loop had accumulated,
@@ -990,6 +994,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
     let mut finished = None;
     let mut turns = 0u32;
     let mut usage = None;
+    let mut shed_since_usage = false;
     let mut started = false;
 
     for (event_index, event) in events.iter().enumerate() {
@@ -1017,6 +1022,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                     bail!("agent event log sheds context during an incomplete tool round");
                 }
                 shed_context(&mut messages, *keep_recent);
+                shed_since_usage = true;
             }
             AgentLoopEvent::Assistant {
                 content,
@@ -1046,6 +1052,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                 });
                 turns = turns.saturating_add(1);
                 usage = *reported_usage;
+                shed_since_usage = false;
             }
             AgentLoopEvent::ToolStarted { call_index } => {
                 let round = pending
@@ -1119,6 +1126,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
         finished,
         turns,
         usage,
+        shed_since_usage,
     })
 }
 
@@ -1462,6 +1470,83 @@ pub async fn run_agent_loop(
             );
         }
 
+        // Pre-flight context management: size the request BEFORE sending
+        // it, and shed older tool results while it would still breach the
+        // model's window — instead of letting the provider reject a doomed
+        // request after the fact.
+        if let Some(capacity) = declared_capacity(config, options.model_name) {
+            let threshold_tokens = (capacity as f64 * config.settings.auto_compact_threshold) as u64;
+            let estimate = preflight_estimate(&state, &definitions);
+            if estimate >= threshold_tokens {
+                let mut candidate = state.messages.clone();
+                let mut shed_levels: Vec<usize> = Vec::new();
+                // Escalate: keep the 2 most recent tool results, then 1,
+                // then none, stopping as soon as the estimate fits.
+                for keep_recent in [2usize, 1, 0] {
+                    if shed_context(&mut candidate, keep_recent) > 0 {
+                        shed_levels.push(keep_recent);
+                    }
+                    if crate::model::estimate_request_tokens(
+                        state.system.as_deref(),
+                        &candidate,
+                        &definitions,
+                    ) < threshold_tokens
+                    {
+                        break;
+                    }
+                }
+                if !shed_levels.is_empty() {
+                    tracing::warn!(
+                        owner_kind = options.owner_kind,
+                        owner = options.owner,
+                        estimate,
+                        capacity,
+                        levels = ?shed_levels,
+                        "pre-flight context pressure: truncated older tool results"
+                    );
+                    observe_loop(
+                        options.on_observation,
+                        AgentLoopObservation::Notice(format!(
+                            "context estimated at {} of {} — truncated older tool result(s) before sending",
+                            crate::model::fmt_tokens(estimate),
+                            crate::model::fmt_tokens(capacity),
+                        )),
+                    );
+                    for keep_recent in shed_levels {
+                        record_loop_event(
+                            &mut events,
+                            options.on_event,
+                            AgentLoopEvent::ContextShed { keep_recent },
+                        );
+                    }
+                    // Re-replay so the request is built from the shed
+                    // conversation (and the estimate base resets).
+                    continue;
+                }
+                if estimate >= capacity {
+                    // Nothing left to trim. The estimate is ±25%, so the
+                    // provider stays the final arbiter — send, but say why
+                    // a rejection is coming if it does.
+                    tracing::warn!(
+                        owner_kind = options.owner_kind,
+                        owner = options.owner,
+                        estimate,
+                        capacity,
+                        "request likely exceeds the context window and nothing is left to shed"
+                    );
+                    observe_loop(
+                        options.on_observation,
+                        AgentLoopObservation::Notice(format!(
+                            "context estimated at {} — likely over the model's {} window, and no \
+                             older tool results are left to truncate",
+                            crate::model::fmt_tokens(estimate),
+                            crate::model::fmt_tokens(capacity),
+                        )),
+                    );
+                }
+            }
+        }
+
         let mut request = Vec::with_capacity(state.messages.len() + 1);
         if let Some(system) = &state.system {
             request.push(Message::System {
@@ -1513,35 +1598,6 @@ pub async fn run_agent_loop(
             continue;
         }
 
-        if let Some((used, capacity)) =
-            context_pressure(config, options.model_name, reply.usage.as_ref())
-        {
-            let mut candidate = state.messages.clone();
-            let trimmed = shed_context(&mut candidate, 2);
-            if trimmed > 0 {
-                tracing::warn!(
-                    owner_kind = options.owner_kind,
-                    owner = options.owner,
-                    used,
-                    capacity,
-                    trimmed,
-                    "context pressure: truncated older tool results"
-                );
-                observe_loop(
-                    options.on_observation,
-                    AgentLoopObservation::Notice(format!(
-                        "context at {} of {} — truncated {trimmed} older tool result(s)",
-                        crate::model::fmt_tokens(used),
-                        crate::model::fmt_tokens(capacity),
-                    )),
-                );
-                record_loop_event(
-                    &mut events,
-                    options.on_event,
-                    AgentLoopEvent::ContextShed { keep_recent: 2 },
-                );
-            }
-        }
         record_loop_event(
             &mut events,
             options.on_event,
@@ -1814,18 +1870,34 @@ pub async fn run_stage(
 /// If the last reply's usage puts the conversation over the auto-compact
 /// threshold of the model's declared context window, return
 /// `(used, capacity)`.
-pub fn context_pressure(
-    config: &Config,
-    model_name: &str,
-    usage: Option<&crate::model::Usage>,
-) -> Option<(u64, u64)> {
-    let threshold = config.settings.auto_compact_threshold;
-    if threshold <= 0.0 {
+/// The model's declared context window, when pre-flight management is
+/// enabled (`auto_compact_threshold` > 0 and `context_tokens` declared).
+fn declared_capacity(config: &Config, model_name: &str) -> Option<u64> {
+    if config.settings.auto_compact_threshold <= 0.0 {
         return None;
     }
-    let capacity = config.models.get(model_name)?.context_tokens?;
-    let used = usage?.context_tokens();
-    (used as f64 >= capacity as f64 * threshold).then_some((used, capacity))
+    config.models.get(model_name)?.context_tokens
+}
+
+/// Size the request about to be sent. Provider-reported usage covers
+/// everything up to and including the last assistant response, so only
+/// the suffix appended since (tool results, steered messages) needs the
+/// character estimate — unless shedding invalidated the measurement, in
+/// which case the whole conversation is estimated.
+fn preflight_estimate(state: &ReplayedAgentLoop, definitions: &[ToolDefinition]) -> u64 {
+    if let Some(usage) = state.usage
+        && !state.shed_since_usage
+    {
+        let suffix_start = state
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Assistant { .. }))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        return usage.context_tokens()
+            + crate::model::estimate_tokens(&state.messages[suffix_start..]);
+    }
+    crate::model::estimate_request_tokens(state.system.as_deref(), &state.messages, definitions)
 }
 
 /// Free context by truncating older tool results in place, keeping the
@@ -1985,6 +2057,169 @@ mod tests {
         };
         assert_eq!(tool_call_id, "c2");
         assert!(content.contains("cancelled"), "{content}");
+    }
+
+    #[test]
+    fn replay_tracks_context_shed_staleness() {
+        let mut events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("c1", "read")],
+                usage: Some(Usage {
+                    prompt_tokens: 50,
+                    completion_tokens: 5,
+                    ..Usage::default()
+                }),
+                reasoning: None,
+            },
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "x".repeat(600),
+            },
+            AgentLoopEvent::ContextShed { keep_recent: 0 },
+        ];
+        // A shed after the last measurement makes the usage stale…
+        let replayed = replay_agent_loop(&events).unwrap();
+        assert!(replayed.shed_since_usage);
+
+        // …and the next measured response resets it.
+        events.push(AgentLoopEvent::Assistant {
+            content: None,
+            tool_calls: vec![tool_call("c2", "read")],
+            usage: Some(Usage {
+                prompt_tokens: 60,
+                completion_tokens: 5,
+                ..Usage::default()
+            }),
+            reasoning: None,
+        });
+        let replayed = replay_agent_loop(&events).unwrap();
+        assert!(!replayed.shed_since_usage);
+    }
+
+    #[tokio::test]
+    async fn preflight_sheds_context_before_sending_a_doomed_request() {
+        let config: Config = toml::from_str(
+            r#"
+            [settings]
+            auto_compact_threshold = 0.8
+
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+            context_tokens = 1000
+            "#,
+        )
+        .unwrap();
+        let adapter = Arc::new(ResumeAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        // The last measured context (900) plus a 6000-char tool result
+        // estimates far beyond 80% of the 1000-token window.
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("c1", "removed_tool")],
+                usage: Some(Usage {
+                    prompt_tokens: 800,
+                    completion_tokens: 100,
+                    ..Usage::default()
+                }),
+                reasoning: None,
+            },
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "x".repeat(6000),
+            },
+        ];
+        let recorded: std::sync::Mutex<Vec<AgentLoopEvent>> = std::sync::Mutex::new(Vec::new());
+        let sink = |event: AgentLoopEvent| recorded.lock().unwrap().push(event);
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            &[],
+            Vec::new(),
+            &events,
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 3,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: Some(&sink),
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+
+        // The shed was recorded BEFORE the request went out…
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::ContextShed { .. })),
+            "expected a pre-flight ContextShed event"
+        );
+        // …so the model never saw the full 6000-char result.
+        let requests = adapter.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let tool_content = requests[0]
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("the tool result is still present");
+        assert!(tool_content.starts_with("[trimmed"), "{tool_content}");
+        assert!(tool_content.len() < 400, "was actually truncated");
     }
 
     #[test]
@@ -2607,7 +2842,7 @@ mod tests {
     }
 
     #[test]
-    fn context_pressure_gated_by_threshold_and_capacity() {
+    fn preflight_sizing_uses_real_usage_and_gates_on_config() {
         let mut config: Config = toml::from_str(
             r#"
             [providers.p]
@@ -2628,39 +2863,52 @@ mod tests {
             "#,
         )
         .unwrap();
-        let usage = |prompt, completion| {
-            Some(crate::model::Usage {
-                prompt_tokens: prompt,
-                completion_tokens: completion,
-                ..Usage::default()
-            })
-        };
 
-        // Default threshold 0.8 of 1000: fires at 800 (prompt + completion), not below.
-        assert_eq!(
-            context_pressure(&config, "gauged", usage(700, 100).as_ref()),
-            Some((800, 1000))
-        );
-        assert_eq!(
-            context_pressure(&config, "gauged", usage(700, 99).as_ref()),
-            None
-        );
-        // No declared window, no reported usage, or unknown model: never fires.
-        assert_eq!(
-            context_pressure(&config, "unbounded", usage(9000, 0).as_ref()),
-            None
-        );
-        assert_eq!(context_pressure(&config, "gauged", None), None);
-        assert_eq!(
-            context_pressure(&config, "missing", usage(9000, 0).as_ref()),
-            None
-        );
-        // Threshold 0 disables the check entirely.
+        // Capacity requires a declared window, a known model, and a
+        // nonzero threshold.
+        assert_eq!(declared_capacity(&config, "gauged"), Some(1000));
+        assert_eq!(declared_capacity(&config, "unbounded"), None);
+        assert_eq!(declared_capacity(&config, "missing"), None);
         config.settings.auto_compact_threshold = 0.0;
-        assert_eq!(
-            context_pressure(&config, "gauged", usage(9000, 0).as_ref()),
-            None
-        );
+        assert_eq!(declared_capacity(&config, "gauged"), None);
+
+        // With fresh usage: measured base plus a char estimate of the
+        // suffix appended since the last assistant response.
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("c1", "read")],
+                usage: Some(Usage {
+                    prompt_tokens: 500,
+                    completion_tokens: 100,
+                    ..Usage::default()
+                }),
+                reasoning: None,
+            },
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "x".repeat(4000),
+            },
+        ];
+        let state = replay_agent_loop(&events).unwrap();
+        let estimate = preflight_estimate(&state, &[]);
+        // 600 measured + ~1000 for the 4000-char result (+ envelope).
+        assert!((1550..1700).contains(&estimate), "{estimate}");
+
+        // After a shed, the measurement is stale: the whole (now smaller)
+        // conversation is re-estimated from characters instead.
+        let mut shed_events = events;
+        shed_events.push(AgentLoopEvent::ContextShed { keep_recent: 0 });
+        let state = replay_agent_loop(&shed_events).unwrap();
+        assert!(state.shed_since_usage);
+        let after = preflight_estimate(&state, &[]);
+        assert!(after < 200, "{after}");
     }
 
     #[test]

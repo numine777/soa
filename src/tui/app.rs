@@ -454,30 +454,10 @@ impl App {
         }
     }
 
-    /// Rough context-size estimate: ~4 characters per token.
+    /// Rough context-size estimate (~4 characters per token) — the shared
+    /// heuristic the loop also uses for pre-flight sizing.
     pub fn token_estimate(&self) -> usize {
-        let chars: usize = self
-            .history
-            .iter()
-            .map(|message| match message {
-                Message::System { content } | Message::User { content } => content.len(),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    ..
-                } => {
-                    content.as_deref().map_or(0, str::len)
-                        + tool_calls.as_ref().map_or(0, |calls| {
-                            calls
-                                .iter()
-                                .map(|c| c.function.arguments.to_string().len() + 32)
-                                .sum()
-                        })
-                }
-                Message::Tool { content, .. } => content.len(),
-            })
-            .sum();
-        chars / 4
+        crate::model::estimate_tokens(&self.history) as usize
     }
 
     /// Diff entries recorded since the last `/clear` — what the diff view,

@@ -212,6 +212,52 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> AdapterFuture<'a>;
 }
 
+/// Rough size of a message list in tokens: ~4 characters per token plus a
+/// small per-message envelope. Real provider-reported usage is preferred
+/// wherever it exists; this estimate sizes only what has no measurement
+/// yet (a request that hasn't been sent, content appended since the last
+/// response). Code tokenizes denser than prose, so treat results as ±25%.
+pub fn estimate_tokens(messages: &[Message]) -> u64 {
+    let chars: usize = messages
+        .iter()
+        .map(|message| match message {
+            Message::System { content } | Message::User { content } => content.len(),
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                content.as_deref().map_or(0, str::len)
+                    + tool_calls.as_ref().map_or(0, |calls| {
+                        calls
+                            .iter()
+                            .map(|call| call.function.arguments.to_string().len() + 32)
+                            .sum()
+                    })
+            }
+            Message::Tool { content, .. } => content.len(),
+        })
+        .sum();
+    (chars / 4 + messages.len() * 8) as u64
+}
+
+/// Estimate a complete request: system prompt, conversation, and tool
+/// definitions (schemas are sent with every request).
+pub fn estimate_request_tokens(
+    system: Option<&str>,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> u64 {
+    let system_tokens = system.map_or(0, |text| text.len() / 4) as u64;
+    let tool_tokens: usize = tools
+        .iter()
+        .map(|tool| {
+            (tool.name.len() + tool.description.len() + tool.parameters.to_string().len()) / 4 + 16
+        })
+        .sum();
+    system_tokens + tool_tokens as u64 + estimate_tokens(messages)
+}
+
 pub fn fmt_tokens(tokens: u64) -> String {
     if tokens >= 1000 {
         format!("{:.1}k tok", tokens as f64 / 1000.0)
@@ -1037,6 +1083,32 @@ mod tests {
             malformed.function.arguments,
             Value::String("{\"path\": oops".to_string())
         );
+    }
+
+    #[test]
+    fn token_estimates_scale_with_content_and_structure() {
+        let messages = vec![
+            Message::User {
+                content: "x".repeat(4000),
+            },
+            Message::Tool {
+                content: "y".repeat(2000),
+                tool_call_id: "c1".to_string(),
+            },
+        ];
+        // ~6000 chars / 4 plus per-message envelopes.
+        let estimate = estimate_tokens(&messages);
+        assert!((1500..1700).contains(&estimate), "{estimate}");
+
+        // System and tool schemas count toward the full request.
+        let tools = vec![ToolDefinition {
+            name: "grep".into(),
+            description: "d".repeat(400),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let full = estimate_request_tokens(Some(&"s".repeat(800)), &messages, &tools);
+        assert!(full > estimate + 250, "{full} vs {estimate}");
+        assert!(estimate_tokens(&[]) == 0);
     }
 
     #[test]

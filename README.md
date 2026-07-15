@@ -271,7 +271,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `max_run_secs` | – | active wall-clock limit for the whole run, including tools, agents, retries, and fallback; resumed runs carry prior active time |
 | `max_tool_output_chars` | 30000 | tool results longer than this are truncated with a notice before entering the conversation, so one oversized result can't blow the context window (0 = unlimited) |
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
-| `auto_compact_threshold` | 0.8 | when real token usage crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results (0 disables; needs `context_tokens` on the model) |
+| `auto_compact_threshold` | 0.8 | when the sized request crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results **before sending** — see the pre-flight description under `[models]` (0 disables; needs `context_tokens` on the model) |
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `mcp_timeout_secs` | 60 | MCP handshakes and individual tool calls are abandoned after this many seconds, so a wedged (but not crashed) server can't hang a stage; an abandoned call triggers the usual reconnect-and-retry |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
@@ -402,9 +402,15 @@ field on every response (including streamed ones, via
   yellow at 70% and red at 90% (without real usage or a declared window it
   falls back to a `~` character estimate);
 - auto-compaction in chat when usage crosses `auto_compact_threshold`;
-- mid-turn shedding in stage, agent, and chat tool loops: older tool
-  results (all but the two most recent) are truncated in place before the
-  next request instead of overflowing the window.
+- **pre-flight context management** in stage, agent, and chat tool loops:
+  every request is sized before it is sent — the previous response's real
+  token usage plus a character estimate of whatever was appended since
+  (tool results, steered messages). A request that would cross the
+  threshold sheds older tool results first, escalating from "keep the two
+  most recent intact" down to truncating all of them, and only then goes
+  out. When nothing is left to trim and the estimate still exceeds the
+  window, soa warns and lets the provider be the final arbiter (the
+  estimate is ±25%) instead of refusing a request that might fit.
 
 For cost accounting, declare both prices in US dollars per million tokens:
 

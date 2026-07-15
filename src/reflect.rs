@@ -785,6 +785,7 @@ mod tests {
         history.push(Message::Assistant {
             content: Some("done, tests pass".to_string()),
             tool_calls: None,
+            reasoning: None,
         });
         let session = crate::tui::store::Session {
             id: "s1".to_string(),

@@ -464,6 +464,7 @@ impl App {
                 Message::Assistant {
                     content,
                     tool_calls,
+                    ..
                 } => {
                     content.as_deref().map_or(0, str::len)
                         + tool_calls.as_ref().map_or(0, |calls| {
@@ -1956,6 +1957,7 @@ impl App {
                     Message::Assistant {
                         content: Some("Understood — continuing with that context.".to_string()),
                         tool_calls: None,
+                        reasoning: None,
                     },
                 ];
                 let after = self.token_estimate();
@@ -1997,6 +1999,7 @@ impl App {
                         self.history.push(Message::Assistant {
                             content: Some(output.clone()),
                             tool_calls: None,
+                            reasoning: None,
                         });
                         if output.trim().is_empty() {
                             self.info(format!("workflow `{workflow}` finished (empty output)"));
@@ -2470,6 +2473,7 @@ mod tests {
                 content: None,
                 tool_calls: vec![call],
                 usage: None,
+                reasoning: None,
             },
             AgentLoopEvent::ToolResult {
                 call_index: 0,

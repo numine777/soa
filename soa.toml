@@ -46,7 +46,8 @@ provider_retries = 3
 
 # ---------------------------------------------------------------------------
 # Providers: model endpoints plus their wire adapters. The default adapter is
-# OpenAI-compatible `/chat/completions`; future protocols stay isolated here.
+# OpenAI-compatible `/chat/completions`; `anthropic_messages` speaks
+# Anthropic's native Messages API. Protocol details stay isolated here.
 # ---------------------------------------------------------------------------
 
 [providers.spark]
@@ -62,6 +63,17 @@ data_boundary = "local"
 # Extra headers on every request (values support ${VAR}) — e.g. Azure's
 # api-key or OpenRouter's HTTP-Referer:
 # headers = { "x-portkey-provider" = "openai" }
+
+# Claude models over Anthropic's native API. The api_key is sent as
+# x-api-key; anthropic-version defaults to 2023-06-01 (override via
+# headers). Thinking blocks are round-tripped across tool rounds
+# automatically. Pair with cached_input_cost_per_million on the model for
+# honest cache-hit accounting.
+# [providers.anthropic]
+# adapter = "anthropic_messages"
+# base_url = "https://api.anthropic.com/v1"
+# api_key = "${ANTHROPIC_API_KEY}"
+# data_boundary = "external"
 
 # ---------------------------------------------------------------------------
 # Models: a provider + model id + default sampling parameters.

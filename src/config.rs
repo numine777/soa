@@ -285,6 +285,8 @@ pub struct Provider {
 pub enum ProviderAdapterKind {
     #[default]
     OpenAiChatCompletions,
+    /// Anthropic's native Messages API (`/v1/messages`).
+    AnthropicMessages,
 }
 
 fn default_true() -> bool {
@@ -1069,6 +1071,13 @@ mod tests {
             "adapter = \"open_ai_chat_completions\"\nbase_url = \"http://localhost:11434/v1\"",
         );
         assert!(parse(&explicit).is_ok());
+
+        let anthropic = explicit.replace("open_ai_chat_completions", "anthropic_messages");
+        let config = parse(&anthropic).unwrap();
+        assert_eq!(
+            config.providers["local"].adapter,
+            ProviderAdapterKind::AnthropicMessages
+        );
 
         let unknown = explicit.replace("open_ai_chat_completions", "mystery_protocol");
         let error = parse(&unknown).unwrap_err().to_string();

@@ -283,10 +283,13 @@ See [soa.toml](soa.toml) for a complete annotated example.
 
 ### `[providers.<name>]`
 
-Each entry selects a provider wire adapter. The default and currently
-built-in adapter is `open_ai_chat_completions`, which supports any
-OpenAI-compatible chat-completions endpoint: Ollama, LM Studio, llama.cpp,
-vLLM, or a hosted API.
+Each entry selects a provider wire adapter. Two adapters are built in:
+
+- `open_ai_chat_completions` (default) — any OpenAI-compatible
+  chat-completions endpoint: Ollama, LM Studio, llama.cpp, vLLM, or a
+  hosted API.
+- `anthropic_messages` — Anthropic's native Messages API (`/v1/messages`),
+  for using Claude models directly without a compatibility gateway.
 
 ```toml
 [providers.ollama]
@@ -300,22 +303,42 @@ headers = { }               # extra headers on every request (values support
                             # ${VAR}) — Azure's api-key, OpenRouter's
                             # HTTP-Referer, org/beta headers. Validated by
                             # `soa check`.
+
+[providers.anthropic]
+adapter = "anthropic_messages"
+base_url = "https://api.anthropic.com/v1"
+api_key = "${ANTHROPIC_API_KEY}"   # sent as x-api-key
+data_boundary = "external"
+# headers = { "anthropic-version" = "2026-01-01" }  # override the default
+#                                  # 2023-06-01, or add anthropic-beta flags
 ```
+
+Anthropic-specific notes: the Messages API requires `max_tokens`, so soa
+sends 64000 when neither the model nor the stage sets one (it is a cap,
+not a target — set `max_tokens` on the model to spend less). Thinking
+blocks from reasoning-enabled models are captured and replayed verbatim
+across tool rounds (the API rejects a tool-use turn whose thinking was
+dropped), stored in sessions and event logs as an opaque payload, and
+never mixed into streamed answer text. Cache-read tokens flow into usage
+and pair with `cached_input_cost_per_million`. Leave `temperature`/`top_p`
+unset for the newest Claude models — they reject non-default sampling
+parameters, and the adapter passes through whatever the config sets.
 
 Internally, stages and agents use a canonical model contract for messages,
 tool definitions, tool calls, sampling, usage, and streamed text. Tool-call
 arguments are structured JSON in that contract (adapters own each protocol's
 encoding, e.g. OpenAI's JSON-in-a-string; saved sessions from older versions
-still load), SSE framing is a shared module rather than adapter-private, and
+still load), SSE framing is a shared module rather than adapter-private,
 usage carries cache-read and reasoning token counts when the provider
-reports them. The adapter
+reports them, and assistant turns can carry an opaque provider reasoning
+payload (Anthropic thinking blocks) that the producing adapter replays
+verbatim while other adapters ignore it. The adapter
 is the only layer that knows the selected provider's JSON, authentication,
 endpoint paths, error classification, or streaming protocol. This keeps
 provider-specific fields out of saved conversations and the agent loop. Stage
 pipelines, configured subagents, and interactive chat all use that same
 event-driven loop, so retry, parallel-tool, approval, context-shedding, and
-tool-result ordering semantics stay aligned across entry points. Another API
-remains a contained adapter addition rather than a workflow rewrite.
+tool-result ordering semantics stay aligned across entry points.
 
 `data_boundary = "external"` marks requests as leaving the trusted local
 boundary. Directly selecting such a provider is explicit consent to send the

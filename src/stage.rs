@@ -224,6 +224,11 @@ pub enum AgentLoopEvent {
         content: Option<String>,
         tool_calls: Vec<ToolCall>,
         usage: Option<Usage>,
+        /// Opaque provider reasoning payload — see
+        /// [`crate::model::Message::Assistant`]. Absent in logs written by
+        /// older soa versions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Value>,
     },
     /// Intent record written just before a mutating or process-executing
     /// call runs. On resume, a started call with no recorded result is NOT
@@ -1017,6 +1022,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                 content,
                 tool_calls,
                 usage: reported_usage,
+                reasoning,
             } => {
                 if !started {
                     bail!("agent event log does not start with a started event");
@@ -1031,6 +1037,7 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                 messages.push(Message::Assistant {
                     content: content.clone(),
                     tool_calls: Some(tool_calls.clone()),
+                    reasoning: reasoning.clone(),
                 });
                 pending = Some(PendingToolRound {
                     calls: tool_calls.clone(),
@@ -1087,9 +1094,12 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                     let StageOutcome::Final(content) = outcome else {
                         unreachable!()
                     };
+                    // Reasoning for a completed final turn is not carried
+                    // (providers accept omitted thinking on past turns).
                     messages.push(Message::Assistant {
                         content: Some(content.clone()),
                         tool_calls: None,
+                        reasoning: None,
                     });
                 }
                 finished = Some(outcome.clone());
@@ -1539,6 +1549,7 @@ pub async fn run_agent_loop(
                 content: reply.content,
                 tool_calls: reply.tool_calls,
                 usage: reply.usage,
+                reasoning: reply.reasoning,
             },
         );
     }
@@ -1904,6 +1915,7 @@ mod tests {
                 Ok(crate::model::ModelResponse {
                     content: Some("done".to_string()),
                     tool_calls: Vec::new(),
+                    reasoning: None,
                     usage: Some(Usage {
                         prompt_tokens: 20,
                         completion_tokens: 1,
@@ -1942,6 +1954,7 @@ mod tests {
                 content: None,
                 tool_calls: vec![tool_call("c1", "write_file"), tool_call("c2", "shell")],
                 usage: None,
+                reasoning: None,
             },
             // The turn is interrupted with only the first result recorded.
             AgentLoopEvent::ToolResult {
@@ -1991,6 +2004,7 @@ mod tests {
                     completion_tokens: 2,
                     ..Usage::default()
                 }),
+                reasoning: None,
             },
             // Parallel completion order is intentionally reversed.
             AgentLoopEvent::ToolResult {
@@ -2045,6 +2059,7 @@ mod tests {
             Some(Message::Assistant {
                 content: Some(content),
                 tool_calls: None,
+                reasoning: None,
             }) if content == "done"
         ));
     }
@@ -2101,6 +2116,7 @@ mod tests {
                     completion_tokens: 2,
                     ..Usage::default()
                 }),
+                reasoning: None,
             },
             AgentLoopEvent::ToolResult {
                 call_index: 1,
@@ -2223,6 +2239,7 @@ mod tests {
                     shell_call("c2", "echo two"),
                 ],
                 usage: None,
+                reasoning: None,
             },
             // The previous run began c1 (intent recorded) and died before
             // its result reached disk; c2 was never started.

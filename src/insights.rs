@@ -231,6 +231,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("1", "write_file"), tool_call("2", "grep")]),
+                reasoning: None,
             },
             Message::Tool {
                 content: "DENIED: the user declined `write_file src/x.rs`.".into(),
@@ -240,6 +241,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("3", "edit_lines")]),
+                reasoning: None,
             },
             Message::Tool {
                 content: "ERROR: stale anchor `4:9f3a` — re-read the file.".into(),
@@ -292,6 +294,7 @@ mod tests {
             Message::Assistant {
                 content: None,
                 tool_calls: Some(vec![tool_call("1", "shell")]),
+                reasoning: None,
             },
             Message::Tool { content: long, tool_call_id: "1".into() },
         ];

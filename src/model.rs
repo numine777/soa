@@ -31,6 +31,13 @@ pub enum Message {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
+        /// Opaque provider reasoning payload (e.g. Anthropic thinking
+        /// blocks), replayed verbatim by the adapter that produced it.
+        /// Thinking-enabled models reject a replayed tool-use turn whose
+        /// thinking blocks were dropped, so the loop must round-trip this.
+        /// Other adapters ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<Value>,
     },
     Tool {
         content: String,
@@ -129,6 +136,8 @@ impl Usage {
 pub struct ModelResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Opaque provider reasoning payload — see [`Message::Assistant`].
+    pub reasoning: Option<Value>,
     /// Real token counts, when the provider reports them.
     pub usage: Option<Usage>,
     /// Set when the provider cut the generation short (e.g. a `length` or
@@ -948,6 +957,7 @@ mod tests {
                 Ok(ModelResponse {
                     content: Some("done".to_string()),
                     tool_calls: Vec::new(),
+                    reasoning: None,
                     usage: Some(Usage {
                         prompt_tokens: 3,
                         completion_tokens: 1,
@@ -974,6 +984,7 @@ mod tests {
                 Ok(ModelResponse {
                     content: Some("late".to_string()),
                     tool_calls: Vec::new(),
+                    reasoning: None,
                     usage: Some(Usage::default()),
                     truncation: None,
                 })

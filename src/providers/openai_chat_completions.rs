@@ -1,12 +1,11 @@
 //! OpenAI-compatible `/chat/completions` JSON and SSE adapter.
 
-use std::time::Duration;
-
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::sse::{SseDecoder, SseEvent};
+use super::{parse_retry_after, retryable_status};
 use crate::model::{
     AdapterError, AdapterFuture, DeltaHandler, FunctionCall, Message, ModelRequest, ModelResponse,
     ProviderAdapter, ToolCall, ToolDefinition, Usage,
@@ -311,6 +310,9 @@ impl<'a> MessageWire<'a> {
             Message::Assistant {
                 content,
                 tool_calls,
+                // The chat-completions protocol has no reasoning replay;
+                // provider-opaque reasoning payloads are dropped here.
+                reasoning: _,
             } => Self::Assistant {
                 content: content.as_deref(),
                 tool_calls: tool_calls
@@ -434,6 +436,7 @@ impl ResponseMessage {
         ModelResponse {
             content: self.content,
             tool_calls: self.tool_calls.into_iter().map(Into::into).collect(),
+            reasoning: None,
             usage,
             truncation: truncation_reason(finish_reason),
         }
@@ -603,6 +606,7 @@ impl StreamAccumulator {
     fn finish(self) -> ModelResponse {
         ModelResponse {
             content: (!self.content.is_empty()).then_some(self.content),
+            reasoning: None,
             tool_calls: self
                 .tool_calls
                 .into_iter()
@@ -618,22 +622,6 @@ impl StreamAccumulator {
             truncation: truncation_reason(self.finish_reason),
         }
     }
-}
-
-fn retryable_status(status: reqwest::StatusCode) -> bool {
-    status.is_server_error()
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-}
-
-fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
-    let value = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?;
-    let seconds: u64 = value.trim().parse().ok()?;
-    Some(Duration::from_secs(seconds.min(30)))
 }
 
 #[cfg(test)]
@@ -655,6 +643,7 @@ mod tests {
             },
             Message::Assistant {
                 content: None,
+                reasoning: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "c1".into(),
                     function: FunctionCall {

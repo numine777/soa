@@ -60,14 +60,23 @@ usage/budgets. While a stage is active, each event is appended to a compact
 JSONL sidecar instead of rewriting the growing snapshot. The log records the
 exact starting conversation, every model tool-call response, each completed
 tool result (including results as parallel calls finish), context shedding,
-and the final outcome; it is folded into the next boundary snapshot.
+and the final outcome; it is folded into the next boundary snapshot. Every
+snapshot and event append is fsynced (file and directory entry), so recorded
+progress survives power loss, not just process death.
 `soa run --resume` replays that log and continues with only the unfinished
 calls instead of rerunning the stage from its prompt. Completed stages, model
 requests, and tool calls are not repeated.
 
-The one unavoidable ambiguity is work interrupted after an external request
-or tool took effect but before its completion event reached disk; that
-in-flight operation may run again on resume. Stage names must still exist in
+Mutating and process-executing calls additionally write an **intent record**
+just before running. On resume, a call that was started but never recorded a
+result is *not* re-executed — its effects may already have happened — and the
+model instead receives an `INTERRUPTED` result telling it to verify the
+current state before deciding whether to repeat the operation. Read-only
+calls simply run again. The remaining ambiguities are small: a model request
+interrupted after the provider generated (and billed) a response is
+re-issued, and an intent written while a call sat at an approval prompt
+reads as "may have executed" even though it never ran — the verify-first
+result is safe in both directions. Stage names must still exist in
 the config, checkpoints are deleted when the pipeline finishes, and
 single-stage runs (`--stage`) are not checkpointed. Resuming carries forward
 recorded tokens, cost, and active time; time while suspended does not consume

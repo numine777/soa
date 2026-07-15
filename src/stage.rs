@@ -225,6 +225,13 @@ pub enum AgentLoopEvent {
         tool_calls: Vec<ToolCall>,
         usage: Option<Usage>,
     },
+    /// Intent record written just before a mutating or process-executing
+    /// call runs. On resume, a started call with no recorded result is NOT
+    /// re-executed — its effects may already have happened — and the model
+    /// is asked to verify instead.
+    ToolStarted {
+        call_index: usize,
+    },
     ToolResult {
         call_index: usize,
         content: String,
@@ -901,6 +908,9 @@ async fn dispatch_tool_call_inner(
 struct PendingToolRound {
     calls: Vec<ToolCall>,
     results: BTreeMap<usize, String>,
+    /// Calls whose execution began (mutating/process calls only) — see
+    /// [`AgentLoopEvent::ToolStarted`].
+    started: std::collections::BTreeSet<usize>,
 }
 
 struct ReplayedAgentLoop {
@@ -1025,9 +1035,21 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                 pending = Some(PendingToolRound {
                     calls: tool_calls.clone(),
                     results: BTreeMap::new(),
+                    started: std::collections::BTreeSet::new(),
                 });
                 turns = turns.saturating_add(1);
                 usage = *reported_usage;
+            }
+            AgentLoopEvent::ToolStarted { call_index } => {
+                let round = pending
+                    .as_mut()
+                    .context("agent event log has a tool intent outside a tool round")?;
+                if *call_index >= round.calls.len() {
+                    bail!("agent event log has out-of-range tool intent {call_index}");
+                }
+                // Repeated interruptions may record the same intent again;
+                // the set makes that harmless.
+                round.started.insert(*call_index);
             }
             AgentLoopEvent::ToolResult {
                 call_index,
@@ -1338,6 +1360,47 @@ pub async fn run_agent_loop(
                                 continue;
                             }
                         }
+                    }
+                    let mutating = bindings
+                        .get(call.function.name.as_str())
+                        .is_some_and(|tool| tool.effects.mutating_or_process());
+                    if mutating {
+                        // An intent with no result means a previous, interrupted
+                        // invocation began this call: its effects may already
+                        // be on disk. Re-executing a non-idempotent operation
+                        // blind is worse than asking the model to verify.
+                        if round.started.contains(&call_index) {
+                            tracing::warn!(
+                                owner_kind = options.owner_kind,
+                                owner = options.owner,
+                                tool = %call.function.name,
+                                "interrupted mutating call not re-executed on resume"
+                            );
+                            observe_loop(
+                                options.on_observation,
+                                AgentLoopObservation::Notice(format!(
+                                    "`{}` was interrupted mid-execution by the previous run —                                      asking the model to verify instead of re-running it",
+                                    call.function.name
+                                )),
+                            );
+                            record_loop_event(
+                                &mut events,
+                                options.on_event,
+                                AgentLoopEvent::ToolResult {
+                                    call_index,
+                                    content: format!(
+                                        "INTERRUPTED: a previous run started this `{}` call but was                                          interrupted before recording its result — it may or may not                                          have taken effect. Verify the current state (re-read the                                          file, check the command's observable effects) before                                          deciding whether to repeat it.",
+                                        call.function.name
+                                    ),
+                                },
+                            );
+                            continue;
+                        }
+                        record_loop_event(
+                            &mut events,
+                            options.on_event,
+                            AgentLoopEvent::ToolStarted { call_index },
+                        );
                     }
                     let output = execute_agent_loop_tool(
                         &call, &bindings, config, mcp, http, usage, approvals, &options,
@@ -2098,6 +2161,144 @@ mod tests {
         assert_eq!(tools[0].0, "first");
         assert!(tools[0].1.contains("unknown tool"));
         assert_eq!(tools[1], ("second", "saved second result"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_mutating_calls_are_not_reexecuted_on_resume() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let adapter = Arc::new(ResumeAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        let shell_tool = StageTool {
+            definition: tools::shell_definition(5, &[]),
+            binding: ToolBinding::Shell { allow: Vec::new() },
+            effects: ToolEffects::one(ToolEffect::ProcessExecute),
+        };
+        let shell_call = |id: &str, command: &str| ToolCall {
+            id: id.to_string(),
+            function: crate::model::FunctionCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({ "command": command }),
+            },
+        };
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![
+                    shell_call("c1", "echo one"),
+                    shell_call("c2", "echo two"),
+                ],
+                usage: None,
+            },
+            // The previous run began c1 (intent recorded) and died before
+            // its result reached disk; c2 was never started.
+            AgentLoopEvent::ToolStarted { call_index: 0 },
+        ];
+        let recorded: std::sync::Mutex<Vec<AgentLoopEvent>> = std::sync::Mutex::new(Vec::new());
+        let sink = |event: AgentLoopEvent| recorded.lock().unwrap().push(event);
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            std::slice::from_ref(&shell_tool),
+            Vec::new(),
+            &events,
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 2,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: Some(&sink),
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+
+        let requests = adapter.requests.lock().unwrap();
+        let tools: Vec<(&str, &str)> = requests[0]
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                } => Some((tool_call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect();
+        // The started-but-unfinished call gets a verify-first synthetic
+        // result instead of running `echo one` again…
+        assert_eq!(tools[0].0, "c1");
+        assert!(tools[0].1.contains("INTERRUPTED"), "{}", tools[0].1);
+        assert!(!tools[0].1.contains("stdout"), "{}", tools[0].1);
+        // …while the never-started call executes normally, with a fresh
+        // intent recorded before it ran.
+        assert_eq!(tools[1].0, "c2");
+        assert!(tools[1].1.contains("two"), "{}", tools[1].1);
+        let recorded = recorded.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::ToolStarted { call_index: 1 })),
+            "the fresh mutating call must record an intent before executing"
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::ToolStarted { call_index: 0 })),
+            "the interrupted call must not record a second intent"
+        );
     }
 
     #[test]

@@ -148,6 +148,8 @@ model = "planner"
 mode = "read_only"
 mcp = ["filesystem"]
 web_search = true
+# The built-in URL-fetching tool pairs well with search results:
+# web_fetch = true
 system_prompt = """
 You are a research assistant. Investigate the task using the available tools.
 Produce a concise briefing: relevant facts, relevant files, and a suggested

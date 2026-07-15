@@ -112,15 +112,16 @@ pub fn definitions(read_write: bool) -> Vec<(ToolDefinition, FileOp, bool)> {
             ToolDefinition {
                 name: FileOp::Glob.tool_name().to_string(),
                 description: format!(
-                    "Find files whose working-directory-relative path matches a `*` \
-                     wildcard pattern (`*` also crosses `/`, so `*.rs` finds nested \
-                     files). Skips {}.",
+                    "Find files by glob pattern: `*` and `?` match within a path \
+                     segment, `**` spans directories, and a pattern without `/` \
+                     matches file names at any depth (`*.rs` finds nested files). \
+                     Dotfiles are included; {} are skipped.",
                     IGNORED_DIRS.join(", ")
                 ),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Pattern like src/*.rs or *config*" }
+                        "pattern": { "type": "string", "description": "Pattern like src/**/*.rs, *.toml, or ?ain.rs" }
                     },
                     "required": ["pattern"]
                 }),
@@ -132,17 +133,21 @@ pub fn definitions(read_write: bool) -> Vec<(ToolDefinition, FileOp, bool)> {
             ToolDefinition {
                 name: FileOp::Grep.tool_name().to_string(),
                 description: format!(
-                    "Search file contents with a regular expression (prefix `(?i)` for \
-                     case-insensitive). Returns `path:line: text` matches. Skips \
-                     binary files and {}.",
+                    "Search file contents with a regular expression. Returns \
+                     `path:line: text` matches (context lines as `path-line- text`). \
+                     Dotfiles are included; binary files and {} are skipped.",
                     IGNORED_DIRS.join(", ")
                 ),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regular expression to search for" },
+                        "pattern": { "type": "string", "description": "Regular expression to search for (literal string with fixed=true)" },
                         "path": path_property("File or directory to search (default: the working directory)"),
-                        "glob": { "type": "string", "description": "Only search files whose relative path matches this `*` pattern" }
+                        "glob": { "type": "string", "description": "Only search files whose relative path matches this glob pattern" },
+                        "fixed": { "type": "boolean", "description": "Match the pattern as a literal string, not a regex (default false)" },
+                        "ignore_case": { "type": "boolean", "description": "Case-insensitive matching (default false)" },
+                        "context": { "type": "integer", "description": "Lines of context around each match, up to 10 (default 0)" },
+                        "output": { "type": "string", "enum": ["content", "files", "count"], "description": "content = matching lines (default), files = only file paths, count = per-file match counts" }
                     },
                     "required": ["pattern"]
                 }),
@@ -266,7 +271,27 @@ pub fn dispatch(op: FileOp, arguments: &Value) -> String {
         }
         FileOp::Grep => {
             let Some(pattern) = str_arg("pattern") else { return missing("pattern") };
-            grep(&cwd, pattern, str_arg("path").unwrap_or(""), str_arg("glob"))
+            let output = match str_arg("output").unwrap_or("content") {
+                "content" => GrepOutput::Content,
+                "files" => GrepOutput::Files,
+                "count" => GrepOutput::Count,
+                other => {
+                    return format!(
+                        "ERROR: unknown `output` mode `{other}` — use content, files, or count"
+                    );
+                }
+            };
+            let options = GrepOptions {
+                filter: str_arg("glob"),
+                fixed: arguments.get("fixed").and_then(Value::as_bool).unwrap_or(false),
+                ignore_case: arguments
+                    .get("ignore_case")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                context: arguments.get("context").and_then(Value::as_u64).unwrap_or(0) as usize,
+                output,
+            };
+            grep(&cwd, pattern, str_arg("path").unwrap_or(""), &options)
         }
     }
 }
@@ -616,14 +641,64 @@ fn list_dir(cwd: &Path, path: &str) -> String {
     names.join("\n")
 }
 
+/// Dotfiles are searchable (`.github/`, `.env`, CI configs); only the
+/// bookkeeping and dependency directories in `IGNORED_DIRS` are not.
 fn searchable_path(relative: &Path) -> bool {
     relative.components().all(|component| match component {
         Component::Normal(name) => {
             let name = name.to_string_lossy();
-            !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_ref())
+            !IGNORED_DIRS.contains(&name.as_ref())
         }
         _ => true,
     })
+}
+
+/// Gitignore-style path matching for `glob` and grep's `glob` filter:
+/// `*` and `?` match within one path segment, `**` spans segments, and a
+/// pattern without `/` matches the file name at any depth (so `*.rs`
+/// finds nested files, like a `.gitignore` line would).
+fn glob_match(pattern: &str, relative: &str) -> bool {
+    let pattern = pattern.trim_matches('/');
+    if !pattern.contains('/') && pattern != "**" {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        return segment_match(pattern, name);
+    }
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let path_segments: Vec<&str> = relative.split('/').collect();
+    match_segments(&pattern_segments, &path_segments)
+}
+
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.first() {
+        None => path.is_empty(),
+        // `**` covers zero or more whole segments.
+        Some(&"**") => {
+            (0..=path.len()).any(|skip| match_segments(&pattern[1..], &path[skip..]))
+        }
+        Some(segment) => {
+            !path.is_empty()
+                && segment_match(segment, path[0])
+                && match_segments(&pattern[1..], &path[1..])
+        }
+    }
+}
+
+/// `*`/`?` wildcard match within one path segment (neither crosses `/`,
+/// which segment splitting already guarantees here).
+fn segment_match(pattern: &str, text: &str) -> bool {
+    fn recurse(pattern: &[char], text: &[char]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some('*') => {
+                recurse(&pattern[1..], text) || (!text.is_empty() && recurse(pattern, &text[1..]))
+            }
+            Some('?') => !text.is_empty() && recurse(&pattern[1..], &text[1..]),
+            Some(ch) => text.first() == Some(ch) && recurse(&pattern[1..], &text[1..]),
+        }
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    recurse(&pattern, &text)
 }
 
 /// Use Git's index and ignore engine when the workspace is a repository.
@@ -713,11 +788,10 @@ fn walk_files(cwd: &Path, root: &Path, visit: &mut dyn FnMut(&str, &Path) -> boo
                 continue;
             }
             if file_type.is_dir() {
-                if !name.starts_with('.') && !IGNORED_DIRS.contains(&name.as_str()) {
+                if !IGNORED_DIRS.contains(&name.as_str()) {
                     pending.push_back(path);
                 }
-            } else if !name.starts_with('.')
-                && let Ok(relative) = path.strip_prefix(cwd)
+            } else if let Ok(relative) = path.strip_prefix(cwd)
                 && !visit(&relative.to_string_lossy(), &path)
             {
                 return true;
@@ -737,7 +811,7 @@ fn glob(cwd: &Path, pattern: &str) -> String {
     };
     let mut matches: Vec<String> = Vec::new();
     let truncated_walk = walk_files(&workspace, &workspace, &mut |relative, _| {
-        if crate::tools::wildcard_match(pattern, relative) {
+        if glob_match(pattern, relative) {
             matches.push(relative.to_string());
         }
         matches.len() < MAX_GLOB_RESULTS
@@ -753,11 +827,42 @@ fn glob(cwd: &Path, pattern: &str) -> String {
     out
 }
 
-fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
-    let regex = match regex::Regex::new(pattern) {
+#[derive(Clone, Copy, PartialEq)]
+enum GrepOutput {
+    /// Matching lines (`path:line: text`, context lines as `path-line- text`).
+    Content,
+    /// Only the paths of files with at least one match.
+    Files,
+    /// Per-file match counts.
+    Count,
+}
+
+/// Search options beyond the pattern and root path.
+struct GrepOptions<'a> {
+    /// Restrict the files searched (same semantics as the `glob` tool).
+    filter: Option<&'a str>,
+    /// Treat the pattern as a literal string, not a regex.
+    fixed: bool,
+    ignore_case: bool,
+    /// Lines of context around each match (`Content` output only).
+    context: usize,
+    output: GrepOutput,
+}
+
+fn grep(cwd: &Path, pattern: &str, path: &str, options: &GrepOptions) -> String {
+    let mut source = if options.fixed {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    if options.ignore_case {
+        source = format!("(?i){source}");
+    }
+    let regex = match regex::Regex::new(&source) {
         Ok(regex) => regex,
         Err(e) => return format!("ERROR: invalid regular expression: {e}"),
     };
+    let context = options.context.min(10);
     let target = if path.trim().is_empty() { "." } else { path };
     let root = match resolve(cwd, target) {
         Ok(p) => p,
@@ -770,12 +875,13 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
 
     let mut lines: Vec<String> = Vec::new();
     let mut files_matched = 0usize;
+    let mut total_matches = 0usize;
     let mut search = |relative: &str, path: &Path| -> bool {
-        if lines.len() >= MAX_GREP_MATCHES {
+        if total_matches >= MAX_GREP_MATCHES {
             return false;
         }
-        if let Some(filter) = filter
-            && !crate::tools::wildcard_match(filter, relative)
+        if let Some(filter) = options.filter
+            && !glob_match(filter, relative)
         {
             return true;
         }
@@ -789,21 +895,52 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
             return true; // binary
         }
         let content = String::from_utf8_lossy(&bytes);
-        let mut matched = false;
-        for (index, line) in content.lines().enumerate() {
-            if lines.len() >= MAX_GREP_MATCHES {
-                break;
-            }
-            if regex.is_match(line) {
-                matched = true;
-                let text: String = line.trim_end().chars().take(300).collect();
-                lines.push(format!("{relative}:{}: {text}", index + 1));
+        let file_lines: Vec<&str> = content.lines().collect();
+        let matched: Vec<usize> = file_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| regex.is_match(line))
+            .map(|(index, _)| index)
+            .take(MAX_GREP_MATCHES - total_matches)
+            .collect();
+        if matched.is_empty() {
+            return true;
+        }
+        files_matched += 1;
+        total_matches += matched.len();
+        let excerpt = |index: usize| -> String {
+            file_lines[index].trim_end().chars().take(300).collect()
+        };
+        match options.output {
+            GrepOutput::Files => lines.push(relative.to_string()),
+            GrepOutput::Count => lines.push(format!("{relative}: {}", matched.len())),
+            GrepOutput::Content => {
+                // Windows around nearby matches are merged; a gap between
+                // windows in the same file shows as `--` (grep style).
+                let is_match: std::collections::BTreeSet<usize> = matched.iter().copied().collect();
+                let mut emitted_end = 0usize; // one past the last printed line
+                for &index in &matched {
+                    let start = index.saturating_sub(context).max(emitted_end);
+                    let end = (index + context + 1).min(file_lines.len());
+                    if start >= end {
+                        continue; // already printed as an earlier match's context
+                    }
+                    if context > 0 && emitted_end > 0 && start > emitted_end {
+                        lines.push("--".to_string());
+                    }
+                    for line_index in start..end {
+                        let separator = if is_match.contains(&line_index) { ':' } else { '-' };
+                        lines.push(format!(
+                            "{relative}{separator}{}{separator} {}",
+                            line_index + 1,
+                            excerpt(line_index)
+                        ));
+                    }
+                    emitted_end = end;
+                }
             }
         }
-        if matched {
-            files_matched += 1;
-        }
-        lines.len() < MAX_GREP_MATCHES
+        total_matches < MAX_GREP_MATCHES
     };
 
     let truncated_walk = if root.is_file() {
@@ -822,12 +959,11 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
         return format!("no matches for `{pattern}`");
     }
     let mut out = lines.join("\n");
-    if lines.len() >= MAX_GREP_MATCHES || truncated_walk {
+    if total_matches >= MAX_GREP_MATCHES || truncated_walk {
         out.push_str("\n… [matches truncated — narrow the pattern or path]");
     } else {
         out.push_str(&format!(
-            "\n({} match(es) in {files_matched} file(s))",
-            lines.len()
+            "\n({total_matches} match(es) in {files_matched} file(s))"
         ));
     }
     out
@@ -836,6 +972,92 @@ fn grep(cwd: &Path, pattern: &str, path: &str, filter: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain_grep() -> GrepOptions<'static> {
+        GrepOptions {
+            filter: None,
+            fixed: false,
+            ignore_case: false,
+            context: 0,
+            output: GrepOutput::Content,
+        }
+    }
+
+    #[test]
+    fn glob_patterns_use_gitignore_semantics() {
+        // Slash-free patterns match the file name at any depth.
+        assert!(glob_match("*.rs", "src/deep/main.rs"));
+        assert!(glob_match("?ain.rs", "src/main.rs"));
+        assert!(glob_match("*config*", ".github/my-config.yml"));
+        assert!(!glob_match("*.rs", "src/main.rs.bak"));
+
+        // With a `/`, `*` and `?` stay within their segment…
+        assert!(glob_match("src/*.rs", "src/main.rs"));
+        assert!(!glob_match("src/*.rs", "src/deep/main.rs"));
+        // …and `**` spans zero or more segments.
+        assert!(glob_match("src/**/*.rs", "src/main.rs"));
+        assert!(glob_match("src/**/*.rs", "src/a/b/main.rs"));
+        assert!(glob_match("**/tests/*.rs", "crates/x/tests/it.rs"));
+        assert!(!glob_match("src/**/*.rs", "other/main.rs"));
+        assert!(glob_match("**", "any/path/at/all.txt"));
+    }
+
+    #[test]
+    fn search_includes_dotfiles_but_not_ignored_dirs() {
+        let cwd = project("dotfiles");
+        std::fs::create_dir_all(cwd.join(".github/workflows")).unwrap();
+        std::fs::write(cwd.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        std::fs::write(cwd.join(".env"), "SECRET=needle\n").unwrap();
+
+        let found = glob(&cwd, "*.yml");
+        assert_eq!(found, ".github/workflows/ci.yml");
+        let hits = grep(&cwd, "needle", "", &plain_grep());
+        assert!(hits.contains(".env:1"), "{hits}");
+        // `.git` internals stay invisible even though dotfiles are searchable.
+        let config_hits = grep(&cwd, "repositoryformatversion", "", &plain_grep());
+        assert!(config_hits.starts_with("no matches"), "{config_hits}");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn grep_modes_fixed_case_context_and_output() {
+        let cwd = project("grepmodes");
+        std::fs::write(
+            cwd.join("notes.txt"),
+            "alpha\nfn call() beta\ngamma\ndelta\nepsilon\nzeta\neta\nfn call() again\n",
+        )
+        .unwrap();
+
+        // `fixed` treats regex metacharacters literally.
+        let fixed = GrepOptions { fixed: true, ..plain_grep() };
+        let hits = grep(&cwd, "fn call()", "notes.txt", &fixed);
+        assert!(hits.contains("notes.txt:2:"), "{hits}");
+        assert!(hits.contains("notes.txt:8:"), "{hits}");
+        // Unescaped, the same pattern is a regex where `()` matches empty.
+        assert!(
+            grep(&cwd, "fn call()", "notes.txt", &plain_grep()).contains("2 match(es)")
+        );
+
+        let ci = GrepOptions { ignore_case: true, ..plain_grep() };
+        assert!(grep(&cwd, "ALPHA", "notes.txt", &ci).contains("notes.txt:1:"));
+
+        // Context lines carry the `-` separator; nearby windows merge and
+        // distant ones are divided by `--`.
+        let ctx = GrepOptions { context: 1, ..plain_grep() };
+        let hits = grep(&cwd, "gamma", "notes.txt", &ctx);
+        assert!(hits.contains("notes.txt-2- fn call() beta"), "{hits}");
+        assert!(hits.contains("notes.txt:3: gamma"), "{hits}");
+        assert!(hits.contains("notes.txt-4- delta"), "{hits}");
+        let both = grep(&cwd, "fn call", "notes.txt", &ctx);
+        assert!(both.contains("\n--\n"), "{both}");
+
+        // Output modes.
+        let files = GrepOptions { output: GrepOutput::Files, ..plain_grep() };
+        assert!(grep(&cwd, "fn call", "", &files).starts_with("notes.txt\n"));
+        let count = GrepOptions { output: GrepOutput::Count, ..plain_grep() };
+        assert!(grep(&cwd, "fn call", "", &count).starts_with("notes.txt: 2"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
 
     fn project(tag: &str) -> PathBuf {
         let root =
@@ -885,7 +1107,7 @@ mod tests {
         let files = glob(&cwd, "*");
         assert!(files.contains("visible.txt"), "{files}");
         assert!(!files.contains("ignored.log"), "{files}");
-        let matches = grep(&cwd, "needle", "", None);
+        let matches = grep(&cwd, "needle", "", &plain_grep());
         assert!(matches.contains("visible.txt:1"), "{matches}");
         assert!(!matches.contains("ignored.log"), "{matches}");
         let _ = std::fs::remove_dir_all(cwd);
@@ -930,7 +1152,7 @@ mod tests {
         assert!(!outside.join("new.txt").exists());
 
         symlink(outside.join("secret.txt"), cwd.join("outside-file-link")).unwrap();
-        let grep_result = grep(&cwd, "secret", "", None);
+        let grep_result = grep(&cwd, "secret", "", &plain_grep());
         assert!(!grep_result.contains("outside-file-link"), "{grep_result}");
         assert_eq!(
             glob(&cwd, "*outside-file-link*"),
@@ -1075,17 +1297,20 @@ mod tests {
         assert!(listing.contains("src/"), "{listing}");
         assert!(listing.contains("README.md"));
 
-        // `*` crosses `/`; ignored dirs are skipped.
+        // A slash-free pattern matches file names at any depth; `.git`
+        // and friends are skipped.
         assert_eq!(glob(&cwd, "*.rs"), "src/lib.rs\nsrc/main.rs");
+        assert_eq!(glob(&cwd, "src/**/*.rs"), "src/lib.rs\nsrc/main.rs");
         assert_eq!(glob(&cwd, "*config*"), "no files match `*config*`");
 
-        let hits = grep(&cwd, r"println!", "", None);
+        let hits = grep(&cwd, r"println!", "", &plain_grep());
         assert!(hits.starts_with("src/main.rs:2:"), "{hits}");
         assert!(hits.contains("1 match(es) in 1 file(s)"), "{hits}");
         // Case-insensitive via inline flag; glob filter narrows files.
-        assert!(grep(&cwd, "(?i)READ", "", Some("*.md")).contains("README.md:1"));
-        assert!(grep(&cwd, "println", "", Some("*.md")).starts_with("no matches"));
-        assert!(grep(&cwd, "[invalid", "", None).starts_with("ERROR: invalid regular"));
+        let md_filter = GrepOptions { filter: Some("*.md"), ..plain_grep() };
+        assert!(grep(&cwd, "(?i)READ", "", &md_filter).contains("README.md:1"));
+        assert!(grep(&cwd, "println", "", &md_filter).starts_with("no matches"));
+        assert!(grep(&cwd, "[invalid", "", &plain_grep()).starts_with("ERROR: invalid regular"));
         let _ = std::fs::remove_dir_all(&cwd);
     }
 }

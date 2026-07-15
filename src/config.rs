@@ -396,6 +396,9 @@ pub struct Agent {
     pub mcp: Vec<String>,
     #[serde(default)]
     pub web_search: bool,
+    /// Expose the built-in `web_fetch` tool (fetch a URL as readable text).
+    #[serde(default)]
+    pub web_fetch: bool,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
     pub max_turns: Option<u32>,
@@ -485,6 +488,9 @@ pub struct Stage {
     /// Expose the SearXNG `web_search` tool to this stage.
     #[serde(default)]
     pub web_search: bool,
+    /// Expose the built-in `web_fetch` tool (fetch a URL as readable text).
+    #[serde(default)]
+    pub web_fetch: bool,
     /// Inline system prompt. Mutually exclusive with `system_prompt_file`.
     pub system_prompt: Option<String>,
     /// Path to a file containing the system prompt, relative to the config file.

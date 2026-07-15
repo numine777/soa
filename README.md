@@ -21,7 +21,8 @@ soa run "task"
 
 Each stage runs a tool-call loop: the rendered prompt goes to the stage's
 model; while the model returns tool calls, soa executes them (against MCP
-servers or the built-in SearXNG search) and feeds the results back; the
+servers or the built-in file, shell, SearXNG search, and URL-fetch tools)
+and feeds the results back; the
 model's first plain-text reply is the stage's output. That output becomes
 `{{previous}}` for the next stage and `{{stage.<name>}}` for all later ones.
 
@@ -419,6 +420,7 @@ mode = "read_only"           # or "read_write" (default: read_only)
 mcp = ["filesystem"]         # keys into [mcp]
 files = true                 # built-in file tools (see "File tools")
 web_search = true            # expose the SearXNG web_search tool
+web_fetch = true             # expose the built-in URL-fetching tool
 system_prompt = "..."        # or system_prompt_file = "prompts/research.md"
 prompt = "{{input}}"         # user-message template (see below)
 max_turns = 32               # override settings.default_max_turns
@@ -454,8 +456,18 @@ files = true
 ```
 
 `read_file` (with optional line windows), `list_dir`, `glob`, and `grep`
-(regex, `path:line:` output) are always included; `write_file`,
-`edit_lines`, and `edit_file` only in `read_write` mode.
+are always included; `write_file`, `edit_lines`, and `edit_file` only in
+`read_write` mode.
+
+`glob` uses gitignore-style patterns: `*` and `?` match within a path
+segment, `**` spans directories, and a pattern without `/` matches file
+names at any depth (`*.rs` finds nested files). `grep` searches with a
+regular expression (`fixed = true` for a literal string, `ignore_case`
+for case folding), returns `path:line: text` matches with optional
+`context` lines (`path-line- text`), and supports `output = "files"`
+(paths only) or `"count"` (per-file match counts) for cheap surveys.
+Dotfiles (`.github/`, `.env`, CI configs) are searchable; binary files
+and `.git`, `node_modules`, `target` are always skipped.
 
 **Hash-anchored edits.** In `read_write` mode, `read_file` prefixes every
 line with an anchor — `42:9f3a|` (line number + a short content hash) —
@@ -471,7 +483,7 @@ cross-line rewrites. Everything is rooted at the working directory (paths
 that escape it lexically or through symlinks are rejected). In Git
 repositories, `glob`/`grep` use the tracked and untracked file inventory plus
 standard ignore rules; elsewhere they use a deterministic early-stopping
-walk. Both paths skip symlinks, hidden entries, `.git`, `node_modules`, and
+walk. Both paths skip symlinks, `.git`, `node_modules`, and
 `target`, and cap results so one call can't flood the context. Writes
 participate in approvals
 (`require_approval`, patterns like `edit_file *`) and chat diff capture
@@ -559,9 +571,9 @@ Tools carry effect labels instead of only a read/write bit:
 `external_read`, and `external_mutation`. Filesystem writes, process
 execution, and external mutation retain the default approval behavior.
 `approval_effects` adds read-like effects to the gate; for example,
-`network_egress` makes SearXNG, HTTP MCP, and external subagent calls ask
-before sending data, while `external_read` can gate opaque read-only MCP
-calls. Native file tools are classified precisely; MCP effects are inferred
+`network_egress` makes SearXNG, `web_fetch`, HTTP MCP, and external
+subagent calls ask before sending data, while `external_read` can gate
+opaque read-only MCP calls. Native file tools are classified precisely; MCP effects are inferred
 from transport and the server's `readOnlyHint`/`readonly_tools`
 classification.
 

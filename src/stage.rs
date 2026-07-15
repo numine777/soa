@@ -67,6 +67,8 @@ pub enum ToolBinding {
         tool: String,
     },
     WebSearch,
+    /// Fetch a URL and return its readable text.
+    WebFetch,
     /// Delegate the call's `task` to a configured subagent.
     Agent {
         agent: String,
@@ -155,6 +157,7 @@ pub struct ToolProfile<'a> {
     pub mode: Mode,
     pub mcp: &'a [String],
     pub web_search: bool,
+    pub web_fetch: bool,
     pub subagents: &'a [String],
     pub shell: bool,
     pub shell_allow: &'a [String],
@@ -168,6 +171,7 @@ impl crate::config::Stage {
             mode: self.mode,
             mcp: &self.mcp,
             web_search: self.web_search,
+            web_fetch: self.web_fetch,
             subagents: &self.subagents,
             shell: self.shell,
             shell_allow: &self.shell_allow,
@@ -183,6 +187,7 @@ impl crate::config::Agent {
             mode: self.mode,
             mcp: &self.mcp,
             web_search: self.web_search,
+            web_fetch: self.web_fetch,
             subagents: &self.subagents,
             shell: self.shell,
             shell_allow: &self.shell_allow,
@@ -369,6 +374,14 @@ pub fn assemble_tools(
         stage_tools.push(StageTool {
             definition: tools::web_search_definition(),
             binding: ToolBinding::WebSearch,
+            effects: ToolEffects::one(ToolEffect::NetworkEgress),
+        });
+    }
+
+    if profile.web_fetch {
+        stage_tools.push(StageTool {
+            definition: tools::web_fetch_definition(),
+            binding: ToolBinding::WebFetch,
             effects: ToolEffects::one(ToolEffect::NetworkEgress),
         });
     }
@@ -585,6 +598,15 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
             always_pattern: tools::WEB_SEARCH_TOOL.to_string(),
             pattern_safe: true,
         },
+        ToolBinding::WebFetch => {
+            let url = args.get("url").and_then(Value::as_str).unwrap_or("?");
+            CallDescriptor {
+                descriptor: format!("{} {}", tools::WEB_FETCH_TOOL, truncate(url, 160)),
+                detail: truncate(url, 200),
+                always_pattern: format!("{} *", tools::WEB_FETCH_TOOL),
+                pattern_safe: true,
+            }
+        }
         ToolBinding::Shell { .. } => {
             let command = args
                 .get("command")
@@ -764,6 +786,20 @@ async fn dispatch_tool_call_inner(
             {
                 Ok(results) => Ok(results),
                 Err(e) => Ok(format!("ERROR: web search failed: {e:#}")),
+            }
+        }
+        ToolBinding::WebFetch => {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if url.is_empty() {
+                return Ok("ERROR: web_fetch requires a non-empty `url` string".to_string());
+            }
+            match tools::web_fetch(http, url).await {
+                Ok(content) => Ok(content),
+                Err(e) => Ok(format!("ERROR: web fetch failed: {e:#}")),
             }
         }
         ToolBinding::Mcp { server, tool } => {
@@ -2104,6 +2140,41 @@ mod tests {
         // At the depth cap (default max_agent_depth = 2) no agents are offered.
         let at_cap = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 2).unwrap();
         assert!(at_cap.is_empty());
+    }
+
+    #[test]
+    fn web_fetch_is_assembled_from_the_profile_flag() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            web_fetch = true
+            "#,
+        )
+        .unwrap();
+        let mcp = McpManager::default();
+        let tools = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].definition.name, "web_fetch");
+        // Egress is read-like: available to read-only stages, gateable via
+        // approval_effects = ["network_egress"].
+        assert!(!tools[0].effects.mutating_or_process());
+        assert!(tools[0].effects.intersects(&[ToolEffect::NetworkEgress]));
+
+        let descriptor = call_descriptor(
+            &ToolBinding::WebFetch,
+            r#"{"url":"https://example.com/doc"}"#,
+        );
+        assert_eq!(descriptor.descriptor, "web_fetch https://example.com/doc");
+        assert_eq!(descriptor.always_pattern, "web_fetch *");
     }
 
     #[test]

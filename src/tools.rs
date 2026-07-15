@@ -25,6 +25,201 @@ pub fn web_search_definition() -> ToolDefinition {
     }
 }
 
+pub const WEB_FETCH_TOOL: &str = "web_fetch";
+
+/// Bound on how much of a response body is read; the tool-output clamp
+/// truncates further before the text reaches the model.
+const MAX_FETCH_BYTES: usize = 4_000_000;
+
+pub fn web_fetch_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: WEB_FETCH_TOOL.to_string(),
+        description: "Fetch a URL (http/https) and return its content. HTML is \
+            converted to readable text; other text content is returned as-is."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL to fetch" }
+            },
+            "required": ["url"]
+        }),
+    }
+}
+
+pub async fn web_fetch(http: &reqwest::Client, url: &str) -> Result<String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        bail!("only http:// and https:// URLs can be fetched");
+    }
+    let response = http
+        .get(url)
+        .header(reqwest::header::ACCEPT, "text/html, text/*, */*")
+        .send()
+        .await
+        .with_context(|| format!("request to {url} failed"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let mut body = Vec::new();
+    let mut response = response;
+    let mut clipped = false;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading the response from {url} failed"))?
+    {
+        if body.len() + chunk.len() > MAX_FETCH_BYTES {
+            body.extend_from_slice(&chunk[..MAX_FETCH_BYTES - body.len()]);
+            clipped = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        bail!(
+            "{url} returned {status}: {}",
+            String::from_utf8_lossy(&body).chars().take(300).collect::<String>()
+        );
+    }
+    if body[..body.len().min(8192)].contains(&0) {
+        bail!("{url} returned binary content ({content_type})");
+    }
+
+    let text = String::from_utf8_lossy(&body);
+    let looks_like_html = content_type.contains("html")
+        || text.trim_start().to_ascii_lowercase().starts_with("<!doctype html")
+        || text.trim_start().to_ascii_lowercase().starts_with("<html");
+    let mut readable = if looks_like_html {
+        html_to_text(&text)
+    } else {
+        text.into_owned()
+    };
+    if clipped {
+        readable.push_str("\n… [response truncated at 4MB]");
+    }
+    Ok(format!("{url} ({content_type})\n\n{readable}"))
+}
+
+/// Elements removed together with their contents — they never carry prose.
+const NON_CONTENT_ELEMENTS: &[&str] = &["script", "style", "head", "noscript", "svg", "template"];
+
+/// Tags treated as line breaks when the remaining markup is stripped.
+const BLOCK_TAGS: &[&str] = &[
+    "p", "br", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "table",
+    "blockquote", "section", "article", "pre",
+];
+
+/// `name` ends at this byte (tag-name boundary), so `head` does not match
+/// `<header>`.
+fn tag_name_boundary(byte: Option<&u8>) -> bool {
+    matches!(byte, None | Some(b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/'))
+}
+
+/// A deliberately small HTML-to-text conversion: drop non-content elements,
+/// break on block boundaries, strip the remaining tags, and decode the
+/// common entities. Not a browser — good enough to make documentation and
+/// articles readable for a model.
+fn html_to_text(html: &str) -> String {
+    // ASCII lowercasing preserves byte offsets, so `lower` can be searched
+    // while slicing `html`.
+    let lower = html.to_ascii_lowercase();
+
+    // Pass 1: remove non-content elements including their bodies.
+    let mut stripped = String::with_capacity(html.len());
+    let mut pos = 0usize;
+    while let Some(offset) = lower[pos..].find('<') {
+        let start = pos + offset;
+        let cut_end = NON_CONTENT_ELEMENTS.iter().find_map(|element| {
+            let name_end = start + 1 + element.len();
+            if !lower[start + 1..].starts_with(element)
+                || !tag_name_boundary(lower.as_bytes().get(name_end))
+            {
+                return None;
+            }
+            let close = format!("</{element}");
+            let mut search = name_end;
+            while let Some(close_offset) = lower[search..].find(&close) {
+                let at = search + close_offset;
+                if tag_name_boundary(lower.as_bytes().get(at + close.len())) {
+                    let after = at + close.len();
+                    return Some(
+                        lower[after..].find('>').map(|i| after + i + 1).unwrap_or(html.len()),
+                    );
+                }
+                search = at + close.len();
+            }
+            Some(html.len()) // unclosed non-content element: drop the rest
+        });
+        match cut_end {
+            Some(end) => {
+                stripped.push_str(&html[pos..start]);
+                pos = end;
+            }
+            None => {
+                stripped.push_str(&html[pos..=start]); // `<` is one byte
+                pos = start + 1;
+            }
+        }
+    }
+    stripped.push_str(&html[pos..]);
+
+    // Pass 2: newline at block boundaries, drop all remaining tags.
+    let mut text = String::with_capacity(stripped.len());
+    let mut pos = 0usize;
+    while let Some(offset) = stripped[pos..].find('<') {
+        let start = pos + offset;
+        text.push_str(&stripped[pos..start]);
+        let end = stripped[start..]
+            .find('>')
+            .map(|i| start + i + 1)
+            .unwrap_or(stripped.len());
+        let name: String = stripped[start + 1..end]
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if BLOCK_TAGS.contains(&name.as_str()) {
+            text.push('\n');
+        }
+        pos = end;
+    }
+    text.push_str(&stripped[pos..]);
+
+    // Decode the entities that dominate real pages.
+    let decoded = text
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&");
+
+    // Collapse runs of blank lines and surrounding space.
+    let mut out = String::with_capacity(decoded.len());
+    let mut blank_run = 0usize;
+    for line in decoded.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
 pub const SHELL_TOOL: &str = "shell";
 
 pub fn shell_definition(timeout_secs: u64, allow: &[String]) -> ToolDefinition {
@@ -280,6 +475,63 @@ mod tests {
         assert!(command_allowed(&allow, r"cargo test escaped\;semicolon"));
         assert!(command_allowed(&allow, "cargo test '$(literal)'"));
         assert!(!command_allowed(&allow, r#"cargo test "$(dangerous-command)""#));
+    }
+
+    #[test]
+    fn html_to_text_strips_markup_and_keeps_prose() {
+        let html = r#"<!doctype html><html><head><title>T</title><style>body{}</style></head>
+<body><script>var x = "<p>not text</p>";</script>
+<h1>Heading</h1><p>First &amp; second</p>
+<header>Site nav</header>
+<ul><li>one</li><li>two</li></ul>
+<div>tail&nbsp;text</div></body></html>"#;
+        let text = html_to_text(html);
+        assert!(!text.contains("var x"), "{text}");
+        assert!(!text.contains("body{}"), "{text}");
+        assert!(!text.contains('<'), "{text}");
+        assert!(text.contains("Heading"), "{text}");
+        assert!(text.contains("First & second"), "{text}");
+        // `<header>` must not be swallowed by the `head` element rule.
+        assert!(text.contains("Site nav"), "{text}");
+        assert!(text.contains("one\ntwo") || text.contains("one\n\ntwo"), "{text}");
+        assert!(text.contains("tail text"), "{text}");
+
+        // An unclosed non-content element drops the rest instead of leaking
+        // code into the text.
+        assert_eq!(html_to_text("before<script>var y = 1;"), "before");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_non_http_schemes() {
+        let http = reqwest::Client::new();
+        let err = web_fetch(&http, "file:///etc/passwd").await.unwrap_err();
+        assert!(err.to_string().contains("http"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_converts_html_from_a_live_server() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = "<html><head><style>x{}</style></head>\
+                        <body><h1>Docs</h1><p>hello &amp; bye</p></body></html>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len(),
+            );
+        });
+        let http = reqwest::Client::new();
+        let out = web_fetch(&http, &format!("http://{addr}/")).await.unwrap();
+        assert!(out.contains("(text/html)"), "{out}");
+        assert!(out.contains("Docs"), "{out}");
+        assert!(out.contains("hello & bye"), "{out}");
+        assert!(!out.contains("x{}"), "{out}");
     }
 
     #[tokio::test]

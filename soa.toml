@@ -259,6 +259,12 @@ of what was accomplished.
 # with `soa run -w quickfix "task"`. `soa stages` lists them.
 # ---------------------------------------------------------------------------
 
+# Stages and agents also accept:
+#   tool_choice = "any"            # or a tool name; forces the FIRST model
+#                                  # turn to call it, later turns are free
+#   output_schema_file = "x.json"  # constrain the final answer to a JSON
+#                                  # Schema (or inline: [stage.output_schema])
+
 [workflows.default]
 description = "research, implement, review"
 stages = ["research", "implement", "review"]

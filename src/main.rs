@@ -139,10 +139,12 @@ async fn main() -> Result<()> {
                     system,
                     &stage.skills,
                 )?;
+                stage.resolve_output_schema(&config.base_dir)?;
             }
             for (name, agent) in &config.agents {
                 let system = agent.resolve_system_prompt(&config.base_dir)?;
                 skills::compose_system(&config, &format!("agent `{name}`"), system, &agent.skills)?;
+                agent.resolve_output_schema(&config.base_dir)?;
             }
             println!(
                 "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s), {} hook(s)",

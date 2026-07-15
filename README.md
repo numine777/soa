@@ -489,7 +489,27 @@ prompt = "{{input}}"         # user-message template (see below)
 max_turns = 32               # override settings.default_max_turns
 temperature = 0.5            # override the model's default
 max_tokens = 4096
+tool_choice = "any"          # force the FIRST model turn to call a tool
+                             # ("any", a tool name, or "auto" — the default)
+output_schema_file = "schemas/plan.json"  # constrain the final answer to a
+                             # JSON Schema (or inline as [stage.output_schema])
 ```
+
+**Forced tool use.** `tool_choice` applies to the opening model request of
+each run only — the model must call some tool (`"any"`) or the named tool
+first; later turns are unconstrained so it can still produce a final
+answer. Works on stages and agents, over both adapters (OpenAI `required`
+/function form, Anthropic `any`/`tool`).
+
+**Structured output.** `output_schema` (inline TOML table) or
+`output_schema_file` (a JSON file relative to the config) constrains the
+stage's or agent's response text to a JSON Schema, sent with every request
+(OpenAI `response_format` with `strict`, Anthropic `output_config.format`).
+The schema'd final answer flows into `{{previous}}`/`{{stage.<name>}}` as
+machine-parseable JSON — useful when a later stage or an outside consumer
+parses the pipeline's output. `soa check` validates that schema files
+exist and parse.
+
 
 **Prompt templates.** `{{input}}` is the original task, `{{previous}}` is
 the previous stage's output, and `{{stage.<name>}}` is the output of any

@@ -255,6 +255,10 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ToolWire<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,6 +278,23 @@ impl<'a> ChatRequest<'a> {
             top_p: request.sampling.top_p,
             max_tokens: request.sampling.max_tokens,
             tools: request.tools.iter().map(ToolWire::from_canonical).collect(),
+            tool_choice: request.constraints.tool_choice.map(|choice| match choice {
+                crate::model::ToolChoice::Any => Value::String("required".to_string()),
+                crate::model::ToolChoice::Tool(name) => serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name },
+                }),
+            }),
+            response_format: request.constraints.output_schema.map(|schema| {
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": schema,
+                        "strict": true,
+                    },
+                })
+            }),
             stream: request.stream,
             stream_options: request.stream.then_some(StreamOptions {
                 include_usage: true,
@@ -629,7 +650,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::model::SamplingParams;
+    use crate::model::{RequestConstraints, SamplingParams};
 
     fn chunk(json: &str) -> StreamChunk {
         serde_json::from_str(json).unwrap()
@@ -666,6 +687,7 @@ mod tests {
                 temperature: Some(0.2),
                 ..Default::default()
             },
+            constraints: RequestConstraints::default(),
             stream: true,
         });
         let wire = serde_json::to_value(request).unwrap();
@@ -685,12 +707,57 @@ mod tests {
             messages: &messages[..1],
             tools: &[],
             sampling: SamplingParams::default(),
+            constraints: RequestConstraints::default(),
             stream: false,
         });
         let empty_wire = serde_json::to_value(empty).unwrap();
         assert!(empty_wire.get("tools").is_none());
         assert!(empty_wire.get("stream").is_none());
         assert!(empty_wire.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn constraints_map_to_tool_choice_and_response_format() {
+        let messages = vec![Message::User {
+            content: "go".into(),
+        }];
+        let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+        let choice = crate::model::ToolChoice::Tool("grep".into());
+        let request = ChatRequest::from_canonical(ModelRequest {
+            model: "m",
+            messages: &messages,
+            tools: &[],
+            sampling: SamplingParams::default(),
+            constraints: RequestConstraints {
+                tool_choice: Some(&choice),
+                output_schema: Some(&schema),
+            },
+            stream: false,
+        });
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["tool_choice"]["function"]["name"], "grep");
+        assert_eq!(wire["response_format"]["type"], "json_schema");
+        assert_eq!(wire["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            wire["response_format"]["json_schema"]["schema"]["properties"]["answer"]["type"],
+            "string"
+        );
+
+        let any = crate::model::ToolChoice::Any;
+        let request = ChatRequest::from_canonical(ModelRequest {
+            model: "m",
+            messages: &messages,
+            tools: &[],
+            sampling: SamplingParams::default(),
+            constraints: RequestConstraints {
+                tool_choice: Some(&any),
+                output_schema: None,
+            },
+            stream: false,
+        });
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["tool_choice"], "required");
+        assert!(wire.get("response_format").is_none());
     }
 
     #[test]

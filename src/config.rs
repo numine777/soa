@@ -410,6 +410,11 @@ pub struct Agent {
     /// Expose the built-in `web_fetch` tool (fetch a URL as readable text).
     #[serde(default)]
     pub web_fetch: bool,
+    /// See the stage field of the same name.
+    pub tool_choice: Option<String>,
+    /// See the stage fields of the same names.
+    pub output_schema: Option<toml::Value>,
+    pub output_schema_file: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<PathBuf>,
     pub max_turns: Option<u32>,
@@ -447,6 +452,19 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn parsed_tool_choice(&self) -> Option<crate::model::ToolChoice> {
+        parse_tool_choice(self.tool_choice.as_deref())
+    }
+
+    pub fn resolve_output_schema(&self, base_dir: &Path) -> Result<Option<serde_json::Value>> {
+        resolve_schema_source(
+            self.output_schema.as_ref(),
+            self.output_schema_file.as_ref(),
+            base_dir,
+            "agent",
+        )
+    }
+
     pub fn resolve_system_prompt(&self, base_dir: &Path) -> Result<Option<String>> {
         resolve_prompt_source(&self.system_prompt, &self.system_prompt_file, base_dir)
     }
@@ -454,6 +472,44 @@ impl Agent {
 
 /// Resolve an inline-or-file prompt pair (mutual exclusivity is enforced
 /// during validation).
+/// Parse a configured `tool_choice` string into the canonical constraint.
+pub fn parse_tool_choice(raw: Option<&str>) -> Option<crate::model::ToolChoice> {
+    match raw {
+        None | Some("auto") => None,
+        Some("any") => Some(crate::model::ToolChoice::Any),
+        Some(name) => Some(crate::model::ToolChoice::Tool(name.to_string())),
+    }
+}
+
+/// Resolve an inline-or-file JSON Schema. Validation already enforced
+/// mutual exclusivity and non-emptiness.
+fn resolve_schema_source(
+    inline: Option<&toml::Value>,
+    file: Option<&PathBuf>,
+    base_dir: &Path,
+    owner: &str,
+) -> Result<Option<serde_json::Value>> {
+    match (inline, file) {
+        (Some(value), None) => Ok(Some(serde_json::to_value(value).with_context(|| {
+            format!("{owner}: output_schema is not representable as JSON")
+        })?)),
+        (None, Some(path)) => {
+            let full = if path.is_absolute() {
+                path.clone()
+            } else {
+                base_dir.join(path)
+            };
+            let text = std::fs::read_to_string(&full)
+                .with_context(|| format!("{owner}: cannot read {}", full.display()))?;
+            let schema: serde_json::Value = serde_json::from_str(&text)
+                .with_context(|| format!("{owner}: {} is not valid JSON", full.display()))?;
+            Ok(Some(schema))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => bail!("{owner}: set output_schema or output_schema_file, not both"),
+    }
+}
+
 fn resolve_prompt_source(
     inline: &Option<String>,
     file: &Option<PathBuf>,
@@ -502,6 +558,14 @@ pub struct Stage {
     /// Expose the built-in `web_fetch` tool (fetch a URL as readable text).
     #[serde(default)]
     pub web_fetch: bool,
+    /// Force the first model turn to call a tool: `"any"` (some tool) or a
+    /// tool name. Later turns are unconstrained. Default: the model decides.
+    pub tool_choice: Option<String>,
+    /// Inline JSON Schema (as a TOML table) the stage's final answer must
+    /// conform to. Mutually exclusive with `output_schema_file`.
+    pub output_schema: Option<toml::Value>,
+    /// Path to a JSON Schema file, relative to the config file.
+    pub output_schema_file: Option<PathBuf>,
     /// Inline system prompt. Mutually exclusive with `system_prompt_file`.
     pub system_prompt: Option<String>,
     /// Path to a file containing the system prompt, relative to the config file.
@@ -557,6 +621,19 @@ pub struct Stage {
 }
 
 impl Stage {
+    pub fn parsed_tool_choice(&self) -> Option<crate::model::ToolChoice> {
+        parse_tool_choice(self.tool_choice.as_deref())
+    }
+
+    pub fn resolve_output_schema(&self, base_dir: &Path) -> Result<Option<serde_json::Value>> {
+        resolve_schema_source(
+            self.output_schema.as_ref(),
+            self.output_schema_file.as_ref(),
+            base_dir,
+            &format!("stage `{}`", self.name),
+        )
+    }
+
     /// Resolve the system prompt, reading `system_prompt_file` if set.
     pub fn resolve_system_prompt(&self, base_dir: &Path) -> Result<Option<String>> {
         resolve_prompt_source(&self.system_prompt, &self.system_prompt_file, base_dir)
@@ -767,6 +844,16 @@ impl Config {
                     "agent `{name}` sets both system_prompt and system_prompt_file"
                 ));
             }
+            if agent.output_schema.is_some() && agent.output_schema_file.is_some() {
+                errors.push(format!(
+                    "agent `{name}` sets both output_schema and output_schema_file"
+                ));
+            }
+            if agent.tool_choice.as_deref() == Some("") {
+                errors.push(format!(
+                    "agent `{name}` has an empty tool_choice — use \"any\", \"auto\", or a tool name"
+                ));
+            }
             if agent.web_search && self.settings.searxng_url.is_none() {
                 errors.push(format!(
                     "agent `{name}` enables web_search but settings.searxng_url is not set"
@@ -852,6 +939,18 @@ impl Config {
             if stage.system_prompt.is_some() && stage.system_prompt_file.is_some() {
                 errors.push(format!(
                     "stage `{name}` sets both system_prompt and system_prompt_file"
+                ));
+            }
+            if stage.output_schema.is_some() && stage.output_schema_file.is_some() {
+                errors.push(format!(
+                    "stage `{name}` sets both output_schema and output_schema_file",
+                    name = stage.name
+                ));
+            }
+            if stage.tool_choice.as_deref() == Some("") {
+                errors.push(format!(
+                    "stage `{}` has an empty tool_choice — use \"any\", \"auto\", or a tool name",
+                    stage.name
                 ));
             }
             if stage.web_search && self.settings.searxng_url.is_none() {
@@ -1328,6 +1427,59 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("invalid header name `bad header`"), "{err}");
+    }
+
+    #[test]
+    fn tool_choice_and_output_schema_parse_and_validate() {
+        // Inline schema (TOML table) + tool_choice parse and resolve. The
+        // sub-table comes after the stage's scalar keys.
+        let toml_str = format!(
+            "{}\n{}",
+            MINIMAL.replace("name = \"answer\"", "name = \"answer\"\ntool_choice = \"any\""),
+            "[stage.output_schema]\ntype = \"object\"\n[stage.output_schema.properties.answer]\ntype = \"string\"\n",
+        );
+        let config = parse(&toml_str).unwrap();
+        let stage = &config.stages[0];
+        assert_eq!(stage.parsed_tool_choice(), Some(crate::model::ToolChoice::Any));
+        let schema = stage
+            .resolve_output_schema(Path::new("."))
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema["properties"]["answer"]["type"], "string");
+
+        // A tool name and the "auto" default.
+        assert_eq!(parse_tool_choice(Some("grep")), Some(crate::model::ToolChoice::Tool("grep".into())));
+        assert_eq!(parse_tool_choice(Some("auto")), None);
+        assert_eq!(parse_tool_choice(None), None);
+
+        // Schema file variant resolves relative to the config dir.
+        let dir = std::env::temp_dir().join(format!("soa-schema-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("out.json"), r#"{"type": "object"}"#).unwrap();
+        let toml_str = MINIMAL.replace(
+            "name = \"answer\"",
+            "name = \"answer\"\noutput_schema_file = \"out.json\"",
+        );
+        let config = parse(&toml_str).unwrap();
+        let schema = config.stages[0]
+            .resolve_output_schema(&dir)
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema["type"], "object");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Mutual exclusion and empty tool_choice are config errors.
+        let toml_str = format!(
+            "{}\n{}",
+            MINIMAL.replace(
+                "name = \"answer\"",
+                "name = \"answer\"\noutput_schema_file = \"x.json\"\ntool_choice = \"\"",
+            ),
+            "[stage.output_schema]\ntype = \"object\"\n",
+        );
+        let error = parse(&toml_str).unwrap_err().to_string();
+        assert!(error.contains("both output_schema and output_schema_file"), "{error}");
+        assert!(error.contains("empty tool_choice"), "{error}");
     }
 
     #[test]

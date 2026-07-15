@@ -95,6 +95,27 @@ pub struct SamplingParams {
     pub max_tokens: Option<u32>,
 }
 
+/// Constrain which tool the model calls. Applied by the agent loop to the
+/// first request of a run only — a standing constraint would make a final
+/// text answer impossible.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolChoice {
+    /// The model must call some tool (OpenAI `required`, Anthropic `any`).
+    Any,
+    /// The model must call this tool.
+    Tool(String),
+}
+
+/// Per-request output constraints, distinct from sampling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestConstraints<'a> {
+    pub tool_choice: Option<&'a ToolChoice>,
+    /// JSON Schema the final response text must conform to (OpenAI
+    /// `response_format`, Anthropic `output_config.format`). Sent with
+    /// every request of the loop.
+    pub output_schema: Option<&'a Value>,
+}
+
 /// One canonical completion request passed to a provider adapter.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRequest<'a> {
@@ -102,6 +123,7 @@ pub struct ModelRequest<'a> {
     pub messages: &'a [Message],
     pub tools: &'a [ToolDefinition],
     pub sampling: SamplingParams,
+    pub constraints: RequestConstraints<'a>,
     pub stream: bool,
 }
 
@@ -811,7 +833,8 @@ impl ModelClient {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<ModelResponse> {
-        self.complete_streamed(messages, tools, None).await
+        self.complete_streamed(messages, tools, RequestConstraints::default(), None)
+            .await
     }
 
     /// One canonical round-trip with retry and fallback orchestration.
@@ -819,6 +842,7 @@ impl ModelClient {
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
+        constraints: RequestConstraints<'_>,
         on_delta: Option<DeltaHandler<'_>>,
     ) -> Result<ModelResponse> {
         let emitted = AtomicUsize::new(0);
@@ -863,6 +887,7 @@ impl ModelClient {
                     messages,
                     tools,
                     sampling,
+                    constraints,
                     stream: target.stream,
                 };
                 let request_started = Instant::now();
@@ -1200,7 +1225,7 @@ mod tests {
         let streamed = Mutex::new(String::new());
         let on_delta = |fragment: &str| streamed.lock().unwrap().push_str(fragment);
         let response = client
-            .complete_streamed(&messages, &[], Some(&on_delta))
+            .complete_streamed(&messages, &[], RequestConstraints::default(), Some(&on_delta))
             .await
             .unwrap();
 

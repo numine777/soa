@@ -280,6 +280,12 @@ pub struct AgentLoopOptions<'a> {
     pub require_approval: bool,
     pub approval_effects: &'a [ToolEffect],
     pub auto_approve: &'a [String],
+    /// Forces the FIRST model request of the run to call a tool (or one
+    /// specific tool); later rounds are unconstrained so the model can
+    /// still produce a final answer.
+    pub tool_choice: Option<&'a crate::model::ToolChoice>,
+    /// JSON Schema constraining the response text; sent on every request.
+    pub output_schema: Option<&'a Value>,
     pub reprompt_targets: &'a [String],
     pub on_delta: Option<DeltaHandler<'a>>,
     pub terminate_streamed_response: bool,
@@ -1632,8 +1638,15 @@ pub async fn run_agent_loop(
             });
         }
         request.extend(state.messages.iter().cloned());
+        let constraints = crate::model::RequestConstraints {
+            // turns counts model responses so far: 0 = the opening request.
+            tool_choice: (state.turns == 0)
+                .then_some(options.tool_choice)
+                .flatten(),
+            output_schema: options.output_schema,
+        };
         let reply = client
-            .complete_streamed(&request, &definitions, options.on_delta)
+            .complete_streamed(&request, &definitions, constraints, options.on_delta)
             .await?;
         if options.terminate_streamed_response
             && let (Some(handler), Some(content)) = (options.on_delta, reply.content.as_deref())
@@ -1726,6 +1739,8 @@ pub fn run_agent<'a>(
             &agent.skills,
         )?;
         let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
+        let tool_choice = agent.parsed_tool_choice();
+        let output_schema = agent.resolve_output_schema(&config.base_dir)?;
         tracing::info!(
             agent = %agent_name, model = %agent.model, tools = agent_tools.len(), depth,
             task = %truncate(task, 200), "running agent"
@@ -1759,6 +1774,8 @@ pub fn run_agent<'a>(
                 require_approval: agent.require_approval,
                 approval_effects: &agent.approval_effects,
                 auto_approve: &agent.auto_approve,
+                tool_choice: tool_choice.as_ref(),
+                output_schema: output_schema.as_ref(),
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,
@@ -1911,6 +1928,8 @@ pub async fn run_stage(
         &stage.skills,
     )?;
     let max_turns = stage.max_turns.unwrap_or(config.settings.default_max_turns);
+    let tool_choice = stage.parsed_tool_choice();
+    let output_schema = stage.resolve_output_schema(&config.base_dir)?;
     tracing::info!(
         stage = %stage.name, model = %stage.model,
         tools = stage_tools.len() + usize::from(!reprompt_targets.is_empty()),
@@ -1938,6 +1957,8 @@ pub async fn run_stage(
             require_approval: stage.require_approval,
             approval_effects: &stage.approval_effects,
             auto_approve: &stage.auto_approve,
+            tool_choice: tool_choice.as_ref(),
+            output_schema: output_schema.as_ref(),
             reprompt_targets,
             on_delta,
             terminate_streamed_response: true,
@@ -2145,6 +2166,126 @@ mod tests {
         assert!(content.contains("cancelled"), "{content}");
     }
 
+    #[tokio::test]
+    async fn tool_choice_constrains_only_the_opening_request() {
+        /// Returns a tool call on the first request, a final answer after,
+        /// recording each request's tool_choice.
+        struct ChoiceAdapter {
+            choices: std::sync::Mutex<Vec<Option<crate::model::ToolChoice>>>,
+        }
+        impl ProviderAdapter for ChoiceAdapter {
+            fn name(&self) -> &'static str {
+                "choice-test"
+            }
+            fn complete<'a>(
+                &'a self,
+                request: crate::model::ModelRequest<'a>,
+                _on_delta: Option<crate::model::DeltaHandler<'a>>,
+            ) -> crate::model::AdapterFuture<'a> {
+                Box::pin(async move {
+                    let mut choices = self.choices.lock().unwrap();
+                    choices.push(request.constraints.tool_choice.cloned());
+                    let first = choices.len() == 1;
+                    // The schema must ride along on every request.
+                    assert!(request.constraints.output_schema.is_some());
+                    Ok(crate::model::ModelResponse {
+                        content: (!first).then(|| "done".to_string()),
+                        reasoning: None,
+                        tool_calls: if first {
+                            vec![tool_call("c1", "missing_tool")]
+                        } else {
+                            Vec::new()
+                        },
+                        usage: None,
+                        truncation: None,
+                    })
+                })
+            }
+        }
+
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let adapter = Arc::new(ChoiceAdapter {
+            choices: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        let choice = crate::model::ToolChoice::Any;
+        let schema = serde_json::json!({"type": "object"});
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            &[],
+            vec![Message::User {
+                content: "task".to_string(),
+            }],
+            &[],
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 3,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                tool_choice: Some(&choice),
+                output_schema: Some(&schema),
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: None,
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+
+        // Forced on the opening request; unconstrained afterwards so the
+        // model can produce the final answer.
+        let choices = adapter.choices.lock().unwrap();
+        assert_eq!(
+            *choices,
+            vec![Some(crate::model::ToolChoice::Any), None]
+        );
+    }
+
     #[test]
     fn subagent_events_extract_scoped_to_the_current_round() {
         let sub = |call_index: usize, content: &str| AgentLoopEvent::Subagent {
@@ -2304,6 +2445,8 @@ mod tests {
                 require_approval: false,
                 approval_effects: &[],
                 auto_approve: &[],
+                tool_choice: None,
+                output_schema: None,
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,
@@ -2467,6 +2610,8 @@ mod tests {
                 require_approval: false,
                 approval_effects: &[],
                 auto_approve: &[],
+                tool_choice: None,
+                output_schema: None,
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,
@@ -2662,6 +2807,8 @@ mod tests {
                 require_approval: false,
                 approval_effects: &[],
                 auto_approve: &[],
+                tool_choice: None,
+                output_schema: None,
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,
@@ -2786,6 +2933,8 @@ mod tests {
                 require_approval: false,
                 approval_effects: &[],
                 auto_approve: &[],
+                tool_choice: None,
+                output_schema: None,
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,

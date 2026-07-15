@@ -199,6 +199,10 @@ struct MessagesRequest<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
 }
@@ -303,6 +307,14 @@ impl<'a> MessagesRequest<'a> {
                 .collect(),
             temperature: request.sampling.temperature,
             top_p: request.sampling.top_p,
+            tool_choice: request.constraints.tool_choice.map(|choice| match choice {
+                crate::model::ToolChoice::Any => json!({ "type": "any" }),
+                crate::model::ToolChoice::Tool(name) => json!({ "type": "tool", "name": name }),
+            }),
+            output_config: request
+                .constraints
+                .output_schema
+                .map(|schema| json!({ "format": { "type": "json_schema", "schema": schema } })),
             stream: request.stream,
         }
     }
@@ -680,7 +692,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::model::{SamplingParams, ToolDefinition};
+    use crate::model::{RequestConstraints, SamplingParams, ToolDefinition};
 
     fn sse(payload: &str) -> SseEvent {
         SseEvent::Data(payload.to_string())
@@ -739,6 +751,7 @@ mod tests {
             messages: &messages,
             tools: &tools,
             sampling: SamplingParams::default(),
+            constraints: RequestConstraints::default(),
             stream: true,
         });
         let wire = serde_json::to_value(&request).unwrap();
@@ -795,6 +808,7 @@ mod tests {
                 max_tokens: Some(2048),
                 ..Default::default()
             },
+            constraints: RequestConstraints::default(),
             stream: false,
         });
         let wire = serde_json::to_value(&request).unwrap();
@@ -804,6 +818,48 @@ mod tests {
         assert_eq!(blocks[0]["type"], "tool_use");
         // Null arguments become an empty input object.
         assert_eq!(blocks[0]["input"], json!({}));
+    }
+
+    #[test]
+    fn constraints_map_to_tool_choice_and_output_config() {
+        let messages = vec![Message::User {
+            content: "go".into(),
+        }];
+        let schema = json!({"type": "object"});
+        let choice = crate::model::ToolChoice::Tool("grep".into());
+        let request = MessagesRequest::from_canonical(ModelRequest {
+            model: "m",
+            messages: &messages,
+            tools: &[],
+            sampling: SamplingParams::default(),
+            constraints: RequestConstraints {
+                tool_choice: Some(&choice),
+                output_schema: Some(&schema),
+            },
+            stream: false,
+        });
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["tool_choice"], json!({"type": "tool", "name": "grep"}));
+        assert_eq!(
+            wire["output_config"],
+            json!({"format": {"type": "json_schema", "schema": {"type": "object"}}})
+        );
+
+        let any = crate::model::ToolChoice::Any;
+        let request = MessagesRequest::from_canonical(ModelRequest {
+            model: "m",
+            messages: &messages,
+            tools: &[],
+            sampling: SamplingParams::default(),
+            constraints: RequestConstraints {
+                tool_choice: Some(&any),
+                output_schema: None,
+            },
+            stream: false,
+        });
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["tool_choice"], json!({"type": "any"}));
+        assert!(wire.get("output_config").is_none());
     }
 
     #[test]
@@ -985,6 +1041,7 @@ mod tests {
                     messages: &messages,
                     tools: &[],
                     sampling: SamplingParams::default(),
+                    constraints: RequestConstraints::default(),
                     stream: true,
                 },
                 Some(&on_delta),

@@ -1303,6 +1303,11 @@ impl App {
             Err(e) => return self.error(format!("{e:#}")),
         };
         self.tool_count = stage_tools.len();
+        let tool_choice = stage.parsed_tool_choice();
+        let output_schema = match stage.resolve_output_schema(&self.config.base_dir) {
+            Ok(schema) => schema,
+            Err(e) => return self.error(format!("{e:#}")),
+        };
 
         let max_turns = stage
             .max_turns
@@ -1330,6 +1335,8 @@ impl App {
             Arc::clone(&self.approvals),
             stage.name.clone(),
             model_name,
+            tool_choice,
+            output_schema,
             Arc::clone(&self.steer_queue),
             Arc::clone(&self.turn_events),
         );
@@ -2165,6 +2172,8 @@ async fn turn_worker(
     approvals: Arc<Approvals>,
     stage_name: String,
     model_name: String,
+    tool_choice: Option<crate::model::ToolChoice>,
+    output_schema: Option<serde_json::Value>,
     steer: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     events: Arc<std::sync::Mutex<Vec<AgentLoopEvent>>>,
 ) {
@@ -2215,6 +2224,8 @@ async fn turn_worker(
             require_approval,
             approval_effects: &approval_effects,
             auto_approve: &auto_approve,
+            tool_choice: tool_choice.as_ref(),
+            output_schema: output_schema.as_ref(),
             reprompt_targets: &[],
             on_delta: Some(&on_delta),
             terminate_streamed_response: false,

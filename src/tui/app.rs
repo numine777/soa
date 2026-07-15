@@ -18,8 +18,8 @@ use crate::diff::{self, DiffEntry};
 use crate::mcp::McpManager;
 use crate::model::{Message, ModelClient, Usage, UsageTracker, fmt_tokens};
 use crate::stage::{
-    AgentLoopObservation, AgentLoopOptions, StageTool, assemble_tools, build_model_client,
-    run_agent_loop,
+    AgentLoopEvent, AgentLoopObservation, AgentLoopOptions, StageTool, assemble_tools,
+    build_model_client, run_agent_loop, salvage_cancelled_loop,
 };
 
 const COMPACT_INSTRUCTION: &str = "\
@@ -177,6 +177,11 @@ pub struct App {
     /// re-appended to the surviving history — same as the turn's original
     /// message, which is pushed before the worker starts.
     steered_this_turn: Vec<String>,
+    /// Event log of the running turn, shared with the worker. When a turn
+    /// is cancelled or fails, the completed tool rounds recorded here are
+    /// folded back into `history` so the model keeps seeing work whose
+    /// effects are already on disk.
+    turn_events: Arc<std::sync::Mutex<Vec<AgentLoopEvent>>>,
     tx: UnboundedSender<AgentEvent>,
     // Session persistence.
     session_id: String,
@@ -254,6 +259,7 @@ impl App {
             workflow_running: None,
             steer_queue: Arc::default(),
             steered_this_turn: Vec::new(),
+            turn_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             tx,
             session_id: store::new_session_id(),
             started_at: store::now_epoch(),
@@ -1320,6 +1326,7 @@ impl App {
 
         self.steer_queue.lock().unwrap().clear();
         self.steered_this_turn.clear();
+        self.turn_events.lock().unwrap().clear();
         let worker = turn_worker(
             client,
             stage_tools,
@@ -1340,6 +1347,7 @@ impl App {
             stage.name.clone(),
             model_name,
             Arc::clone(&self.steer_queue),
+            Arc::clone(&self.turn_events),
         );
         self.compacting = false;
         self.turn = Some(tokio::spawn(worker));
@@ -1399,6 +1407,7 @@ impl App {
 
         self.steer_queue.lock().unwrap().clear();
         self.steered_this_turn.clear();
+        self.turn_events.lock().unwrap().clear();
         let worker = workflow_worker(
             Arc::clone(&self.config),
             Arc::clone(&self.mcp),
@@ -1440,6 +1449,7 @@ impl App {
         });
         let tx = self.tx.clone();
         self.compacting = true;
+        self.turn_events.lock().unwrap().clear();
         self.turn = Some(tokio::spawn(async move {
             let event = match client.complete(&request, &[]).await {
                 Ok(reply) => AgentEvent::Compacted {
@@ -1491,7 +1501,7 @@ impl App {
             let workflow = self.workflow_running.take();
             self.pending_approval = None; // dropped responder reads as deny
             self.flush_stream_buffer();
-            self.preserve_steered();
+            self.recover_interrupted_turn();
             self.info(match workflow {
                 Some(name) => format!(
                     "cancelled workflow `{name}` — file changes it already made remain \
@@ -1499,6 +1509,7 @@ impl App {
                 ),
                 None => "cancelled".to_string(),
             });
+            self.persist();
         }
     }
 
@@ -1788,6 +1799,48 @@ impl App {
         self.persist();
     }
 
+    /// Recover from an interrupted (cancelled or failed) turn: fold the
+    /// tool rounds the worker already completed back into `history` — their
+    /// file effects are on disk, and a model that cannot see them will
+    /// contradict the filesystem — then keep any undelivered steered
+    /// messages. Falls back to [`Self::preserve_steered`] when the turn
+    /// recorded nothing (workflows, compaction, pre-model cancels).
+    fn recover_interrupted_turn(&mut self) {
+        let events = std::mem::take(&mut *self.turn_events.lock().unwrap());
+        match salvage_cancelled_loop(&events) {
+            Ok(Some(messages)) => {
+                let folded = messages.len().saturating_sub(self.history.len());
+                if folded > 0 {
+                    self.history = messages;
+                    self.info(format!(
+                        "kept {folded} message(s) from the interrupted turn in context — \
+                         the model will see the tool calls that already ran"
+                    ));
+                }
+                // Steered messages the loop already delivered are part of
+                // the salvaged history; only the undelivered queue is
+                // re-added.
+                let leftovers: Vec<String> = self.steer_queue.lock().unwrap().drain(..).collect();
+                self.steered_this_turn.clear();
+                if !leftovers.is_empty() {
+                    for content in leftovers {
+                        self.history.push(Message::User { content });
+                    }
+                    self.info("queued message(s) kept in context for the next turn");
+                }
+            }
+            result => {
+                if let Err(e) = result {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "could not salvage the interrupted turn's events"
+                    );
+                }
+                self.preserve_steered();
+            }
+        }
+    }
+
     /// A failed or cancelled turn discards the worker's history clone, and
     /// any steered messages with it — keep them in the surviving history so
     /// the next turn still sees them.
@@ -1864,6 +1917,7 @@ impl App {
                 // The buffer holds the same text that just streamed; the
                 // final Turn event is authoritative.
                 self.stream_buffer.clear();
+                self.turn_events.lock().unwrap().clear();
                 self.history = history;
                 self.last_usage = usage;
                 if text.trim().is_empty() {
@@ -1975,7 +2029,7 @@ impl App {
                 self.error(message);
                 self.turn = None;
                 self.compacting = false;
-                self.preserve_steered();
+                self.recover_interrupted_turn();
             }
         }
         if should_save {
@@ -2126,10 +2180,17 @@ async fn turn_worker(
     stage_name: String,
     model_name: String,
     steer: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    events: Arc<std::sync::Mutex<Vec<AgentLoopEvent>>>,
 ) {
     let delta_tx = tx.clone();
     let on_delta = move |fragment: &str| {
         let _ = delta_tx.send(AgentEvent::Delta(fragment.to_string()));
+    };
+    // Mirror every loop event into shared state the UI thread can read: if
+    // this task is aborted mid-turn, the completed rounds recorded here are
+    // salvaged back into the conversation history.
+    let on_event = move |event: AgentLoopEvent| {
+        events.lock().unwrap().push(event);
     };
     let observation_tx = tx.clone();
     let on_observation = move |event: AgentLoopObservation| match event {
@@ -2172,7 +2233,7 @@ async fn turn_worker(
             on_delta: Some(&on_delta),
             terminate_streamed_response: false,
             on_diff: Some(&on_diff),
-            on_event: None,
+            on_event: Some(&on_event),
             on_observation: Some(&on_observation),
             steer: Some(&steer),
             tool_errors_as_results: true,
@@ -2381,6 +2442,70 @@ mod tests {
         assert!(
             matches!(app.transcript.last(), Some(TranscriptItem::Error(text))
             if text.contains("blew up"))
+        );
+    }
+
+    #[test]
+    fn interrupted_turns_fold_completed_tool_work_into_history() {
+        let mut app = test_app();
+        app.history = vec![Message::User {
+            content: "edit the file".to_string(),
+        }];
+        let call = crate::model::ToolCall {
+            id: "c1".to_string(),
+            function: crate::model::FunctionCall {
+                name: "write_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        *app.turn_events.lock().unwrap() = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: app.history.clone(),
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![call],
+                usage: None,
+            },
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "wrote `x`".to_string(),
+            },
+        ];
+        // One steered message was never delivered to the worker.
+        app.steer_queue
+            .lock()
+            .unwrap()
+            .push_back("also do y".to_string());
+        app.steered_this_turn.push("also do y".to_string());
+
+        app.recover_interrupted_turn();
+
+        // The completed tool round survives, followed by the undelivered
+        // steered message; the event log and steer state are consumed.
+        assert_eq!(app.history.len(), 4);
+        assert!(matches!(
+            &app.history[1],
+            Message::Assistant {
+                tool_calls: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(&app.history[2], Message::Tool { .. }));
+        assert!(
+            matches!(&app.history[3], Message::User { content } if content == "also do y")
+        );
+        assert!(app.turn_events.lock().unwrap().is_empty());
+        assert!(app.steered_this_turn.is_empty());
+        assert!(app.steer_queue.lock().unwrap().is_empty());
+
+        // With no recorded events (a cancelled workflow, a compaction), the
+        // conservative fallback keeps all steered messages.
+        app.steered_this_turn.push("plan b".to_string());
+        app.recover_interrupted_turn();
+        assert!(
+            matches!(app.history.last(), Some(Message::User { content }) if content == "plan b")
         );
     }
 

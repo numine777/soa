@@ -855,6 +855,34 @@ struct ReplayedAgentLoop {
     usage: Option<Usage>,
 }
 
+/// Rebuild the conversation a cancelled (or failed) loop had accumulated,
+/// so completed tool rounds survive into the caller's history — their
+/// effects are already on disk, and a model that cannot see them will
+/// contradict the filesystem. An incomplete final round is closed with
+/// synthetic "interrupted" results so the history stays protocol-valid.
+/// Returns `None` when nothing was recorded.
+pub fn salvage_cancelled_loop(events: &[AgentLoopEvent]) -> Result<Option<Vec<Message>>> {
+    if events.is_empty() {
+        return Ok(None);
+    }
+    let replayed = replay_agent_loop(events)?;
+    let mut messages = replayed.messages;
+    if let Some(round) = replayed.pending {
+        for (index, call) in round.calls.iter().enumerate() {
+            let content = round.results.get(&index).cloned().unwrap_or_else(|| {
+                "The user cancelled the turn before this tool call finished; \
+                 it may or may not have taken effect."
+                    .to_string()
+            });
+            messages.push(Message::Tool {
+                content,
+                tool_call_id: call.id.clone(),
+            });
+        }
+    }
+    Ok(Some(messages))
+}
+
 fn flush_completed_round(
     messages: &mut Vec<Message>,
     pending: &mut Option<PendingToolRound>,
@@ -1771,6 +1799,55 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn salvage_closes_interrupted_tool_rounds() {
+        // Nothing recorded (workflow cancels, pre-model cancels) — nothing
+        // to salvage.
+        assert!(salvage_cancelled_loop(&[]).unwrap().is_none());
+
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![tool_call("c1", "write_file"), tool_call("c2", "shell")],
+                usage: None,
+            },
+            // The turn is interrupted with only the first result recorded.
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "wrote `x`".to_string(),
+            },
+        ];
+        let messages = salvage_cancelled_loop(&events).unwrap().unwrap();
+        assert_eq!(messages.len(), 4); // user, assistant, recorded + synthetic results
+        assert!(matches!(
+            &messages[1],
+            Message::Assistant { tool_calls: Some(calls), .. } if calls.len() == 2
+        ));
+        let Message::Tool {
+            content,
+            tool_call_id,
+        } = &messages[2]
+        else {
+            panic!("expected the recorded tool result");
+        };
+        assert_eq!((content.as_str(), tool_call_id.as_str()), ("wrote `x`", "c1"));
+        let Message::Tool {
+            content,
+            tool_call_id,
+        } = &messages[3]
+        else {
+            panic!("expected a synthetic result for the unfinished call");
+        };
+        assert_eq!(tool_call_id, "c2");
+        assert!(content.contains("cancelled"), "{content}");
     }
 
     #[test]

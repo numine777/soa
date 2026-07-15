@@ -110,6 +110,14 @@ after the current tool round — correct course without cancelling. Anything
 still queued when the turn finishes is sent as the next turn, and a
 cancelled or failed turn keeps queued messages in context.
 
+**Cancelling keeps completed work in context.** When a turn is cancelled
+(`Esc`/`Ctrl+C`) or fails mid-way, the tool rounds it already completed are
+folded back into the conversation — their file effects are on disk, and a
+model that couldn't see them would contradict the filesystem on the next
+turn. A tool call interrupted mid-flight is recorded as such ("may or may
+not have taken effect"), and only the unfinished response text is
+discarded. Rewind still undoes the file changes themselves.
+
 Keys: `Enter` sends, `Alt+Enter` inserts a newline, `Up`/`Down` recall
 previously submitted prompts (shell-style; `Up` on the input's first line,
 `Down` on its last), `PgUp`/`PgDn` and the mouse wheel scroll the

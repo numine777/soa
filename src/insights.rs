@@ -256,6 +256,7 @@ mod tests {
                 added: 1,
                 removed: 0,
                 before: crate::diff::Snapshot::Absent,
+                via: None,
             },
             crate::diff::DiffEntry {
                 tool: "rewind".into(),
@@ -264,6 +265,7 @@ mod tests {
                 added: 0,
                 removed: 1,
                 before: crate::diff::Snapshot::Absent,
+                via: None,
             },
         ];
         let signals = extract_signals(&session_with(history, diffs));

@@ -768,7 +768,10 @@ Semantics:
   `soa chat`. In the TUI you'll see the delegation as a single
   `agent__<name>` tool call with its final answer; the agent's internal
   tool calls go to the log file (`$TMPDIR/soa-chat.log`). File edits made
-  by a subagent aren't captured by the diff viewer yet.
+  by a subagent are captured like the stage's own: they appear in the
+  diff viewer and the headless `── changes ──` summary attributed to the
+  delegation (`researcher › edit_file`, chaining for nested agents), with
+  full restore/rewind support.
 - Delegations are checkpointed: during pipeline runs, a subagent's own
   event log is recorded alongside the stage's, so `soa run --resume`
   continues an interrupted delegation mid-run — completed subagent model

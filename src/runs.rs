@@ -287,6 +287,7 @@ mod tests {
             added: 3,
             removed: 1,
             before: crate::diff::Snapshot::Unavailable,
+            via: None,
         });
         state.usage.models.insert(
             "coder".to_string(),

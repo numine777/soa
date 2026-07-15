@@ -690,7 +690,7 @@ pub async fn dispatch_tool_call(
     usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
-    subagent: SubagentCheckpoint<'_>,
+    subagent: SubagentHooks<'_>,
 ) -> Result<String> {
     let described = call_descriptor(binding, arguments);
 
@@ -788,7 +788,7 @@ async fn dispatch_tool_call_inner(
     usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
-    subagent: SubagentCheckpoint<'_>,
+    subagent: SubagentHooks<'_>,
 ) -> Result<String> {
     // The adapter already decoded the wire encoding. `Null` means "no
     // arguments"; any other non-object survived a malformed generation —
@@ -1168,13 +1168,15 @@ fn observe_loop(sink: LoopObservationSink<'_>, event: AgentLoopObservation) {
     }
 }
 
-/// Checkpoint hooks for one `agent__<name>` delegation: the subagent
-/// events already recorded for this call (so an interrupted delegation
-/// resumes mid-run), and a sink that persists the delegation's new events
-/// wrapped under the call's index.
-pub struct SubagentCheckpoint<'a> {
+/// Hooks for one `agent__<name>` delegation: the subagent events already
+/// recorded for this call (so an interrupted delegation resumes mid-run),
+/// a sink that persists the delegation's new events wrapped under the
+/// call's index, and the caller's diff sink so the delegation's file
+/// edits are captured with attribution.
+pub struct SubagentHooks<'a> {
     pub resume_events: Vec<AgentLoopEvent>,
     pub on_event: LoopEventSink<'a>,
+    pub on_diff: DiffSink<'a>,
 }
 
 /// The subagent events recorded for `call_index` in the current round —
@@ -1258,11 +1260,12 @@ async fn execute_agent_loop_tool(
                     });
                 }
             };
-            let subagent = SubagentCheckpoint {
+            let subagent = SubagentHooks {
                 resume_events: subagent_resume,
                 on_event: outer_sink
                     .is_some()
                     .then_some(&wrap as &(dyn Fn(AgentLoopEvent) + Send + Sync)),
+                on_diff: options.on_diff,
             };
             match dispatch_tool_call(
                 &tool.binding,
@@ -1715,7 +1718,7 @@ pub fn run_agent<'a>(
     usage: &'a UsageTracker,
     depth: u32,
     approvals: &'a Approvals,
-    checkpoint: SubagentCheckpoint<'a>,
+    hooks: SubagentHooks<'a>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         let agent = config
@@ -1745,20 +1748,33 @@ pub fn run_agent<'a>(
             agent = %agent_name, model = %agent.model, tools = agent_tools.len(), depth,
             task = %truncate(task, 200), "running agent"
         );
-        if !checkpoint.resume_events.is_empty() {
+        if !hooks.resume_events.is_empty() {
             tracing::info!(
                 agent = %agent_name,
-                events = checkpoint.resume_events.len(),
+                events = hooks.resume_events.len(),
                 "resuming interrupted delegation from its checkpointed events"
             );
         }
+        // The delegation's file edits flow to the caller's diff sink with
+        // this agent's name prepended to the attribution path; nested
+        // delegations chain naturally (outer wraps inner).
+        let outer_diff = hooks.on_diff;
+        let attributed_diff = move |mut entry: crate::diff::DiffEntry| {
+            if let Some(sink) = outer_diff {
+                entry.via = Some(match entry.via.take() {
+                    Some(inner) => format!("{agent_name} › {inner}"),
+                    None => agent_name.to_string(),
+                });
+                sink(entry);
+            }
+        };
         let result = run_agent_loop(
             &client,
             &agent_tools,
             vec![Message::User {
                 content: task.to_string(),
             }],
-            &checkpoint.resume_events,
+            &hooks.resume_events,
             config,
             mcp,
             http,
@@ -1779,8 +1795,10 @@ pub fn run_agent<'a>(
                 reprompt_targets: &[],
                 on_delta: None,
                 terminate_streamed_response: false,
-                on_diff: None,
-                on_event: checkpoint.on_event,
+                on_diff: outer_diff
+                    .is_some()
+                    .then_some(&attributed_diff as &(dyn Fn(crate::diff::DiffEntry) + Send + Sync)),
+                on_event: hooks.on_event,
                 on_observation: None,
                 steer: None,
                 tool_errors_as_results: false,
@@ -2326,6 +2344,205 @@ mod tests {
             AgentLoopEvent::UserMessage { content } if content == "current round"
         ));
         assert!(subagent_resume_events(&events, 2).is_empty());
+    }
+
+    /// Serve canned OpenAI chat-completion responses over a real socket.
+    fn mock_openai_server(responses: Vec<String>) -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = vec![0u8; 65536];
+                let mut read = 0;
+                // Read until the JSON body is complete enough (headers +
+                // content-length body arrive quickly on loopback).
+                loop {
+                    let n = stream.read(&mut buffer[read..]).unwrap();
+                    read += n;
+                    let text = String::from_utf8_lossy(&buffer[..read]);
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let expect: usize = text
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|v| v.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if read >= split + 4 + expect {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn delegation_edits_are_captured_with_attribution() {
+        // The helper agent's model lives behind a mock server: first
+        // response asks to write a file, second is the final answer.
+        let target = format!(
+            "target/soa-attrib-test-{}.txt",
+            std::process::id()
+        );
+        let addr = mock_openai_server(vec![
+            format!(
+                r#"{{"choices":[{{"message":{{"content":null,"tool_calls":[{{"id":"w1","type":"function","function":{{"name":"write_file","arguments":"{{\"path\":\"{target}\",\"content\":\"hello\"}}"}}}}]}},"finish_reason":"tool_calls"}}]}}"#,
+            ),
+            r#"{"choices":[{"message":{"content":"wrote it"},"finish_reason":"stop"}]}"#.to_string(),
+        ]);
+        let config: Config = toml::from_str(&format!(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [providers.mock]
+            base_url = "http://{addr}/v1"
+            stream = false
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [models.helper-m]
+            provider = "mock"
+            model = "y"
+
+            [agents.helper]
+            model = "helper-m"
+            mode = "read_write"
+            files = true
+            description = "writes files"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        ))
+        .unwrap();
+        // Parent model: the plain recording adapter.
+        let adapter = Arc::new(ResumeAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        let delegation_tool = StageTool {
+            definition: crate::model::ToolDefinition {
+                name: "agent__helper".to_string(),
+                description: "delegate".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            binding: ToolBinding::Agent {
+                agent: "helper".to_string(),
+            },
+            effects: ToolEffects::one(ToolEffect::FilesystemWrite),
+        };
+        // The parent already decided to delegate; resume executes it.
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "d1".to_string(),
+                    function: crate::model::FunctionCall {
+                        name: "agent__helper".to_string(),
+                        arguments: serde_json::json!({"task": "write the file"}),
+                    },
+                }],
+                usage: None,
+                reasoning: None,
+            },
+        ];
+        let captured: std::sync::Mutex<Vec<crate::diff::DiffEntry>> =
+            std::sync::Mutex::new(Vec::new());
+        let on_diff = |entry: crate::diff::DiffEntry| captured.lock().unwrap().push(entry);
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            std::slice::from_ref(&delegation_tool),
+            Vec::new(),
+            &events,
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 3,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                tool_choice: None,
+                output_schema: None,
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: Some(&on_diff),
+                on_event: None,
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&target);
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+
+        // The delegation's answer reached the parent…
+        let requests = adapter.requests.lock().unwrap();
+        let tool_content = requests[0]
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tool_content, "wrote it");
+        // …and its file edit surfaced on the parent's diff sink, attributed
+        // to the delegation.
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "one captured change");
+        assert_eq!(captured[0].path, target);
+        assert_eq!(captured[0].tool, "write_file");
+        assert_eq!(captured[0].via.as_deref(), Some("helper"));
+        assert_eq!(captured[0].provenance(), "helper › write_file");
+        assert!(captured[0].added >= 1);
     }
 
     #[tokio::test]

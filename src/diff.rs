@@ -50,11 +50,25 @@ pub struct DiffEntry {
     /// saved before this field existed.
     #[serde(default)]
     pub before: Snapshot,
+    /// Delegation path when a subagent made the change (`"researcher"`, or
+    /// `"researcher › checker"` for nested delegations). Absent for edits
+    /// made directly by the stage or chat turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 impl DiffEntry {
     pub fn title(&self) -> String {
         format!("{} (+{} −{})", self.path, self.added, self.removed)
+    }
+
+    /// What made the change: the tool, prefixed by the delegation path
+    /// when a subagent ran it.
+    pub fn provenance(&self) -> String {
+        match &self.via {
+            Some(via) => format!("{via} › {}", self.tool),
+            None => self.tool.clone(),
+        }
     }
 
     pub fn restorable(&self) -> bool {
@@ -226,6 +240,7 @@ fn compute(tool: &str, path: &str, before: Option<&str>, after: Option<&str>) ->
         added,
         removed,
         before: before.map_or(Snapshot::Absent, |text| Snapshot::Content(text.to_string())),
+        via: None,
     }
 }
 
@@ -269,6 +284,7 @@ mod tests {
             added: 0,
             removed: 0,
             before,
+            via: None,
         };
         let diffs = vec![
             entry("a", Snapshot::Content("a0".into())),

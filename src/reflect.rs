@@ -718,6 +718,7 @@ mod tests {
             added: 0,
             removed: 0,
             before: crate::diff::Snapshot::Absent,
+            via: None,
         };
         let mut session = crate::tui::store::Session {
             id: "s1".to_string(),

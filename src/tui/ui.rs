@@ -711,7 +711,7 @@ fn draw_diffs(frame: &mut Frame, app: &mut App, area: Rect) {
             n => format!(" (+{n} before /clear)"),
         },
         entry.title(),
-        entry.tool,
+        entry.provenance(),
     );
     frame.render_widget(
         Paragraph::new(header).style(

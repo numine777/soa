@@ -852,7 +852,7 @@ impl DiffLedger {
     }
 
     fn record(&self, entry: diff::DiffEntry) {
-        eprintln!("✎ {} via {}", entry.title(), entry.tool);
+        eprintln!("✎ {} via {}", entry.title(), entry.provenance());
         self.entries.lock().unwrap().push(entry);
     }
 
@@ -960,6 +960,7 @@ mod tests {
             added,
             removed,
             before: diff::Snapshot::Unavailable,
+            via: None,
         };
         let ledger = DiffLedger::new(vec![entry("b.rs", 1, 0)]); // from a resumed checkpoint
         ledger.entries.lock().unwrap().push(entry("a.rs", 10, 2));

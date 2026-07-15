@@ -1518,14 +1518,16 @@ impl App {
             Ok(Some(reverse)) => {
                 self.info(format!(
                     "restored {} to its state before `{}` — undo via the new rewind entry",
-                    entry.path, entry.tool
+                    entry.path,
+                    entry.provenance()
                 ));
                 self.diffs.push(reverse);
                 self.persist();
             }
             Ok(None) => self.info(format!(
                 "{} already matches the state recorded before `{}`",
-                entry.path, entry.tool
+                entry.path,
+                entry.provenance()
             )),
             Err(message) => self.error(message),
         }
@@ -1896,7 +1898,11 @@ impl App {
                 self.transcript.push(TranscriptItem::ToolDone { preview });
             }
             AgentEvent::Diff(entry) => {
-                self.info(format!("✎ {} — Ctrl+G to view", entry.title()));
+                self.info(format!(
+                    "✎ {} via {} — Ctrl+G to view",
+                    entry.title(),
+                    entry.provenance()
+                ));
                 self.diffs.push(entry);
             }
             AgentEvent::Notice(text) => self.info(text),
@@ -2297,6 +2303,7 @@ mod tests {
             removed: 0,
             // Unrestorable, so rewinds in tests never touch the filesystem.
             before: crate::diff::Snapshot::Unavailable,
+            via: None,
         }
     }
 

@@ -537,6 +537,8 @@ async fn run_pipeline(
         eprintln!("── stage {} ──", stage.name);
         let stream = StderrStream::new();
         let on_delta = |fragment: &str| stream.push(fragment);
+        let diffs = DiffLedger::new(Vec::new());
+        let on_diff = |entry: diff::DiffEntry| diffs.record(entry);
         let result = stage::run_stage(
             config,
             stage,
@@ -549,12 +551,13 @@ async fn run_pipeline(
             None,
             &[],
             Some(&on_delta),
-            None,
+            Some(&on_diff),
             &approvals,
         );
         let result = usage.within_time(result).await;
         stream.flush();
         manager.shutdown().await;
+        diffs.print_summary();
         print_usage_summary(&usage);
         return match result? {
             stage::StageOutcome::Final(output) => {
@@ -681,10 +684,13 @@ async fn run_workflow(
     let mut position = state.position;
     let mut runs = state.runs;
     let mut last_output = None;
+    // Seeded from the checkpoint so a resumed run's change summary covers
+    // the stages that ran before the interruption.
+    let diffs = DiffLedger::new(std::mem::take(&mut state.diffs));
 
     // Checkpoint the fresh run too, so a crash inside the first stage
     // still leaves the task resumable.
-    checkpoint(&mut state, position, runs, &context, &usage);
+    checkpoint(&mut state, position, runs, &context, &usage, &diffs);
 
     let mut result = Ok(());
     while position < order.len() {
@@ -701,7 +707,7 @@ async fn run_workflow(
                     run: runs,
                     events: Vec::new(),
                 });
-                checkpoint(&mut state, position, runs, &context, &usage);
+                checkpoint(&mut state, position, runs, &context, &usage, &diffs);
                 (Vec::new(), false)
             }
         };
@@ -751,6 +757,7 @@ async fn run_workflow(
         };
         let stream = StderrStream::new();
         let on_delta = |fragment: &str| stream.push(fragment);
+        let on_diff = |entry: diff::DiffEntry| diffs.record(entry);
         let stage_result = usage
             .within_time(stage::run_stage(
                 config,
@@ -764,7 +771,7 @@ async fn run_workflow(
                 Some(&on_event),
                 &reprompt_targets,
                 Some(&on_delta),
-                None,
+                Some(&on_diff),
                 &approvals,
             ))
             .await;
@@ -775,7 +782,7 @@ async fn run_workflow(
                 context.record(&stage.name, output.clone());
                 position += 1;
                 state.active_stage = None;
-                checkpoint(&mut state, position, runs, &context, &usage);
+                checkpoint(&mut state, position, runs, &context, &usage, &diffs);
                 // The output already streamed to stderr; just separate stages.
                 eprintln!("\n");
                 last_output = Some(output);
@@ -794,7 +801,7 @@ async fn run_workflow(
                     .position(|name| *name == target)
                     .expect("reprompt targets are filtered to the active workflow");
                 state.active_stage = None;
-                checkpoint(&mut state, position, runs, &context, &usage);
+                checkpoint(&mut state, position, runs, &context, &usage, &diffs);
             }
             Err(e) => {
                 result = Err(e);
@@ -810,11 +817,12 @@ async fn run_workflow(
             }
         }
         Err(_) => {
-            checkpoint(&mut state, position, runs, &context, &usage);
+            checkpoint(&mut state, position, runs, &context, &usage, &diffs);
             eprintln!("✗ run interrupted — continue it with `soa run --resume`");
         }
     }
 
+    diffs.print_summary();
     print_usage_summary(&usage);
     if result.is_ok()
         && let Some(output) = last_output
@@ -824,6 +832,74 @@ async fn run_workflow(
 
     manager.shutdown().await;
     result
+}
+
+/// File changes captured during a headless run: each is announced on
+/// stderr as it lands, aggregated into a `── changes ──` summary at the
+/// end, and carried through the run checkpoint so a resumed run reports
+/// the whole picture.
+struct DiffLedger {
+    entries: std::sync::Mutex<Vec<diff::DiffEntry>>,
+}
+
+impl DiffLedger {
+    fn new(seed: Vec<diff::DiffEntry>) -> Self {
+        DiffLedger {
+            entries: std::sync::Mutex::new(seed),
+        }
+    }
+
+    fn record(&self, entry: diff::DiffEntry) {
+        eprintln!("✎ {} via {}", entry.title(), entry.tool);
+        self.entries.lock().unwrap().push(entry);
+    }
+
+    fn snapshot(&self) -> Vec<diff::DiffEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    /// One line per touched file, in first-touched order, with per-file
+    /// totals across every change.
+    fn summary_lines(&self) -> Vec<String> {
+        let entries = self.entries.lock().unwrap();
+        let mut order: Vec<&str> = Vec::new();
+        let mut totals: std::collections::BTreeMap<&str, (usize, usize, usize)> =
+            std::collections::BTreeMap::new();
+        for entry in entries.iter() {
+            let slot = totals.entry(entry.path.as_str()).or_insert_with(|| {
+                order.push(entry.path.as_str());
+                (0, 0, 0)
+            });
+            slot.0 += entry.added;
+            slot.1 += entry.removed;
+            slot.2 += 1;
+        }
+        order
+            .into_iter()
+            .map(|path| {
+                let (added, removed, changes) = totals[path];
+                format!(
+                    "{path} +{added} −{removed}{}",
+                    if changes > 1 {
+                        format!(" ({changes} changes)")
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+            .collect()
+    }
+
+    fn print_summary(&self) {
+        let lines = self.summary_lines();
+        if lines.is_empty() {
+            return;
+        }
+        eprintln!("── changes ──");
+        for line in lines {
+            eprintln!("{line}");
+        }
+    }
 }
 
 /// Rich cumulative usage for this run, including the portion before resume.
@@ -847,12 +923,14 @@ fn checkpoint(
     runs: u32,
     context: &stage::PipelineContext,
     usage: &model::UsageTracker,
+    diffs: &DiffLedger,
 ) {
     state.position = position;
     state.runs = runs;
     state.previous = context.previous.clone();
     state.outputs = context.outputs.clone();
     state.usage = usage.snapshot();
+    state.diffs = diffs.snapshot();
     state.updated_at = tui::store::now_epoch();
     match runs::save_run(state) {
         Ok(()) if state.active_stage.is_none() => {
@@ -864,5 +942,31 @@ fn checkpoint(
         Err(error) => {
             eprintln!("⚠ cannot write run checkpoint: {error:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_ledger_aggregates_per_file_in_first_touched_order() {
+        let entry = |path: &str, added: usize, removed: usize| diff::DiffEntry {
+            tool: "edit_file".to_string(),
+            path: path.to_string(),
+            unified: String::new(),
+            added,
+            removed,
+            before: diff::Snapshot::Unavailable,
+        };
+        let ledger = DiffLedger::new(vec![entry("b.rs", 1, 0)]); // from a resumed checkpoint
+        ledger.entries.lock().unwrap().push(entry("a.rs", 10, 2));
+        ledger.entries.lock().unwrap().push(entry("b.rs", 3, 3));
+        assert_eq!(
+            ledger.summary_lines(),
+            vec!["b.rs +4 −3 (2 changes)", "a.rs +10 −2"]
+        );
+        assert!(DiffLedger::new(Vec::new()).summary_lines().is_empty());
+        assert_eq!(ledger.snapshot().len(), 3);
     }
 }

@@ -27,8 +27,12 @@ model's first plain-text reply is the stage's output. That output becomes
 `{{previous}}` for the next stage and `{{stage.<name>}}` for all later ones.
 
 Intermediate stage output and logs go to stderr; only the final stage's
-answer is printed to stdout, so `soa run` composes with pipes. Every run
-(including failed ones) ends with a `── usage ──` summary on stderr:
+answer is printed to stdout, so `soa run` composes with pipes. File edits
+are announced on stderr as they land (`✎ path (+a −r) via edit_file`) and
+recapped in a `── changes ──` summary at the end — one line per touched
+file with its cumulative +/− across the run, carried through checkpoints
+so a resumed run reports the whole picture. Every run
+(including failed ones) also ends with a `── usage ──` summary on stderr:
 per-model successful requests and attempts, failures, input/output tokens,
 known cost, provider latency, adapter/data-boundary attribution, wall time,
 and configured budget progress. Stage loops, subagents, retries, and fallback

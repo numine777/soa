@@ -75,6 +75,12 @@ pub struct RunState {
     /// stage boundary because this field defaults to `None`.
     #[serde(default)]
     pub active_stage: Option<StageProgress>,
+    /// File changes captured so far, so a resumed run's end-of-run change
+    /// summary covers the whole run. Persisted at stage boundaries: a
+    /// mid-stage interruption loses that stage's entries from the summary
+    /// (the edits themselves are on disk and will not re-run).
+    #[serde(default)]
+    pub diffs: Vec<crate::diff::DiffEntry>,
 }
 
 impl RunState {
@@ -93,6 +99,7 @@ impl RunState {
             outputs: BTreeMap::new(),
             usage: UsageSnapshot::default(),
             active_stage: None,
+            diffs: Vec::new(),
         }
     }
 }
@@ -273,6 +280,14 @@ mod tests {
             .outputs
             .insert("a".to_string(), "a says hi".to_string());
         state.usage.elapsed_ms = 1_234;
+        state.diffs.push(crate::diff::DiffEntry {
+            tool: "edit_file".to_string(),
+            path: "src/widget.rs".to_string(),
+            unified: String::new(),
+            added: 3,
+            removed: 1,
+            before: crate::diff::Snapshot::Unavailable,
+        });
         state.usage.models.insert(
             "coder".to_string(),
             crate::model::ModelUsage {
@@ -315,6 +330,11 @@ mod tests {
         assert_eq!(loaded.usage.models["coder"].requests, 2);
         assert_eq!(loaded.active_stage.as_ref().unwrap().stage, "b");
         assert_eq!(loaded.active_stage.as_ref().unwrap().events.len(), 2);
+        // Captured file changes survive the checkpoint for the resumed
+        // run's change summary.
+        assert_eq!(loaded.diffs.len(), 1);
+        assert_eq!(loaded.diffs[0].path, "src/widget.rs");
+        assert_eq!((loaded.diffs[0].added, loaded.diffs[0].removed), (3, 1));
         assert!(!runs_dir().join(format!(".{}.json.tmp", state.id)).exists());
 
         // Saving a hydrated active stage folds its event prefix into the

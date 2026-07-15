@@ -1,4 +1,8 @@
-# soa — staged orchestration for local models.
+# soa — staged orchestration for local models. ANNOTATED EXAMPLE.
+#
+# Copy this file to ~/.config/soa/soa.toml (user-level, or
+# $XDG_CONFIG_HOME/soa/soa.toml) or to ./soa.toml in a project, then adjust
+# the providers/models to your endpoints. `soa -c <path>` overrides both.
 #
 # Pipeline: `soa run "task"` executes each [[stage]] in order. A stage sends
 # its rendered prompt to its model and loops on tool calls until the model
@@ -50,16 +54,16 @@ provider_retries = 3
 # Anthropic's native Messages API. Protocol details stay isolated here.
 # ---------------------------------------------------------------------------
 
-[providers.spark]
+[providers.ollama]
 adapter = "open_ai_chat_completions"
-base_url = "http://192.168.6.7:8000/v1"
+base_url = "http://localhost:11434/v1"
 data_boundary = "local"            # mark hosted/proprietary APIs "external"
 
-[providers.threadripper]
+[providers.vllm]
 adapter = "open_ai_chat_completions"
-base_url = "http://192.168.5.188:8000/v1"
+base_url = "http://localhost:8000/v1"
 data_boundary = "local"
-# api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment
+# api_key = "${VLLM_API_KEY}"            # ${VAR} expands from the environment
 # Extra headers on every request (values support ${VAR}) — e.g. Azure's
 # api-key or OpenRouter's HTTP-Referer:
 # headers = { "x-portkey-provider" = "openai" }
@@ -80,8 +84,8 @@ data_boundary = "local"
 # ---------------------------------------------------------------------------
 
 [models.planner]
-provider = "spark"
-model = "qwen"
+provider = "ollama"
+model = "qwen3:32b"
 temperature = 0.7
 # Declaring the context window enables the real-usage gauge in the chat
 # status bar, auto-compaction, and mid-stage shedding of old tool results.
@@ -101,8 +105,8 @@ context_tokens = 131072
 # allow_external_fallback = true
 
 [models.coder]
-provider = "threadripper"
-model = "qwen-haiku"
+provider = "vllm"
+model = "qwen3-coder"
 temperature = 0.2
 max_tokens = 8192
 context_tokens = 131072
@@ -110,8 +114,8 @@ context_tokens = 131072
 # output_cost_per_million = 15.00
 
 [models.reviewer]
-provider = "spark"
-model = "qwen"
+provider = "ollama"
+model = "qwen3:32b"
 temperature = 0.7
 # input_cost_per_million = 0.20
 # output_cost_per_million = 0.80
@@ -125,7 +129,7 @@ temperature = 0.7
 [mcp.filesystem]
 transport = "stdio"
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/scott/personal"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/your/projects"]
 readonly_tools = ["read_file", "read_multiple_files", "list_directory", "search_files", "get_file_info", "directory_tree"]
 
 # [mcp.remote]

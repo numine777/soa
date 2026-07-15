@@ -1,1 +1,3 @@
 /target
+# Project-local config stays out of version control; see soa.example.toml.
+/soa.toml

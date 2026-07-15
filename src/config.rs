@@ -472,6 +472,40 @@ impl Agent {
 
 /// Resolve an inline-or-file prompt pair (mutual exclusivity is enforced
 /// during validation).
+/// The user-level config path: `$XDG_CONFIG_HOME/soa/soa.toml` (default
+/// `~/.config/soa/soa.toml`), mirroring the data-directory convention.
+pub fn user_config_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join(".config")
+        });
+    base.join("soa").join("soa.toml")
+}
+
+/// Which config file to load: an explicit `-c` path wins, then a
+/// project-local `./soa.toml`, then the user-level config.
+pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let local = PathBuf::from("soa.toml");
+    if local.exists() {
+        return Ok(local);
+    }
+    let user = user_config_path();
+    if user.exists() {
+        return Ok(user);
+    }
+    bail!(
+        "no configuration found — pass -c/--config, create ./soa.toml for this \
+         project, or create {} (the repository ships a complete annotated \
+         example as soa.example.toml)",
+        user.display()
+    )
+}
+
 /// Parse a configured `tool_choice` string into the canonical constraint.
 pub fn parse_tool_choice(raw: Option<&str>) -> Option<crate::model::ToolChoice> {
     match raw {
@@ -1268,7 +1302,7 @@ mod tests {
 
     #[test]
     fn example_config_parses() {
-        let raw = include_str!("../soa.toml");
+        let raw = include_str!("../soa.example.toml");
         let config: Config = toml::from_str(raw).unwrap();
         config.validate().unwrap();
         assert!(config.stages.len() >= 2);
@@ -1427,6 +1461,25 @@ mod tests {
         );
         let err = parse(&toml_str).unwrap_err().to_string();
         assert!(err.contains("invalid header name `bad header`"), "{err}");
+    }
+
+    #[test]
+    fn config_path_resolution_prefers_explicit_then_local_then_user() {
+        // An explicit path always wins, without touching the filesystem.
+        let explicit = resolve_config_path(Some(Path::new("/x/custom.toml"))).unwrap();
+        assert_eq!(explicit, PathBuf::from("/x/custom.toml"));
+
+        // The user-level location follows XDG_CONFIG_HOME.
+        let _guard = crate::tui::store::ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/soa-xdg-test") };
+        assert_eq!(
+            user_config_path(),
+            PathBuf::from("/tmp/soa-xdg-test/soa/soa.toml")
+        );
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let fallback = user_config_path();
+        assert!(fallback.ends_with(".config/soa/soa.toml"), "{fallback:?}");
     }
 
     #[test]

@@ -41,7 +41,7 @@ targets all report through the same run ledger.
 ## Commands
 
 ```sh
-soa check              # validate soa.toml (cross-references, templates, prompt files)
+soa check              # validate the config (cross-references, templates, prompt files)
 soa stages             # list the configured pipeline
 soa tools              # connect to every MCP server, list tools with ro/rw markers
 soa run "task"         # run the default workflow (or: echo "task" | soa run)
@@ -52,7 +52,8 @@ soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
 soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
-soa -c other.toml …    # use a different config file
+soa -c other.toml …    # explicit config (default: ./soa.toml, then
+                       #   ~/.config/soa/soa.toml — see Configuration)
 ```
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
@@ -262,7 +263,17 @@ session that grows later is reflected again.
 
 ## Configuration
 
-See [soa.toml](soa.toml) for a complete annotated example.
+soa looks for its configuration in this order: an explicit `-c/--config`
+path, a project-local `./soa.toml` in the current directory, then the
+user-level `$XDG_CONFIG_HOME/soa/soa.toml` (default
+`~/.config/soa/soa.toml`). Relative paths inside the config — prompt
+files, `skills_dir`, schema files — resolve against the config file's own
+directory, so a user-level config keeps its skills in
+`~/.config/soa/skills/`. `soa check` prints which file was loaded.
+
+See [soa.example.toml](soa.example.toml) for a complete annotated
+example; copy it to one of the locations above to get started.
+Project-local `soa.toml` files are gitignored in this repository.
 
 ### `[settings]`
 

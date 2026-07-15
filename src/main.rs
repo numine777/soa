@@ -31,9 +31,10 @@ use mcp::McpManager;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(short, long, default_value = "soa.toml", global = true)]
-    config: PathBuf,
+    /// Path to the configuration file (default: ./soa.toml if present,
+    /// else $XDG_CONFIG_HOME/soa/soa.toml — ~/.config/soa/soa.toml).
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -125,7 +126,8 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    let config = Config::load(&cli.config)?;
+    let config_path = config::resolve_config_path(cli.config.as_deref())?;
+    let config = Config::load(&config_path)?;
 
     match cli.command {
         Command::Check => {
@@ -146,6 +148,7 @@ async fn main() -> Result<()> {
                 skills::compose_system(&config, &format!("agent `{name}`"), system, &agent.skills)?;
                 agent.resolve_output_schema(&config.base_dir)?;
             }
+            println!("config: {}", config_path.display());
             println!(
                 "OK: {} provider(s), {} model(s), {} mcp server(s), {} agent(s), {} stage(s), {} workflow(s), {} hook(s)",
                 config.providers.len(),
@@ -365,7 +368,9 @@ async fn main() -> Result<()> {
         } => {
             tui::run(
                 config,
-                cli.config.clone(),
+                // The resolved path, so /reload re-reads the same file the
+                // session started with regardless of how it was found.
+                config_path.clone(),
                 stage.as_deref(),
                 !no_mouse,
                 resume.as_deref(),

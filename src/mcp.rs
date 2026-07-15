@@ -17,6 +17,9 @@ pub struct McpConnection {
     /// on the next tool call.
     server_config: McpServer,
     quiet: bool,
+    /// Cap on handshakes and individual tool calls, so a wedged (but not
+    /// crashed) server cannot hang a stage forever.
+    timeout: std::time::Duration,
     /// RwLock so concurrent tool calls proceed in parallel (read);
     /// reconnecting swaps the service exclusively (write).
     service: tokio::sync::RwLock<RunningService<RoleClient, ()>>,
@@ -30,17 +33,28 @@ pub struct McpConnection {
 impl McpConnection {
     /// `quiet` discards spawned servers' stderr instead of inheriting it —
     /// required in TUI mode, where stray writes would corrupt the display.
-    pub async fn connect(name: &str, config: &McpServer, quiet: bool) -> Result<McpConnection> {
-        let service = Self::establish(name, config, quiet).await?;
-        let tools = service
-            .list_all_tools()
+    pub async fn connect(
+        name: &str,
+        config: &McpServer,
+        quiet: bool,
+        timeout: std::time::Duration,
+    ) -> Result<McpConnection> {
+        let service = Self::establish(name, config, quiet, timeout).await?;
+        let tools = tokio::time::timeout(timeout, service.list_all_tools())
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "mcp `{name}`: tools/list timed out after {}s",
+                    timeout.as_secs()
+                )
+            })?
             .with_context(|| format!("mcp `{name}`: tools/list failed"))?;
 
         Ok(McpConnection {
             name: name.to_string(),
             server_config: config.clone(),
             quiet,
+            timeout,
             service: tokio::sync::RwLock::new(service),
             generation: std::sync::atomic::AtomicU64::new(0),
             tools,
@@ -49,6 +63,22 @@ impl McpConnection {
     }
 
     async fn establish(
+        name: &str,
+        config: &McpServer,
+        quiet: bool,
+        timeout: std::time::Duration,
+    ) -> Result<RunningService<RoleClient, ()>> {
+        tokio::time::timeout(timeout, Self::establish_inner(name, config, quiet))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "mcp `{name}`: initialize handshake timed out after {}s",
+                    timeout.as_secs()
+                )
+            })?
+    }
+
+    async fn establish_inner(
         name: &str,
         config: &McpServer,
         quiet: bool,
@@ -157,9 +187,17 @@ impl McpConnection {
         arguments: JsonObject,
     ) -> Result<rmcp::model::CallToolResult> {
         let service = self.service.read().await;
-        service
-            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
+        let call = service
+            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments));
+        tokio::time::timeout(self.timeout, call)
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "mcp `{}`: `{tool_name}` timed out after {}s",
+                    self.name,
+                    self.timeout.as_secs()
+                )
+            })?
             .with_context(|| format!("mcp `{}`: call to `{tool_name}` failed", self.name))
     }
 
@@ -173,7 +211,8 @@ impl McpConnection {
         if self.generation.load(Ordering::Acquire) != observed {
             return Ok(()); // another caller already reconnected
         }
-        let fresh = Self::establish(&self.name, &self.server_config, self.quiet).await?;
+        let fresh =
+            Self::establish(&self.name, &self.server_config, self.quiet, self.timeout).await?;
         let dead = std::mem::replace(&mut *service, fresh);
         self.generation.fetch_add(1, Ordering::Release);
         drop(service);
@@ -218,10 +257,11 @@ impl McpManager {
         // startup for process-backed servers. Resolve every name first, then
         // connect all of them concurrently so an invalid reference never
         // leaves a partially started manager.
+        let timeout = std::time::Duration::from_secs(config.settings.mcp_timeout_secs);
         let results = futures_util::future::join_all(requested.into_iter().map(
             |(name, server_config)| async move {
                 tracing::info!(server = %name, "connecting to MCP server");
-                let result = McpConnection::connect(&name, &server_config, quiet).await;
+                let result = McpConnection::connect(&name, &server_config, quiet, timeout).await;
                 (name, result)
             },
         ))

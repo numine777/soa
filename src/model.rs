@@ -105,6 +105,10 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Real token counts, when the provider reports them.
     pub usage: Option<Usage>,
+    /// Set when the provider cut the generation short (e.g. a `length` or
+    /// `content_filter` finish reason) — the response is incomplete, not a
+    /// deliberate stop.
+    pub truncation: Option<String>,
 }
 
 /// Callback invoked with each streamed text fragment.
@@ -145,6 +149,12 @@ impl AdapterError {
             retryable,
             retry_after,
         }
+    }
+
+    /// Whether the retry loop may re-attempt after this failure.
+    #[cfg(test)]
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 
@@ -883,6 +893,7 @@ mod tests {
                         prompt_tokens: 3,
                         completion_tokens: 1,
                     }),
+                    truncation: None,
                 })
             })
         }
@@ -904,6 +915,7 @@ mod tests {
                     content: Some("late".to_string()),
                     tool_calls: Vec::new(),
                     usage: Some(Usage::default()),
+                    truncation: None,
                 })
             })
         }

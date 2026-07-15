@@ -500,6 +500,10 @@ fn edit_lines(
         Err(e) => return format!("ERROR: cannot read `{path}`: {e}"),
     };
     let had_trailing_newline = content.ends_with('\n');
+    // `lines()` strips `\r`, so rejoining with `\n` would silently convert
+    // a CRLF file to LF. Rejoin with the file's own line ending instead
+    // (mixed-ending files are normalized to CRLF if any line uses it).
+    let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<&str> = content.lines().collect();
 
     // An anchor is only usable if the line it names still has the content
@@ -549,9 +553,9 @@ fn edit_lines(
         updated.extend(&replacement);
         updated.extend(&lines[last_line..]);
     }
-    let mut new_content = updated.join("\n");
+    let mut new_content = updated.join(eol);
     if had_trailing_newline && !new_content.is_empty() {
-        new_content.push('\n');
+        new_content.push_str(eol);
     }
     if let Err(e) = std::fs::write(&resolved, new_content) {
         return format!("ERROR: cannot write `{path}`: {e}");
@@ -1036,6 +1040,31 @@ mod tests {
             .contains("not a line anchor"));
         assert!(edit_lines(&cwd, "src/main.rs", "99:abcd", None, "x", false)
             .contains("out of range"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn edit_lines_preserves_crlf_line_endings() {
+        let cwd = project("crlf");
+        std::fs::write(cwd.join("win.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+        // Anchors hash the logical line (no \r), same as read_file shows.
+        let anchor = format!("2:{}", line_hash("beta"));
+        let reply = edit_lines(&cwd, "win.txt", &anchor, None, "BETA", false);
+        assert!(reply.starts_with("edited `win.txt`"), "{reply}");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("win.txt")).unwrap(),
+            "alpha\r\nBETA\r\ngamma\r\n",
+            "untouched lines and the trailing newline must stay CRLF"
+        );
+
+        // Insertion adopts the file's line ending too.
+        let anchor = format!("1:{}", line_hash("alpha"));
+        edit_lines(&cwd, "win.txt", &anchor, None, "inserted", true);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("win.txt")).unwrap(),
+            "alpha\r\ninserted\r\nBETA\r\ngamma\r\n"
+        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

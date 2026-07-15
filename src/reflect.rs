@@ -278,7 +278,15 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     let proposal = parse_proposal(&text)
         .with_context(|| format!("model did not return usable JSON:\n{}", excerpt(&text, 400)))?;
 
-    let lessons = validate_lessons(proposal.lessons);
+    let (lessons, wipe_refused) =
+        guard_lesson_wipe(&existing_lessons, validate_lessons(proposal.lessons));
+    if wipe_refused {
+        eprintln!(
+            "⚠ the model proposed deleting all {} lesson(s); keeping the existing list — \
+             edit the lessons block in the file directly if you really want it cleared",
+            existing_lessons.len()
+        );
+    }
     let skills: Vec<(String, SkillProposal)> = proposal
         .skills
         .into_iter()
@@ -499,6 +507,18 @@ fn validate_lessons(lessons: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Refuse to replace a non-empty lesson list with nothing: a lazy or
+/// confused model returning `"lessons": []` must not wipe accumulated
+/// memory. Deleting everything is a human decision (edit the block in the
+/// file directly). Returns the list to keep and whether the guard fired.
+fn guard_lesson_wipe(existing: &[String], proposed: Vec<String>) -> (Vec<String>, bool) {
+    if proposed.is_empty() && !existing.is_empty() {
+        (existing.to_vec(), true)
+    } else {
+        (proposed, false)
+    }
+}
+
 /// A safe skill filename: lowercase kebab-case, or None if nothing usable
 /// remains.
 fn slug(name: &str) -> Option<String> {
@@ -669,6 +689,24 @@ mod tests {
         assert_eq!(lessons[0], "spaced out");
         assert_eq!(lessons.len(), 2); // the empty one is dropped
         assert!(lessons[1].chars().count() <= MAX_LESSON_CHARS + 1);
+    }
+
+    #[test]
+    fn empty_proposal_cannot_wipe_existing_lessons() {
+        let existing = vec!["always run tests".to_string()];
+
+        // An empty replacement of a non-empty list is refused...
+        let (kept, refused) = guard_lesson_wipe(&existing, Vec::new());
+        assert!(refused);
+        assert_eq!(kept, existing);
+
+        // ...but a real replacement, and an empty-to-empty answer, pass through.
+        let (kept, refused) = guard_lesson_wipe(&existing, vec!["new rule".to_string()]);
+        assert!(!refused);
+        assert_eq!(kept, vec!["new rule".to_string()]);
+        let (kept, refused) = guard_lesson_wipe(&[], Vec::new());
+        assert!(!refused);
+        assert!(kept.is_empty());
     }
 
     #[test]

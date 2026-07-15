@@ -218,7 +218,10 @@ rewrites two kinds of durable memory:
   `SOA.md`, which reaches every stage and agent automatically via
   `context_files`. The model returns the complete replacement list each
   run, so lessons are consolidated and pruned instead of accreting
-  forever; hand-written content outside the block is never touched.
+  forever; hand-written content outside the block is never touched. A
+  proposal that would replace a non-empty list with nothing is refused —
+  wiping all lessons is a human decision, made by editing the block
+  directly.
 - **Skills** — occasionally, a recurring multi-step procedure is written
   up as a skill file in the project skills directory, ready to attach with
   `skills = [...]`. Reflect only overwrites skill files it authored
@@ -252,6 +255,7 @@ See [soa.toml](soa.toml) for a complete annotated example.
 | `max_agent_depth` | 2 | how deep subagent delegation may nest (agents stop being offered as tools at this depth) |
 | `auto_compact_threshold` | 0.8 | when real token usage crosses this fraction of a model's `context_tokens`, chat auto-compacts and stage/agent loops truncate older tool results (0 disables; needs `context_tokens` on the model) |
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
+| `mcp_timeout_secs` | 60 | MCP handshakes and individual tool calls are abandoned after this many seconds, so a wedged (but not crashed) server can't hang a stage; an abandoned call triggers the usual reconnect-and-retry |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
 | `context_files` | `["SOA.md"]` | project-instruction files, each discovered by walking up from the working directory and sourced into every system prompt in the listed order (see below) |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
@@ -291,6 +295,14 @@ boundary. Directly selecting such a provider is explicit consent to send the
 stage or agent context there. A fallback is less visible, so soa rejects any
 local-to-external fallback edge unless the source model sets
 `allow_external_fallback = true`.
+
+Error handling reads past the status code: gateways that report failures
+as an in-band `{"error": …}` event on a 200 stream are classified properly
+(rate limits and overloads retry; invalid requests fail fast), and a
+response cut short by the provider (`length`, `content_filter`) is flagged
+— the stage log warns, and a truncated final answer carries a visible
+`[warning: … truncated …]` marker into `{{previous}}` and the transcript
+instead of masquerading as complete.
 
 Responses stream token-by-token everywhere: live in the chat TUI (with a
 `▌` cursor while text arrives), and to stderr during `soa run` so you can

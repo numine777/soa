@@ -68,10 +68,15 @@ impl OpenAiChatCompletions {
                         .context(format!("unexpected response from {url}: {body}")),
                 )
             })?;
+            if let Some(error) = parsed.error {
+                return Err(in_band_error(&error, &url));
+            }
             let choice = parsed.choices.into_iter().next().ok_or_else(|| {
                 AdapterError::fatal(anyhow!("provider returned no choices from {url}"))
             })?;
-            let result = choice.message.into_canonical(parsed.usage.map(Into::into));
+            let result = choice
+                .message
+                .into_canonical(parsed.usage.map(Into::into), choice.finish_reason);
             if let (Some(handler), Some(content)) = (on_delta, result.content.as_deref()) {
                 handler(content);
             }
@@ -296,8 +301,61 @@ fn apply_sse_event(
                 .context(format!("unexpected stream event from {url}: {data}")),
         )
     })?;
+    // Many OpenAI-compatible gateways report failures as an in-band
+    // `{"error": ...}` event on a 200 stream. Surface it as the classified
+    // failure it is instead of letting the stream "end before finished".
+    if let Some(error) = parsed.error {
+        return Err(in_band_error(&error, url));
+    }
     accumulator.apply(parsed, on_delta);
     Ok(false)
+}
+
+/// Classify an in-band `error` object from a 200 response. Rate limiting,
+/// overload, and server-side failures are worth retrying; everything else
+/// (invalid request, context overflow, content policy) is fatal.
+fn in_band_error(error: &Value, url: &str) -> AdapterError {
+    let code = error
+        .get("code")
+        .map(|code| match code {
+            Value::Number(number) => number.to_string(),
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let retryable = matches!(code.as_str(), "408" | "429" | "500" | "502" | "503" | "504")
+        || [kind, code.as_str(), message.as_str()].iter().any(|text| {
+            let text = text.to_ascii_lowercase();
+            ["rate_limit", "rate limit", "overloaded", "server_error", "timeout", "temporar"]
+                .iter()
+                .any(|marker| text.contains(marker))
+        });
+    let detail = if code.is_empty() && kind.is_empty() {
+        message
+    } else {
+        format!("{message} (code: {code}, type: {kind})")
+    };
+    AdapterError::classified(
+        anyhow!("provider error from {url}: {detail}"),
+        retryable,
+        None,
+    )
+}
+
+/// A finish reason that means the provider cut the generation short rather
+/// than the model stopping deliberately.
+fn truncation_reason(finish_reason: Option<String>) -> Option<String> {
+    finish_reason
+        .filter(|reason| !matches!(reason.as_str(), "stop" | "tool_calls" | "function_call"))
 }
 
 impl ProviderAdapter for OpenAiChatCompletions {
@@ -459,13 +517,17 @@ struct StreamOptions {
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
+    #[serde(default)]
     choices: Vec<Choice>,
     usage: Option<UsageWire>,
+    /// Some gateways return an error object with HTTP 200.
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,11 +538,12 @@ struct ResponseMessage {
 }
 
 impl ResponseMessage {
-    fn into_canonical(self, usage: Option<Usage>) -> ModelResponse {
+    fn into_canonical(self, usage: Option<Usage>, finish_reason: Option<String>) -> ModelResponse {
         ModelResponse {
             content: self.content,
             tool_calls: self.tool_calls.into_iter().map(Into::into).collect(),
             usage,
+            truncation: truncation_reason(finish_reason),
         }
     }
 }
@@ -533,6 +596,8 @@ struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
     usage: Option<UsageWire>,
+    /// Some gateways report failures as an in-band event on a 200 stream.
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -569,6 +634,7 @@ struct StreamAccumulator {
     tool_calls: Vec<ToolCall>,
     usage: Option<Usage>,
     finished: bool,
+    finish_reason: Option<String>,
 }
 
 impl StreamAccumulator {
@@ -577,8 +643,9 @@ impl StreamAccumulator {
             self.usage = chunk.usage.map(Into::into);
         }
         for choice in chunk.choices {
-            if choice.finish_reason.is_some() {
+            if let Some(reason) = choice.finish_reason {
                 self.finished = true;
+                self.finish_reason = Some(reason);
             }
             if let Some(text) = choice.delta.content
                 && !text.is_empty()
@@ -621,6 +688,7 @@ impl StreamAccumulator {
             content: (!self.content.is_empty()).then_some(self.content),
             tool_calls: self.tool_calls,
             usage: self.usage,
+            truncation: truncation_reason(self.finish_reason),
         }
     }
 }
@@ -709,18 +777,16 @@ mod tests {
             r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#,
         )
         .unwrap();
-        let response = parsed
-            .choices
-            .into_iter()
-            .next()
-            .unwrap()
+        let choice = parsed.choices.into_iter().next().unwrap();
+        let response = choice
             .message
-            .into_canonical(parsed.usage.map(Into::into));
+            .into_canonical(parsed.usage.map(Into::into), choice.finish_reason);
 
         assert!(response.content.is_none());
         assert_eq!(response.tool_calls[0].id, "c1");
         assert_eq!(response.tool_calls[0].function.name, "read_file");
         assert_eq!(response.usage.unwrap().context_tokens(), 11);
+        assert!(response.truncation.is_none());
     }
 
     #[test]
@@ -822,6 +888,62 @@ mod tests {
                 SseEvent::Data("two".to_string()),
                 SseEvent::Done,
             ]
+        );
+    }
+
+    #[test]
+    fn in_band_error_events_are_surfaced_and_classified() {
+        // A rate-limit error on a 200 stream is worth retrying...
+        let rate_limited = apply_sse_event(
+            SseEvent::Data(
+                r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error","code":429}}"#
+                    .into(),
+            ),
+            &mut StreamAccumulator::default(),
+            None,
+            "http://test/v1",
+        )
+        .unwrap_err();
+        assert!(rate_limited.is_retryable());
+
+        // ...but an invalid request (e.g. context overflow) is fatal, not
+        // "stream ended before the generation finished".
+        let fatal = apply_sse_event(
+            SseEvent::Data(
+                r#"{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}"#
+                    .into(),
+            ),
+            &mut StreamAccumulator::default(),
+            None,
+            "http://test/v1",
+        )
+        .unwrap_err();
+        assert!(!fatal.is_retryable());
+
+        // Non-streaming 200 bodies with an error object classify the same way.
+        let parsed: ChatResponse =
+            serde_json::from_str(r#"{"error":{"message":"overloaded","code":"503"}}"#).unwrap();
+        assert!(in_band_error(&parsed.error.unwrap(), "http://test/v1").is_retryable());
+    }
+
+    #[test]
+    fn abnormal_finish_reasons_are_reported_as_truncation() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.apply(
+            chunk(r#"{"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}"#),
+            None,
+        );
+        assert!(accumulator.finished);
+        let response = accumulator.finish();
+        assert_eq!(response.truncation.as_deref(), Some("length"));
+
+        // Deliberate stops are not truncation.
+        assert_eq!(truncation_reason(Some("stop".into())), None);
+        assert_eq!(truncation_reason(Some("tool_calls".into())), None);
+        assert_eq!(truncation_reason(None), None);
+        assert_eq!(
+            truncation_reason(Some("content_filter".into())).as_deref(),
+            Some("content_filter")
         );
     }
 

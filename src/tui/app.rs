@@ -186,6 +186,9 @@ pub struct App {
     pub session_list: Vec<Session>,
     /// Set once the user has submitted something; empty sessions aren't saved.
     has_activity: bool,
+    /// A save failure is reported once, not on every subsequent persist;
+    /// saving keeps being attempted and a success clears the flag.
+    persist_error_shown: bool,
     // Prompt history (shell-style recall with Up/Down).
     prompt_history: PromptHistory,
     /// Position while browsing the prompt history; None = not browsing.
@@ -257,6 +260,7 @@ impl App {
             cwd: store::current_cwd(),
             session_list: Vec::new(),
             has_activity: false,
+            persist_error_shown: false,
             prompt_history: PromptHistory::load(),
             recall_index: None,
             recall_draft: String::new(),
@@ -341,9 +345,17 @@ impl App {
             transcript_baseline: self.transcript_baseline,
             diff_baseline: self.diff_baseline,
         };
-        if let Err(e) = store::save_session(&session) {
-            self.has_activity = false; // avoid an error loop
-            self.error(format!("failed to save session: {e:#}"));
+        match store::save_session(&session) {
+            Ok(()) => self.persist_error_shown = false,
+            // Keep trying on later persists — a transient disk error must
+            // not silently stop session saving — but report it only once.
+            Err(e) if !self.persist_error_shown => {
+                self.persist_error_shown = true;
+                self.error(format!(
+                    "failed to save session (will keep retrying): {e:#}"
+                ));
+            }
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "session save failed again"),
         }
     }
 

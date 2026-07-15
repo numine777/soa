@@ -108,6 +108,10 @@ pub struct Settings {
     /// this many seconds.
     #[serde(default = "default_shell_timeout")]
     pub shell_timeout_secs: u64,
+    /// MCP handshakes and tool calls are abandoned after this many seconds,
+    /// so a wedged (but not crashed) server cannot hang a stage forever.
+    #[serde(default = "default_mcp_timeout")]
+    pub mcp_timeout_secs: u64,
     /// Directory holding skills, relative to the config file (default
     /// `skills/`). The global `~/.local/share/soa/skills` is also searched.
     pub skills_dir: Option<PathBuf>,
@@ -154,6 +158,7 @@ impl Default for Settings {
             provider_retries: default_provider_retries(),
             request_timeout_secs: default_timeout(),
             shell_timeout_secs: default_shell_timeout(),
+            mcp_timeout_secs: default_mcp_timeout(),
             skills_dir: None,
             default_workflow: None,
             context_files: default_context_files(),
@@ -178,6 +183,10 @@ fn default_context_files() -> Vec<PathBuf> {
 
 fn default_shell_timeout() -> u64 {
     120
+}
+
+fn default_mcp_timeout() -> u64 {
+    60
 }
 
 fn default_search_results() -> usize {
@@ -865,6 +874,13 @@ impl Config {
                 "settings.default_workflow references unknown workflow `{default}`"
             ));
         }
+        if let Some(model) = &self.settings.reflect_model
+            && !self.models.contains_key(model)
+        {
+            errors.push(format!(
+                "settings.reflect_model references unknown model `{model}`"
+            ));
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -1249,6 +1265,16 @@ mod tests {
             )
         );
         assert!(parse(&toml_str).is_ok());
+    }
+
+    #[test]
+    fn reflect_model_must_reference_a_configured_model() {
+        let toml_str = format!("{MINIMAL}\n[settings]\nreflect_model = \"ghost\"\n");
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(
+            err.contains("reflect_model references unknown model `ghost`"),
+            "{err}"
+        );
     }
 
     #[test]

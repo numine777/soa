@@ -1320,13 +1320,35 @@ pub async fn run_agent_loop(
         {
             handler("\n");
         }
+        if let Some(reason) = reply.truncation.as_deref() {
+            tracing::warn!(
+                owner_kind = options.owner_kind,
+                owner = options.owner,
+                reason,
+                "provider cut the response short"
+            );
+            observe_loop(
+                options.on_observation,
+                AgentLoopObservation::Notice(format!(
+                    "response truncated by the provider ({reason}) — it is incomplete"
+                )),
+            );
+        }
 
         if reply.tool_calls.is_empty() {
+            let mut answer = reply.content.unwrap_or_default();
+            // A cut-off answer must not masquerade as a complete one: the
+            // marker travels with it into {{previous}} and the transcript.
+            if let Some(reason) = &reply.truncation {
+                answer.push_str(&format!(
+                    "\n\n[warning: this response was truncated by the provider ({reason}) and is incomplete]"
+                ));
+            }
             record_loop_event(
                 &mut events,
                 options.on_event,
                 AgentLoopEvent::Finished {
-                    outcome: StageOutcome::Final(reply.content.unwrap_or_default()),
+                    outcome: StageOutcome::Final(answer),
                     usage: reply.usage,
                 },
             );
@@ -1735,6 +1757,7 @@ mod tests {
                         prompt_tokens: 20,
                         completion_tokens: 1,
                     }),
+                    truncation: None,
                 })
             })
         }

@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::sse::{SseDecoder, SseEvent};
 use crate::model::{
     AdapterError, AdapterFuture, DeltaHandler, FunctionCall, Message, ModelRequest, ModelResponse,
     ProviderAdapter, ToolCall, ToolDefinition, Usage,
@@ -15,15 +16,32 @@ pub struct OpenAiChatCompletions {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    headers: reqwest::header::HeaderMap,
 }
 
 impl OpenAiChatCompletions {
-    pub fn new(http: reqwest::Client, base_url: &str, api_key: Option<String>) -> Self {
-        Self {
+    pub fn new(
+        http: reqwest::Client,
+        base_url: &str,
+        api_key: Option<String>,
+        headers: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (key, value) in headers {
+            header_map.insert(
+                key.parse::<reqwest::header::HeaderName>()
+                    .map_err(|_| anyhow!("invalid header name `{key}`"))?,
+                value
+                    .parse::<reqwest::header::HeaderValue>()
+                    .map_err(|_| anyhow!("invalid value for header `{key}`"))?,
+            );
+        }
+        Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-        }
+            headers: header_map,
+        })
     }
 
     async fn complete_inner(
@@ -34,6 +52,9 @@ impl OpenAiChatCompletions {
         let request = ChatRequest::from_canonical(canonical);
         let url = format!("{}/chat/completions", self.base_url);
         let mut builder = self.http.post(&url).json(&request);
+        if !self.headers.is_empty() {
+            builder = builder.headers(self.headers.clone());
+        }
         if let Some(key) = &self.api_key
             && !key.is_empty()
         {
@@ -132,155 +153,6 @@ impl OpenAiChatCompletions {
 
         Ok(accumulator.finish())
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SseEvent {
-    Data(String),
-    Done,
-}
-
-/// Incremental Server-Sent Events decoder. It handles LF, CRLF, and CR line
-/// endings, comments/other fields, multiple `data:` lines, fragmented UTF-8,
-/// and a final event without a trailing blank line. Consumed bytes are
-/// compacted once per HTTP chunk rather than drained once per line.
-#[derive(Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-    data: Vec<u8>,
-    has_data: bool,
-    first_line: bool,
-}
-
-impl SseDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
-        self.buffer.extend_from_slice(chunk);
-        self.parse(false)
-    }
-
-    fn finish(&mut self) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
-        self.parse(true)
-    }
-
-    fn parse(&mut self, eof: bool) -> Result<Vec<SseEvent>, std::string::FromUtf8Error> {
-        let mut events = Vec::new();
-        let mut consumed = 0usize;
-        loop {
-            let mut terminator = None;
-            for index in consumed..self.buffer.len() {
-                match self.buffer[index] {
-                    b'\n' => {
-                        terminator = Some((index, index + 1));
-                        break;
-                    }
-                    b'\r' if index + 1 < self.buffer.len() => {
-                        terminator = Some((
-                            index,
-                            index + 1 + usize::from(self.buffer[index + 1] == b'\n'),
-                        ));
-                        break;
-                    }
-                    b'\r' if eof => {
-                        terminator = Some((index, index + 1));
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            let Some((line_end, next)) = terminator else {
-                if eof && consumed < self.buffer.len() {
-                    let line = &self.buffer[consumed..];
-                    process_sse_line(
-                        line,
-                        &mut self.data,
-                        &mut self.has_data,
-                        &mut self.first_line,
-                        &mut events,
-                    )?;
-                    consumed = self.buffer.len();
-                }
-                break;
-            };
-            let line = &self.buffer[consumed..line_end];
-            process_sse_line(
-                line,
-                &mut self.data,
-                &mut self.has_data,
-                &mut self.first_line,
-                &mut events,
-            )?;
-            consumed = next;
-        }
-
-        if consumed == self.buffer.len() {
-            self.buffer.clear();
-        } else if consumed > 0 {
-            self.buffer.drain(..consumed);
-        }
-        if eof && self.has_data {
-            dispatch_sse_data(&mut self.data, &mut self.has_data, &mut events)?;
-        }
-        Ok(events)
-    }
-}
-
-fn process_sse_line(
-    mut line: &[u8],
-    data: &mut Vec<u8>,
-    has_data: &mut bool,
-    first_line: &mut bool,
-    events: &mut Vec<SseEvent>,
-) -> Result<(), std::string::FromUtf8Error> {
-    if !*first_line {
-        *first_line = true;
-        line = line.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(line);
-    }
-    if line.is_empty() {
-        if *has_data {
-            dispatch_sse_data(data, has_data, events)?;
-        }
-        return Ok(());
-    }
-    if line[0] == b':' {
-        return Ok(());
-    }
-    let colon = line
-        .iter()
-        .position(|byte| *byte == b':')
-        .unwrap_or(line.len());
-    if &line[..colon] != b"data" {
-        return Ok(());
-    }
-    let mut value = if colon < line.len() {
-        &line[colon + 1..]
-    } else {
-        b""
-    };
-    if value.first() == Some(&b' ') {
-        value = &value[1..];
-    }
-    if *has_data {
-        data.push(b'\n');
-    }
-    data.extend_from_slice(value);
-    *has_data = true;
-    Ok(())
-}
-
-fn dispatch_sse_data(
-    data: &mut Vec<u8>,
-    has_data: &mut bool,
-    events: &mut Vec<SseEvent>,
-) -> Result<(), std::string::FromUtf8Error> {
-    let value = String::from_utf8(std::mem::take(data))?;
-    *has_data = false;
-    if value == "[DONE]" {
-        events.push(SseEvent::Done);
-    } else {
-        events.push(SseEvent::Data(value));
-    }
-    Ok(())
 }
 
 fn apply_sse_event(
@@ -471,7 +343,7 @@ impl<'a> ToolCallWire<'a> {
             kind: "function",
             function: FunctionCallWire {
                 name: &call.function.name,
-                arguments: &call.function.arguments,
+                arguments: encode_arguments(&call.function.arguments),
             },
         }
     }
@@ -480,7 +352,27 @@ impl<'a> ToolCallWire<'a> {
 #[derive(Serialize)]
 struct FunctionCallWire<'a> {
     name: &'a str,
-    arguments: &'a str,
+    /// The chat-completions wire format carries arguments as a JSON-encoded
+    /// string.
+    arguments: String,
+}
+
+fn encode_arguments(arguments: &Value) -> String {
+    match arguments {
+        Value::Null => "{}".to_string(),
+        // A malformed round-trip survivor: send the raw text back verbatim.
+        Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The inverse: parse the wire string into the canonical structured form,
+/// preserving malformed output as a raw string so dispatch can report it.
+fn decode_arguments(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 #[derive(Serialize)]
@@ -561,7 +453,7 @@ impl From<ResponseToolCall> for ToolCall {
             id: call.id,
             function: FunctionCall {
                 name: call.function.name,
-                arguments: call.function.arguments,
+                arguments: decode_arguments(&call.function.arguments),
             },
         }
     }
@@ -580,6 +472,20 @@ struct UsageWire {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 impl From<UsageWire> for Usage {
@@ -587,6 +493,14 @@ impl From<UsageWire> for Usage {
         Self {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
+            cache_read_tokens: usage
+                .prompt_tokens_details
+                .map(|details| details.cached_tokens)
+                .unwrap_or_default(),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .map(|details| details.reasoning_tokens)
+                .unwrap_or_default(),
         }
     }
 }
@@ -631,10 +545,19 @@ struct FunctionDelta {
 #[derive(Default)]
 struct StreamAccumulator {
     content: String,
-    tool_calls: Vec<ToolCall>,
+    tool_calls: Vec<PartialToolCall>,
     usage: Option<Usage>,
     finished: bool,
     finish_reason: Option<String>,
+}
+
+/// A tool call still being assembled from stream deltas; arguments stay a
+/// raw string until the stream ends.
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl StreamAccumulator {
@@ -657,13 +580,7 @@ impl StreamAccumulator {
             }
             for delta in choice.delta.tool_calls.unwrap_or_default() {
                 while self.tool_calls.len() <= delta.index {
-                    self.tool_calls.push(ToolCall {
-                        id: String::new(),
-                        function: FunctionCall {
-                            name: String::new(),
-                            arguments: String::new(),
-                        },
-                    });
+                    self.tool_calls.push(PartialToolCall::default());
                 }
                 let slot = &mut self.tool_calls[delta.index];
                 if let Some(id) = delta.id
@@ -673,10 +590,10 @@ impl StreamAccumulator {
                 }
                 if let Some(function) = delta.function {
                     if let Some(name) = function.name {
-                        slot.function.name.push_str(&name);
+                        slot.name.push_str(&name);
                     }
                     if let Some(arguments) = function.arguments {
-                        slot.function.arguments.push_str(&arguments);
+                        slot.arguments.push_str(&arguments);
                     }
                 }
             }
@@ -686,7 +603,17 @@ impl StreamAccumulator {
     fn finish(self) -> ModelResponse {
         ModelResponse {
             content: (!self.content.is_empty()).then_some(self.content),
-            tool_calls: self.tool_calls,
+            tool_calls: self
+                .tool_calls
+                .into_iter()
+                .map(|call| ToolCall {
+                    id: call.id,
+                    function: FunctionCall {
+                        name: call.name,
+                        arguments: decode_arguments(&call.arguments),
+                    },
+                })
+                .collect(),
             usage: self.usage,
             truncation: truncation_reason(self.finish_reason),
         }
@@ -732,7 +659,7 @@ mod tests {
                     id: "c1".into(),
                     function: FunctionCall {
                         name: "read_file".into(),
-                        arguments: r#"{"path":"x"}"#.into(),
+                        arguments: json!({"path": "x"}),
                     },
                 }]),
             },
@@ -755,6 +682,12 @@ mod tests {
         let wire = serde_json::to_value(request).unwrap();
         assert_eq!(wire["model"], "coder");
         assert_eq!(wire["messages"][1]["tool_calls"][0]["type"], "function");
+        // The wire format carries arguments as a JSON-encoded string even
+        // though the canonical form is structured.
+        assert_eq!(
+            wire["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"x"}"#
+        );
         assert_eq!(wire["tools"][0]["type"], "function");
         assert_eq!(wire["stream_options"]["include_usage"], true);
 
@@ -787,6 +720,26 @@ mod tests {
         assert_eq!(response.tool_calls[0].function.name, "read_file");
         assert_eq!(response.usage.unwrap().context_tokens(), 11);
         assert!(response.truncation.is_none());
+    }
+
+    #[test]
+    fn usage_details_map_to_cache_and_reasoning_tokens() {
+        let wire: UsageWire = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":50,
+                "prompt_tokens_details":{"cached_tokens":80,"audio_tokens":0},
+                "completion_tokens_details":{"reasoning_tokens":30}}"#,
+        )
+        .unwrap();
+        let usage: Usage = wire.into();
+        assert_eq!(usage.cache_read_tokens, 80);
+        assert_eq!(usage.reasoning_tokens, 30);
+
+        // Providers that omit the detail objects report zeros.
+        let plain: UsageWire =
+            serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5}"#).unwrap();
+        let usage: Usage = plain.into();
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
     }
 
     #[test]
@@ -841,55 +794,15 @@ mod tests {
         assert_eq!(response.tool_calls.len(), 2);
         assert_eq!(response.tool_calls[0].id, "c1");
         assert_eq!(response.tool_calls[0].function.name, "write_file");
-        assert_eq!(response.tool_calls[0].function.arguments, r#"{"path":"x"}"#);
+        // Fragments assemble into the structured canonical form.
+        assert_eq!(response.tool_calls[0].function.arguments, json!({"path": "x"}));
         assert_eq!(response.tool_calls[1].function.name, "read_file");
+        assert_eq!(response.tool_calls[1].function.arguments, json!({}));
         assert!(response.content.is_none());
     }
 
-    #[test]
-    fn sse_decoder_handles_fragmented_multiline_events_and_crlf() {
-        let mut decoder = SseDecoder::default();
-        assert!(
-            decoder
-                .push(b": keepalive\r\nid: 1\r\nda")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(decoder.push(b"ta: {\"value\":\r\n").unwrap().is_empty());
-        assert_eq!(
-            decoder.push(b"data: 1}\r\n\r\n").unwrap(),
-            vec![SseEvent::Data("{\"value\":\n1}".to_string())]
-        );
-    }
 
-    #[test]
-    fn sse_decoder_preserves_split_utf8_and_finishes_unterminated_event() {
-        let mut decoder = SseDecoder::default();
-        let event = "data: {\"text\":\"hé\"}".as_bytes();
-        let split = event.iter().position(|byte| *byte == 0xc3).unwrap() + 1;
-        assert!(decoder.push(&event[..split]).unwrap().is_empty());
-        assert!(decoder.push(&event[split..]).unwrap().is_empty());
-        assert_eq!(
-            decoder.finish().unwrap(),
-            vec![SseEvent::Data("{\"text\":\"hé\"}".to_string())]
-        );
-    }
 
-    #[test]
-    fn sse_decoder_handles_many_events_done_and_bom() {
-        let mut decoder = SseDecoder::default();
-        let events = decoder
-            .push(b"\xef\xbb\xbfdata: one\n\ndata: two\r\rdata: [DONE]\n\n")
-            .unwrap();
-        assert_eq!(
-            events,
-            vec![
-                SseEvent::Data("one".to_string()),
-                SseEvent::Data("two".to_string()),
-                SseEvent::Done,
-            ]
-        );
-    }
 
     #[test]
     fn in_band_error_events_are_surfaced_and_classified() {

@@ -467,7 +467,10 @@ impl App {
                 } => {
                     content.as_deref().map_or(0, str::len)
                         + tool_calls.as_ref().map_or(0, |calls| {
-                            calls.iter().map(|c| c.function.arguments.len() + 32).sum()
+                            calls
+                                .iter()
+                                .map(|c| c.function.arguments.to_string().len() + 32)
+                                .sum()
                         })
                 }
                 Message::Tool { content, .. } => content.len(),
@@ -2455,7 +2458,7 @@ mod tests {
             id: "c1".to_string(),
             function: crate::model::FunctionCall {
                 name: "write_file".to_string(),
-                arguments: "{}".to_string(),
+                arguments: serde_json::json!({}),
             },
         };
         *app.turn_events.lock().unwrap() = vec![

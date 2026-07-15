@@ -580,21 +580,30 @@ pub struct CallDescriptor {
     pub pattern_safe: bool,
 }
 
-pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescriptor {
-    let args: Value = serde_json::from_str(arguments_json).unwrap_or(Value::Null);
+/// Compact JSON for logs, transcripts, and hook/approval details.
+pub fn arguments_preview(arguments: &Value) -> String {
+    match arguments {
+        Value::Null => "{}".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn call_descriptor(binding: &ToolBinding, arguments: &Value) -> CallDescriptor {
+    let args = arguments;
+    let detail_json = arguments_preview(arguments);
     match binding {
         ToolBinding::Mcp { server, tool } => {
             let name = sanitize_tool_name(&format!("{server}__{tool}"));
             CallDescriptor {
                 descriptor: name.clone(),
-                detail: truncate(arguments_json, 200),
+                detail: truncate(&detail_json, 200),
                 always_pattern: name,
                 pattern_safe: true,
             }
         }
         ToolBinding::WebSearch => CallDescriptor {
             descriptor: tools::WEB_SEARCH_TOOL.to_string(),
-            detail: truncate(arguments_json, 200),
+            detail: truncate(&detail_json, 200),
             always_pattern: tools::WEB_SEARCH_TOOL.to_string(),
             pattern_safe: true,
         },
@@ -634,7 +643,7 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
             let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
             CallDescriptor {
                 descriptor: format!("{} {}", op.tool_name(), truncate(path, 160)),
-                detail: truncate(arguments_json, 200),
+                detail: truncate(&detail_json, 200),
                 always_pattern: format!("{} *", op.tool_name()),
                 pattern_safe: true,
             }
@@ -648,7 +657,7 @@ pub fn call_descriptor(binding: &ToolBinding, arguments_json: &str) -> CallDescr
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_tool_call(
     binding: &ToolBinding,
-    arguments_json: &str,
+    arguments: &Value,
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
@@ -656,12 +665,12 @@ pub async fn dispatch_tool_call(
     depth: u32,
     policy: &CallPolicy<'_>,
 ) -> Result<String> {
-    let described = call_descriptor(binding, arguments_json);
+    let described = call_descriptor(binding, arguments);
 
     // pre_tool hooks run before the approval prompt: a call a hook is
     // going to block should never interrupt the user.
     if let Some(blocked) =
-        crate::hooks::pre_tool(config, &described.descriptor, arguments_json).await
+        crate::hooks::pre_tool(config, &described.descriptor, arguments).await
     {
         return Ok(blocked);
     }
@@ -709,7 +718,7 @@ pub async fn dispatch_tool_call(
 
     let output = dispatch_tool_call_inner(
         binding,
-        arguments_json,
+        arguments,
         config,
         mcp,
         http,
@@ -719,7 +728,7 @@ pub async fn dispatch_tool_call(
     )
     .await?;
     let output =
-        crate::hooks::post_tool(config, &described.descriptor, arguments_json, output).await;
+        crate::hooks::post_tool(config, &described.descriptor, arguments, output).await;
     Ok(clamp_tool_output(
         output,
         config.settings.max_tool_output_chars,
@@ -744,7 +753,7 @@ fn clamp_tool_output(output: String, max_chars: usize) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_tool_call_inner(
     binding: &ToolBinding,
-    arguments_json: &str,
+    arguments: &Value,
     config: &Config,
     mcp: &McpManager,
     http: &reqwest::Client,
@@ -752,13 +761,21 @@ async fn dispatch_tool_call_inner(
     depth: u32,
     policy: &CallPolicy<'_>,
 ) -> Result<String> {
-    let arguments: Value = if arguments_json.trim().is_empty() {
-        Value::Object(JsonObject::new())
-    } else {
-        match serde_json::from_str(arguments_json) {
-            Ok(value) => value,
-            // Feed malformed JSON back to the model instead of aborting the stage.
-            Err(e) => return Ok(format!("ERROR: tool arguments were not valid JSON: {e}")),
+    // The adapter already decoded the wire encoding. `Null` means "no
+    // arguments"; any other non-object survived a malformed generation —
+    // feed it back to the model instead of aborting the stage.
+    let empty;
+    let arguments = match arguments {
+        Value::Object(_) => arguments,
+        Value::Null => {
+            empty = Value::Object(JsonObject::new());
+            &empty
+        }
+        other => {
+            return Ok(format!(
+                "ERROR: tool arguments were not a JSON object: {}",
+                truncate(&other.to_string(), 200)
+            ));
         }
     };
 
@@ -809,7 +826,7 @@ async fn dispatch_tool_call_inner(
             let connection = mcp
                 .get(server)
                 .ok_or_else(|| anyhow!("mcp server `{server}` is not connected"))?;
-            match connection.call(tool, object).await {
+            match connection.call(tool, object.clone()).await {
                 Ok(text) => Ok(text),
                 // Transport-level failure: report to the model, keep the stage alive.
                 Err(e) => Ok(format!("ERROR: {e:#}")),
@@ -870,8 +887,12 @@ async fn dispatch_tool_call_inner(
             .await)
         }
         ToolBinding::File { op } => {
-            tracing::info!(tool = op.tool_name(), args = %truncate(arguments_json, 200), "file tool");
-            Ok(crate::files::dispatch(*op, &arguments))
+            tracing::info!(
+                tool = op.tool_name(),
+                args = %truncate(&arguments_preview(arguments), 200),
+                "file tool"
+            );
+            Ok(crate::files::dispatch(*op, arguments))
         }
     }
 }
@@ -1101,14 +1122,14 @@ async fn execute_agent_loop_tool(
         options.on_observation,
         AgentLoopObservation::ToolCall {
             name: call.function.name.clone(),
-            args: call.function.arguments.clone(),
+            args: arguments_preview(&call.function.arguments),
         },
     );
     tracing::info!(
         owner_kind = options.owner_kind,
         owner = options.owner,
         tool = %call.function.name,
-        args = %truncate(&call.function.arguments, 200),
+        args = %truncate(&arguments_preview(&call.function.arguments), 200),
         "agent loop tool call"
     );
 
@@ -1592,10 +1613,12 @@ pub fn build_model_client(
             .providers
             .get(&model.provider)
             .ok_or_else(|| anyhow!("unknown provider `{}`", model.provider))?;
-        let adapter = adapters
-            .entry(model.provider.clone())
-            .or_insert_with(|| crate::providers::build_adapter(provider, http.clone()))
-            .clone();
+        let adapter = match adapters.entry(model.provider.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry
+                .insert(crate::providers::build_adapter(provider, http.clone())?)
+                .clone(),
+        };
         targets.push(ModelTarget {
             model: model.model.clone(),
             label: name,
@@ -1608,6 +1631,7 @@ pub fn build_model_client(
             pricing: ModelPricing {
                 input_per_million: model.input_cost_per_million,
                 output_per_million: model.output_cost_per_million,
+                cached_input_per_million: model.cached_input_cost_per_million,
             },
             external: provider.data_boundary == DataBoundary::External,
             adapter,
@@ -1758,13 +1782,13 @@ pub fn shed_context(messages: &mut [Message], keep_recent: usize) -> usize {
     trimmed
 }
 
-fn parse_reprompt(arguments_json: &str, targets: &[String]) -> Result<StageOutcome, String> {
+fn parse_reprompt(arguments: &Value, targets: &[String]) -> Result<StageOutcome, String> {
     #[derive(serde::Deserialize)]
     struct RepromptArgs {
         stage: String,
         instructions: String,
     }
-    let args: RepromptArgs = serde_json::from_str(arguments_json)
+    let args: RepromptArgs = serde_json::from_value(arguments.clone())
         .map_err(|e| format!("reprompt_stage arguments were not valid JSON: {e}"))?;
     if !targets.contains(&args.stage) {
         return Err(format!(
@@ -1820,6 +1844,7 @@ mod tests {
                     usage: Some(Usage {
                         prompt_tokens: 20,
                         completion_tokens: 1,
+                        ..Usage::default()
                     }),
                     truncation: None,
                 })
@@ -1832,7 +1857,7 @@ mod tests {
             id: id.to_string(),
             function: crate::model::FunctionCall {
                 name: name.to_string(),
-                arguments: "{}".to_string(),
+                arguments: serde_json::json!({}),
             },
         }
     }
@@ -1901,6 +1926,7 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: 10,
                     completion_tokens: 2,
+                    ..Usage::default()
                 }),
             },
             // Parallel completion order is intentionally reversed.
@@ -1945,6 +1971,7 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: 4,
                     completion_tokens: 1,
+                    ..Usage::default()
                 }),
             },
         ];
@@ -2009,6 +2036,7 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: 10,
                     completion_tokens: 2,
+                    ..Usage::default()
                 }),
             },
             AgentLoopEvent::ToolResult {
@@ -2171,7 +2199,7 @@ mod tests {
 
         let descriptor = call_descriptor(
             &ToolBinding::WebFetch,
-            r#"{"url":"https://example.com/doc"}"#,
+            &serde_json::json!({"url": "https://example.com/doc"}),
         );
         assert_eq!(descriptor.descriptor, "web_fetch https://example.com/doc");
         assert_eq!(descriptor.always_pattern, "web_fetch *");
@@ -2224,7 +2252,7 @@ mod tests {
             id: "x".into(),
             function: crate::model::FunctionCall {
                 name: name.into(),
-                arguments: "{}".into(),
+                arguments: serde_json::json!({}),
             },
         };
         let parallel_safe = |name: &str| match name {
@@ -2280,11 +2308,15 @@ mod tests {
     #[test]
     fn compound_shell_commands_cannot_use_pattern_approvals() {
         let binding = ToolBinding::Shell { allow: Vec::new() };
-        let simple = call_descriptor(&binding, r#"{"command":"cargo test --all"}"#);
+        let simple =
+            call_descriptor(&binding, &serde_json::json!({"command": "cargo test --all"}));
         assert!(simple.pattern_safe);
         assert!(tools::wildcard_match("shell cargo *", &simple.descriptor));
 
-        let compound = call_descriptor(&binding, r#"{"command":"cargo test; dangerous-command"}"#);
+        let compound = call_descriptor(
+            &binding,
+            &serde_json::json!({"command": "cargo test; dangerous-command"}),
+        );
         assert!(!compound.pattern_safe);
         // It still textually matches the broad pattern, proving that the
         // separate pattern_safe gate is what prevents auto-approval.
@@ -2382,6 +2414,7 @@ mod tests {
             Some(crate::model::Usage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
+                ..Usage::default()
             })
         };
 

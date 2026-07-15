@@ -49,9 +49,26 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
-    /// JSON-encoded arguments, as produced by the model.
-    #[serde(default)]
-    pub arguments: String,
+    /// Parsed argument object, as produced by the model. `Null` means no
+    /// arguments; a non-object value means the model emitted something
+    /// malformed and dispatch reports it back. Adapters own the conversion
+    /// to and from their wire encoding (OpenAI: a JSON-encoded string).
+    #[serde(default, deserialize_with = "arguments_compat")]
+    pub arguments: Value,
+}
+
+/// Legacy sessions and event logs stored `arguments` as a JSON-encoded
+/// string; both that shape and the structured form deserialize.
+fn arguments_compat<'de, D>(deserializer: D) -> std::result::Result<Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Value::deserialize(deserializer)?;
+    Ok(match raw {
+        Value::String(text) if text.trim().is_empty() => Value::Null,
+        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        other => other,
+    })
 }
 
 /// A tool advertised to a model.
@@ -88,6 +105,15 @@ pub struct Usage {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub completion_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache (a subset of
+    /// `prompt_tokens`), when reported. Billed at the cached rate if the
+    /// model declares one.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Reasoning/thinking tokens (a subset of `completion_tokens`), when
+    /// reported. Informational: providers bill them as output.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl Usage {
@@ -190,13 +216,22 @@ pub fn fmt_tokens(tokens: u64) -> String {
 pub struct ModelPricing {
     pub input_per_million: Option<f64>,
     pub output_per_million: Option<f64>,
+    /// Price for cache-read prompt tokens. Missing means they bill at the
+    /// full input rate — over-counting, which is the safe direction for a
+    /// spend cap.
+    pub cached_input_per_million: Option<f64>,
 }
 
 impl ModelPricing {
     fn cost(self, usage: Usage) -> Option<f64> {
+        let input = self.input_per_million?;
+        let output = self.output_per_million?;
+        let cached = usage.cache_read_tokens.min(usage.prompt_tokens);
+        let cached_rate = self.cached_input_per_million.unwrap_or(input);
         Some(
-            usage.prompt_tokens as f64 * self.input_per_million? / 1_000_000.0
-                + usage.completion_tokens as f64 * self.output_per_million? / 1_000_000.0,
+            (usage.prompt_tokens - cached) as f64 * input / 1_000_000.0
+                + cached as f64 * cached_rate / 1_000_000.0
+                + usage.completion_tokens as f64 * output / 1_000_000.0,
         )
     }
 
@@ -231,6 +266,10 @@ pub struct ModelUsage {
     #[serde(default)]
     pub completion_tokens: u64,
     #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
     pub unreported_requests: u64,
     #[serde(default)]
     pub cost_usd: f64,
@@ -257,6 +296,8 @@ struct UsageTotals {
     requests: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_read_tokens: u64,
+    reasoning_tokens: u64,
     unreported_requests: u64,
     cost_usd: f64,
     unpriced_requests: u64,
@@ -272,6 +313,8 @@ impl UsageSnapshot {
             total.requests += usage.requests;
             total.prompt_tokens += usage.prompt_tokens;
             total.completion_tokens += usage.completion_tokens;
+            total.cache_read_tokens += usage.cache_read_tokens;
+            total.reasoning_tokens += usage.reasoning_tokens;
             total.unreported_requests += usage.unreported_requests;
             total.cost_usd += usage.cost_usd;
             total.unpriced_requests += usage.unpriced_requests;
@@ -457,6 +500,12 @@ impl UsageTracker {
                         entry.completion_tokens = entry
                             .completion_tokens
                             .saturating_add(usage.completion_tokens);
+                        entry.cache_read_tokens = entry
+                            .cache_read_tokens
+                            .saturating_add(usage.cache_read_tokens);
+                        entry.reasoning_tokens = entry
+                            .reasoning_tokens
+                            .saturating_add(usage.reasoning_tokens);
                         if let Some(cost) = pricing.cost(usage) {
                             entry.cost_usd += cost;
                         } else {
@@ -528,9 +577,19 @@ impl UsageTracker {
                     usage.requests, usage.attempts
                 ),
                 format!(
-                    "{} in + {} out",
+                    "{} in{} + {} out{}",
                     fmt_tokens(usage.prompt_tokens),
-                    fmt_tokens(usage.completion_tokens)
+                    if usage.cache_read_tokens > 0 {
+                        format!(" ({} cached)", fmt_tokens(usage.cache_read_tokens))
+                    } else {
+                        String::new()
+                    },
+                    fmt_tokens(usage.completion_tokens),
+                    if usage.reasoning_tokens > 0 {
+                        format!(" ({} reasoning)", fmt_tokens(usage.reasoning_tokens))
+                    } else {
+                        String::new()
+                    },
                 ),
                 describe_cost(usage.cost_usd, usage.unpriced_requests),
                 format!(
@@ -892,6 +951,7 @@ mod tests {
                     usage: Some(Usage {
                         prompt_tokens: 3,
                         completion_tokens: 1,
+                        ..Usage::default()
                     }),
                     truncation: None,
                 })
@@ -933,6 +993,64 @@ mod tests {
         ) -> AdapterFuture<'a> {
             Box::pin(async move { Err(AdapterError::transient(anyhow::anyhow!("retry me"))) })
         }
+    }
+
+    #[test]
+    fn tool_call_arguments_deserialize_from_both_shapes() {
+        // Legacy sessions/event logs stored a JSON-encoded string.
+        let legacy: ToolCall = serde_json::from_str(
+            r#"{"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"x\"}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.function.arguments, serde_json::json!({"path": "x"}));
+
+        // The structured form round-trips.
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(serialized.contains(r#""arguments":{"path":"x"}"#), "{serialized}");
+        let round_tripped: ToolCall = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped, legacy);
+
+        // Legacy empty and missing arguments become Null; malformed model
+        // output survives as a raw string for dispatch to report.
+        let empty: ToolCall =
+            serde_json::from_str(r#"{"id":"c","function":{"name":"f","arguments":""}}"#).unwrap();
+        assert_eq!(empty.function.arguments, Value::Null);
+        let missing: ToolCall =
+            serde_json::from_str(r#"{"id":"c","function":{"name":"f"}}"#).unwrap();
+        assert_eq!(missing.function.arguments, Value::Null);
+        let malformed: ToolCall = serde_json::from_str(
+            r#"{"id":"c","function":{"name":"f","arguments":"{\"path\": oops"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            malformed.function.arguments,
+            Value::String("{\"path\": oops".to_string())
+        );
+    }
+
+    #[test]
+    fn cached_prompt_tokens_bill_at_the_cached_rate() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            cache_read_tokens: 600_000,
+            reasoning_tokens: 0,
+        };
+        let pricing = ModelPricing {
+            input_per_million: Some(10.0),
+            output_per_million: Some(0.0),
+            cached_input_per_million: Some(1.0),
+        };
+        // 400k at $10/M + 600k at $1/M.
+        assert_eq!(pricing.cost(usage), Some(4.0 + 0.6));
+
+        // Without a cached rate, cached tokens bill at the full input rate —
+        // over-counting, never under a spend cap.
+        let no_cached_rate = ModelPricing {
+            cached_input_per_million: None,
+            ..pricing
+        };
+        assert_eq!(no_cached_rate.cost(usage), Some(10.0));
     }
 
     #[test]
@@ -1017,6 +1135,7 @@ mod tests {
         let pricing = ModelPricing {
             input_per_million: Some(2.0),
             output_per_million: Some(8.0),
+            cached_input_per_million: None,
         };
         tracker.record_attempt(
             "model-a",
@@ -1026,6 +1145,7 @@ mod tests {
             Some(Some(Usage {
                 prompt_tokens: 1_000,
                 completion_tokens: 100,
+                ..Usage::default()
             })),
             pricing,
         );
@@ -1129,6 +1249,7 @@ mod tests {
                 pricing: ModelPricing {
                     input_per_million: Some(1.0),
                     output_per_million: Some(1.0),
+                    cached_input_per_million: None,
                 },
                 external: true,
                 adapter: Arc::new(RecordingAdapter {

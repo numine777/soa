@@ -18,9 +18,9 @@ use crate::config::{Config, Hook, HookEvent};
 /// and its message (fed back to the model) is returned. A hook that times
 /// out or cannot be spawned also blocks — pre hooks fail closed, because
 /// blocking policies must not be skippable by breaking the hook.
-pub async fn pre_tool(config: &Config, descriptor: &str, arguments_json: &str) -> Option<String> {
+pub async fn pre_tool(config: &Config, descriptor: &str, arguments: &Value) -> Option<String> {
     for hook in matching(config, HookEvent::PreTool, descriptor) {
-        let run = run_hook(config, hook, "pre_tool", descriptor, arguments_json, None).await;
+        let run = run_hook(config, hook, "pre_tool", descriptor, arguments, None).await;
         match run {
             HookRun { exit: Some(0), .. } => {}
             HookRun { exit, output } => {
@@ -48,12 +48,12 @@ pub async fn pre_tool(config: &Config, descriptor: &str, arguments_json: &str) -
 pub async fn post_tool(
     config: &Config,
     descriptor: &str,
-    arguments_json: &str,
+    arguments: &Value,
     mut output: String,
 ) -> String {
     for hook in matching(config, HookEvent::PostTool, descriptor) {
         let run =
-            run_hook(config, hook, "post_tool", descriptor, arguments_json, Some(&output)).await;
+            run_hook(config, hook, "post_tool", descriptor, arguments, Some(&output)).await;
         match run {
             HookRun { exit: Some(0), .. } => {}
             HookRun { exit, output: hook_output } => {
@@ -101,12 +101,10 @@ async fn run_hook(
     hook: &Hook,
     event: &str,
     descriptor: &str,
-    arguments_json: &str,
+    arguments: &Value,
     tool_output: Option<&str>,
 ) -> HookRun {
     let tool = descriptor.split_whitespace().next().unwrap_or("");
-    let arguments: Value =
-        serde_json::from_str(arguments_json).unwrap_or(Value::String(arguments_json.to_string()));
     let payload = json!({
         "event": event,
         "tool": tool,
@@ -115,7 +113,7 @@ async fn run_hook(
         "output": tool_output,
     })
     .to_string();
-    let paths = crate::diff::extract_paths(arguments_json).join("\n");
+    let paths = crate::diff::extract_paths(arguments).join("\n");
 
     let timeout = Duration::from_secs(
         hook.timeout_secs.unwrap_or(config.settings.shell_timeout_secs),
@@ -207,12 +205,12 @@ mod tests {
             command = "true"
             "#,
         );
-        let blocked = pre_tool(&config, "edit_file src/x.rs", "{}").await.unwrap();
+        let blocked = pre_tool(&config, "edit_file src/x.rs", &serde_json::json!({})).await.unwrap();
         assert!(blocked.contains("BLOCKED"), "{blocked}");
         assert!(blocked.contains("protected file"), "{blocked}");
         // Non-matching descriptor: the failing hook is not consulted.
-        assert!(pre_tool(&config, "shell cargo test", "{}").await.is_none());
-        assert!(pre_tool(&config, "read_file src/x.rs", "{}").await.is_none());
+        assert!(pre_tool(&config, "shell cargo test", &serde_json::json!({})).await.is_none());
+        assert!(pre_tool(&config, "read_file src/x.rs", &serde_json::json!({})).await.is_none());
     }
 
     #[tokio::test]
@@ -233,7 +231,7 @@ mod tests {
         let result = post_tool(
             &config,
             "write_file src/x.rs",
-            r#"{"path": "src/x.rs", "content": "x"}"#,
+            &serde_json::json!({"path": "src/x.rs", "content": "x"}),
             "created `src/x.rs` (1 bytes)".to_string(),
         )
         .await;
@@ -241,7 +239,9 @@ mod tests {
         assert!(result.contains("[post_tool hook `write_file *` exited 1]"), "{result}");
         assert!(result.contains("lint failed in src/x.rs"), "{result}");
         // A passing hook appends nothing.
-        let clean = post_tool(&config, "write_file y.rs", r#"{"path":"y.rs"}"#, "ok".into()).await;
+        let clean =
+            post_tool(&config, "write_file y.rs", &serde_json::json!({"path":"y.rs"}), "ok".into())
+                .await;
         assert!(clean.contains("[post_tool hook"), "failing hook still matches y.rs");
     }
 
@@ -255,7 +255,7 @@ mod tests {
             timeout_secs = 1
             "#,
         );
-        let blocked = pre_tool(&config, "anything", "{}").await.unwrap();
+        let blocked = pre_tool(&config, "anything", &serde_json::json!({})).await.unwrap();
         assert!(blocked.contains("timed out"), "{blocked}");
     }
 
@@ -269,7 +269,7 @@ mod tests {
             "#,
         );
         // The stdin payload names the tool, so the hook can block on it.
-        assert!(pre_tool(&config, "shell rm -rf /", "{}").await.is_some());
-        assert!(pre_tool(&config, "read_file x", "{}").await.is_none());
+        assert!(pre_tool(&config, "shell rm -rf /", &serde_json::json!({})).await.is_some());
+        assert!(pre_tool(&config, "read_file x", &serde_json::json!({})).await.is_none());
     }
 }

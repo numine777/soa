@@ -59,6 +59,9 @@ adapter = "open_ai_chat_completions"
 base_url = "http://192.168.5.188:8000/v1"
 data_boundary = "local"
 # api_key = "${LMSTUDIO_API_KEY}"        # ${VAR} expands from the environment
+# Extra headers on every request (values support ${VAR}) — e.g. Azure's
+# api-key or OpenRouter's HTTP-Referer:
+# headers = { "x-portkey-provider" = "openai" }
 
 # ---------------------------------------------------------------------------
 # Models: a provider + model id + default sampling parameters.
@@ -72,9 +75,12 @@ temperature = 0.7
 # status bar, auto-compaction, and mid-stage shedding of old tool results.
 context_tokens = 131072
 # Optional cost accounting, in USD per million tokens. Both prices are
-# required on every model when settings.max_run_cost_usd is set.
+# required on every model when settings.max_run_cost_usd is set. Cache-read
+# prompt tokens bill at cached_input_cost_per_million when set (otherwise
+# the full input rate — safe over-counting for spend caps).
 # input_cost_per_million = 0.20
 # output_cost_per_million = 0.80
+# cached_input_cost_per_million = 0.02
 # Fail over to other [models] entries (in order) when this endpoint stays
 # down after settings.provider_retries.
 # fallback = ["coder"]

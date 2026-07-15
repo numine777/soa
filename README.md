@@ -287,10 +287,19 @@ api_key = "${SOME_KEY}"     # optional; ${VAR} expands from the environment
 stream = true               # default: stream responses over SSE; set false
                             # for servers that don't support it
 data_boundary = "local"     # default; use "external" for hosted providers
+headers = { }               # extra headers on every request (values support
+                            # ${VAR}) — Azure's api-key, OpenRouter's
+                            # HTTP-Referer, org/beta headers. Validated by
+                            # `soa check`.
 ```
 
 Internally, stages and agents use a canonical model contract for messages,
-tool definitions, tool calls, sampling, usage, and streamed text. The adapter
+tool definitions, tool calls, sampling, usage, and streamed text. Tool-call
+arguments are structured JSON in that contract (adapters own each protocol's
+encoding, e.g. OpenAI's JSON-in-a-string; saved sessions from older versions
+still load), SSE framing is a shared module rather than adapter-private, and
+usage carries cache-read and reasoning token counts when the provider
+reports them. The adapter
 is the only layer that knows the selected provider's JSON, authentication,
 endpoint paths, error classification, or streaming protocol. This keeps
 provider-specific fields out of saved conversations and the agent loop. Stage
@@ -373,7 +382,17 @@ provider = "cloud"
 model = "proprietary-coder"
 input_cost_per_million = 3.0
 output_cost_per_million = 15.0
+cached_input_cost_per_million = 0.3   # optional: price for cache-read tokens
 ```
+
+When the provider reports prompt-cache hits
+(`prompt_tokens_details.cached_tokens`), those tokens bill at
+`cached_input_cost_per_million`; without it they bill at the full input
+rate — over-counting, which is the safe direction for a spend cap.
+Reasoning tokens (`completion_tokens_details.reasoning_tokens`) are billed
+as ordinary output by providers and tracked separately in usage reports;
+both counts appear in `── usage ──` summaries and `/usage` as
+`(N cached)` / `(N reasoning)` annotations when nonzero.
 
 When `max_run_tokens` is configured, soa clamps each request's output
 allowance to the remaining reported budget. Input size is only known after

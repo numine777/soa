@@ -220,7 +220,7 @@ mod tests {
     fn tool_call(id: &str, name: &str) -> ToolCall {
         ToolCall {
             id: id.to_string(),
-            function: FunctionCall { name: name.to_string(), arguments: "{}".to_string() },
+            function: FunctionCall { name: name.to_string(), arguments: serde_json::json!({}) },
         }
     }
 

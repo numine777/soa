@@ -129,9 +129,9 @@ pub fn earliest_restorable_since(diffs: &[DiffEntry], from: usize) -> Vec<DiffEn
     targets
 }
 
-/// Pull candidate file paths out of a tool call's JSON arguments.
-pub fn extract_paths(arguments_json: &str) -> Vec<String> {
-    let Ok(Value::Object(args)) = serde_json::from_str::<Value>(arguments_json) else {
+/// Pull candidate file paths out of a tool call's arguments.
+pub fn extract_paths(arguments: &Value) -> Vec<String> {
+    let Value::Object(args) = arguments else {
         return Vec::new();
     };
     let mut paths: Vec<String> = Vec::new();
@@ -236,9 +236,10 @@ mod tests {
     #[test]
     fn extracts_path_like_arguments() {
         let args = r#"{"path": "/a/b.rs", "content": "x", "destination": "/c/d.rs"}"#;
-        assert_eq!(extract_paths(args), vec!["/a/b.rs", "/c/d.rs"]);
-        assert!(extract_paths("not json").is_empty());
-        assert!(extract_paths(r#"{"query": "hi"}"#).is_empty());
+        let args: Value = serde_json::from_str(args).unwrap();
+        assert_eq!(extract_paths(&args), vec!["/a/b.rs", "/c/d.rs"]);
+        assert!(extract_paths(&Value::String("not json".into())).is_empty());
+        assert!(extract_paths(&serde_json::json!({"query": "hi"})).is_empty());
     }
 
     #[test]

@@ -264,6 +264,11 @@ pub struct Provider {
     pub base_url: String,
     /// Optional bearer token. Supports `${ENV_VAR}` expansion.
     pub api_key: Option<String>,
+    /// Extra headers sent with every request to this provider (values
+    /// support `${ENV_VAR}` expansion) — Azure's `api-key`, OpenRouter's
+    /// `HTTP-Referer`, Anthropic's `anthropic-version`, org/beta headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// Stream responses token-by-token over SSE. Disable for servers that
     /// don't support `"stream": true`.
     #[serde(default = "default_true")]
@@ -309,6 +314,10 @@ pub struct Model {
     /// required when `settings.max_run_cost_usd` is configured.
     pub input_cost_per_million: Option<f64>,
     pub output_cost_per_million: Option<f64>,
+    /// Price for cache-read prompt tokens, when the provider reports them.
+    /// Missing means cached tokens bill at the full input rate (safe
+    /// over-counting for spend caps).
+    pub cached_input_cost_per_million: Option<f64>,
     /// The model's context window, in tokens. Enables the pressure gauge
     /// in the chat status bar, auto-compaction, and mid-stage shedding of
     /// old tool results.
@@ -588,6 +597,9 @@ impl Config {
         }
         for provider in self.providers.values_mut() {
             provider.base_url = expand_env(&provider.base_url)?;
+            for value in provider.headers.values_mut() {
+                *value = expand_env(value)?;
+            }
             if let Some(key) = &provider.api_key {
                 provider.api_key = Some(expand_env(key)?);
             }
@@ -621,6 +633,18 @@ impl Config {
     fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
+        for (name, provider) in &self.providers {
+            for (key, value) in &provider.headers {
+                if key.parse::<http::HeaderName>().is_err() {
+                    errors.push(format!("provider `{name}` has an invalid header name `{key}`"));
+                }
+                if value.parse::<http::HeaderValue>().is_err() {
+                    errors.push(format!(
+                        "provider `{name}` has an invalid value for header `{key}`"
+                    ));
+                }
+            }
+        }
         for (name, model) in &self.models {
             if !self.providers.contains_key(&model.provider) {
                 errors.push(format!(
@@ -637,6 +661,10 @@ impl Config {
             for (field, price) in [
                 ("input_cost_per_million", model.input_cost_per_million),
                 ("output_cost_per_million", model.output_cost_per_million),
+                (
+                    "cached_input_cost_per_million",
+                    model.cached_input_cost_per_million,
+                ),
             ] {
                 if let Some(price) = price
                     && (!price.is_finite() || price < 0.0)
@@ -1271,6 +1299,26 @@ mod tests {
             )
         );
         assert!(parse(&toml_str).is_ok());
+    }
+
+    #[test]
+    fn provider_headers_expand_env_and_validate() {
+        // ${VAR} expansion applies to header values.
+        unsafe { std::env::set_var("SOA_TEST_HEADER", "v1") };
+        let toml_str = MINIMAL.replace(
+            "base_url = \"http://localhost:11434/v1\"",
+            "base_url = \"http://localhost:11434/v1\"\nheaders = { \"api-version\" = \"${SOA_TEST_HEADER}\" }",
+        );
+        let config = parse(&toml_str).unwrap();
+        assert_eq!(config.providers["local"].headers["api-version"], "v1");
+
+        // Syntactically invalid header names fail `soa check`.
+        let toml_str = MINIMAL.replace(
+            "base_url = \"http://localhost:11434/v1\"",
+            "base_url = \"http://localhost:11434/v1\"\nheaders = { \"bad header\" = \"x\" }",
+        );
+        let err = parse(&toml_str).unwrap_err().to_string();
+        assert!(err.contains("invalid header name `bad header`"), "{err}");
     }
 
     #[test]

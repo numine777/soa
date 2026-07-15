@@ -244,6 +244,14 @@ pub enum AgentLoopEvent {
     UserMessage {
         content: String,
     },
+    /// One event of a subagent's own loop, recorded while an
+    /// `agent__<name>` delegation (the pending call at `call_index`) runs.
+    /// Resume extracts these and continues the delegation mid-run instead
+    /// of re-running it from scratch; nested delegations nest the variant.
+    Subagent {
+        call_index: usize,
+        event: Box<AgentLoopEvent>,
+    },
     Finished {
         outcome: StageOutcome,
         usage: Option<Usage>,
@@ -676,6 +684,7 @@ pub async fn dispatch_tool_call(
     usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
+    subagent: SubagentCheckpoint<'_>,
 ) -> Result<String> {
     let described = call_descriptor(binding, arguments);
 
@@ -737,6 +746,7 @@ pub async fn dispatch_tool_call(
         usage,
         depth,
         policy,
+        subagent,
     )
     .await?;
     let output =
@@ -772,6 +782,7 @@ async fn dispatch_tool_call_inner(
     usage: &UsageTracker,
     depth: u32,
     policy: &CallPolicy<'_>,
+    subagent: SubagentCheckpoint<'_>,
 ) -> Result<String> {
     // The adapter already decoded the wire encoding. `Null` means "no
     // arguments"; any other non-object survived a malformed generation —
@@ -861,6 +872,7 @@ async fn dispatch_tool_call_inner(
                 usage,
                 depth + 1,
                 policy.approvals,
+                subagent,
             )
             .await
             {
@@ -1080,6 +1092,9 @@ fn replay_agent_loop(events: &[AgentLoopEvent]) -> Result<ReplayedAgentLoop> {
                 }
                 flush_completed_round(&mut messages, &mut pending)?;
             }
+            // Subagent events shape the delegation's own log, not the
+            // parent conversation — resume extraction is their consumer.
+            AgentLoopEvent::Subagent { .. } => {}
             AgentLoopEvent::UserMessage { content } => {
                 flush_completed_round(&mut messages, &mut pending)?;
                 if pending.is_some() {
@@ -1147,9 +1162,41 @@ fn observe_loop(sink: LoopObservationSink<'_>, event: AgentLoopObservation) {
     }
 }
 
+/// Checkpoint hooks for one `agent__<name>` delegation: the subagent
+/// events already recorded for this call (so an interrupted delegation
+/// resumes mid-run), and a sink that persists the delegation's new events
+/// wrapped under the call's index.
+pub struct SubagentCheckpoint<'a> {
+    pub resume_events: Vec<AgentLoopEvent>,
+    pub on_event: LoopEventSink<'a>,
+}
+
+/// The subagent events recorded for `call_index` in the current round —
+/// everything since the last assistant turn, because earlier rounds reuse
+/// the same call indices.
+fn subagent_resume_events(events: &[AgentLoopEvent], call_index: usize) -> Vec<AgentLoopEvent> {
+    let round_start = events
+        .iter()
+        .rposition(|event| matches!(event, AgentLoopEvent::Assistant { .. }))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    events[round_start..]
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopEvent::Subagent {
+                call_index: at,
+                event,
+            } if *at == call_index => Some((**event).clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_agent_loop_tool(
     call: &ToolCall,
+    call_index: usize,
+    subagent_resume: Vec<AgentLoopEvent>,
     bindings: &BTreeMap<&str, &StageTool>,
     config: &Config,
     mcp: &McpManager,
@@ -1193,6 +1240,24 @@ async fn execute_agent_loop_tool(
                 approvals,
                 tool.effects,
             );
+            // Delegations mirror their inner loop into the parent's log,
+            // tagged by call index, so a crash mid-delegation resumes the
+            // subagent instead of re-running it.
+            let outer_sink = options.on_event;
+            let wrap = move |event: AgentLoopEvent| {
+                if let Some(sink) = outer_sink {
+                    sink(AgentLoopEvent::Subagent {
+                        call_index,
+                        event: Box::new(event),
+                    });
+                }
+            };
+            let subagent = SubagentCheckpoint {
+                resume_events: subagent_resume,
+                on_event: outer_sink
+                    .is_some()
+                    .then_some(&wrap as &(dyn Fn(AgentLoopEvent) + Send + Sync)),
+            };
             match dispatch_tool_call(
                 &tool.binding,
                 &call.function.arguments,
@@ -1202,6 +1267,7 @@ async fn execute_agent_loop_tool(
                 usage,
                 options.depth,
                 &policy,
+                subagent,
             )
             .await
             {
@@ -1331,11 +1397,15 @@ pub async fn run_agent_loop(
                 );
                 let mut futures = FuturesUnordered::new();
                 for (call_index, call) in &missing {
-                    futures.push(async {
+                    let resume = subagent_resume_events(&events, *call_index);
+                    let bindings = &bindings;
+                    let options = &options;
+                    futures.push(async move {
                         (
                             *call_index,
                             execute_agent_loop_tool(
-                                call, &bindings, config, mcp, http, usage, approvals, &options,
+                                call, *call_index, resume, bindings, config, mcp, http, usage,
+                                approvals, options,
                             )
                             .await,
                         )
@@ -1379,10 +1449,16 @@ pub async fn run_agent_loop(
                             }
                         }
                     }
-                    let mutating = bindings
-                        .get(call.function.name.as_str())
+                    let tool_binding = bindings.get(call.function.name.as_str());
+                    let mutating = tool_binding
                         .is_some_and(|tool| tool.effects.mutating_or_process());
-                    if mutating {
+                    let is_delegation = tool_binding
+                        .is_some_and(|tool| matches!(tool.binding, ToolBinding::Agent { .. }));
+                    // Delegations are exempt from the intent rule: their own
+                    // checkpointed event log records exactly what ran, and a
+                    // resumed inner loop applies the intent rule recursively
+                    // to its own mutating calls.
+                    if mutating && !is_delegation {
                         // An intent with no result means a previous, interrupted
                         // invocation began this call: its effects may already
                         // be on disk. Re-executing a non-idempotent operation
@@ -1420,8 +1496,10 @@ pub async fn run_agent_loop(
                             AgentLoopEvent::ToolStarted { call_index },
                         );
                     }
+                    let resume = subagent_resume_events(&events, call_index);
                     let output = execute_agent_loop_tool(
-                        &call, &bindings, config, mcp, http, usage, approvals, &options,
+                        &call, call_index, resume, &bindings, config, mcp, http, usage,
+                        approvals, &options,
                     )
                     .await?;
                     record_loop_event(
@@ -1624,6 +1702,7 @@ pub fn run_agent<'a>(
     usage: &'a UsageTracker,
     depth: u32,
     approvals: &'a Approvals,
+    checkpoint: SubagentCheckpoint<'a>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(async move {
         let agent = config
@@ -1651,13 +1730,20 @@ pub fn run_agent<'a>(
             agent = %agent_name, model = %agent.model, tools = agent_tools.len(), depth,
             task = %truncate(task, 200), "running agent"
         );
+        if !checkpoint.resume_events.is_empty() {
+            tracing::info!(
+                agent = %agent_name,
+                events = checkpoint.resume_events.len(),
+                "resuming interrupted delegation from its checkpointed events"
+            );
+        }
         let result = run_agent_loop(
             &client,
             &agent_tools,
             vec![Message::User {
                 content: task.to_string(),
             }],
-            &[],
+            &checkpoint.resume_events,
             config,
             mcp,
             http,
@@ -1677,7 +1763,7 @@ pub fn run_agent<'a>(
                 on_delta: None,
                 terminate_streamed_response: false,
                 on_diff: None,
-                on_event: None,
+                on_event: checkpoint.on_event,
                 on_observation: None,
                 steer: None,
                 tool_errors_as_results: false,
@@ -2057,6 +2143,202 @@ mod tests {
         };
         assert_eq!(tool_call_id, "c2");
         assert!(content.contains("cancelled"), "{content}");
+    }
+
+    #[test]
+    fn subagent_events_extract_scoped_to_the_current_round() {
+        let sub = |call_index: usize, content: &str| AgentLoopEvent::Subagent {
+            call_index,
+            event: Box::new(AgentLoopEvent::UserMessage {
+                content: content.to_string(),
+            }),
+        };
+        let assistant = |name: &str| AgentLoopEvent::Assistant {
+            content: None,
+            tool_calls: vec![tool_call("c", name)],
+            usage: None,
+            reasoning: None,
+        };
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            assistant("agent__helper"),
+            sub(0, "old round"),
+            AgentLoopEvent::ToolResult {
+                call_index: 0,
+                content: "done".to_string(),
+            },
+            // A new round reuses call index 0; extraction must not leak
+            // the previous round's events into it.
+            assistant("agent__helper"),
+            sub(0, "current round"),
+            sub(1, "other call"),
+        ];
+        let extracted = subagent_resume_events(&events, 0);
+        assert_eq!(extracted.len(), 1);
+        assert!(matches!(
+            &extracted[0],
+            AgentLoopEvent::UserMessage { content } if content == "current round"
+        ));
+        assert!(subagent_resume_events(&events, 2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_delegation_resumes_from_its_checkpoint() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [agents.helper]
+            model = "m"
+            description = "helps"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        let adapter = Arc::new(ResumeAdapter {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let usage = UsageTracker::unlimited();
+        let client = ModelClient::new(
+            vec![ModelTarget {
+                label: "m".to_string(),
+                model: "x".to_string(),
+                sampling: SamplingParams::default(),
+                stream: false,
+                pricing: ModelPricing::default(),
+                external: false,
+                adapter: adapter.clone(),
+            }],
+            0,
+            usage.clone(),
+        );
+        // A write-capable delegation, so the intent rule would previously
+        // have synthesized an INTERRUPTED result instead of resuming.
+        let delegation_tool = StageTool {
+            definition: crate::model::ToolDefinition {
+                name: "agent__helper".to_string(),
+                description: "delegate".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            binding: ToolBinding::Agent {
+                agent: "helper".to_string(),
+            },
+            effects: ToolEffects::one(ToolEffect::ProcessExecute),
+        };
+        let delegation_call = ToolCall {
+            id: "d1".to_string(),
+            function: crate::model::FunctionCall {
+                name: "agent__helper".to_string(),
+                arguments: serde_json::json!({"task": "sub task"}),
+            },
+        };
+        // The previous run died after the subagent FINISHED but before the
+        // parent recorded the delegation's result. Its answer is on disk.
+        let events = vec![
+            AgentLoopEvent::Started {
+                system: None,
+                messages: vec![Message::User {
+                    content: "task".to_string(),
+                }],
+            },
+            AgentLoopEvent::Assistant {
+                content: None,
+                tool_calls: vec![delegation_call],
+                usage: None,
+                reasoning: None,
+            },
+            // Legacy intent record (pre-checkpointing logs have these for
+            // delegations) — must not trigger the verify-first synthetic.
+            AgentLoopEvent::ToolStarted { call_index: 0 },
+            AgentLoopEvent::Subagent {
+                call_index: 0,
+                event: Box::new(AgentLoopEvent::Started {
+                    system: None,
+                    messages: vec![Message::User {
+                        content: "sub task".to_string(),
+                    }],
+                }),
+            },
+            AgentLoopEvent::Subagent {
+                call_index: 0,
+                event: Box::new(AgentLoopEvent::Finished {
+                    outcome: StageOutcome::Final("the sub answer".to_string()),
+                    usage: None,
+                }),
+            },
+        ];
+        let recorded: std::sync::Mutex<Vec<AgentLoopEvent>> = std::sync::Mutex::new(Vec::new());
+        let sink = |event: AgentLoopEvent| recorded.lock().unwrap().push(event);
+        let mcp = McpManager::default();
+        let approvals = Approvals::non_interactive();
+        let result = run_agent_loop(
+            &client,
+            std::slice::from_ref(&delegation_tool),
+            Vec::new(),
+            &events,
+            &config,
+            &mcp,
+            &reqwest::Client::new(),
+            &usage,
+            &approvals,
+            AgentLoopOptions {
+                owner_kind: "stage",
+                owner: "s",
+                model_name: "m",
+                system: None,
+                max_turns: 3,
+                depth: 0,
+                require_approval: false,
+                approval_effects: &[],
+                auto_approve: &[],
+                reprompt_targets: &[],
+                on_delta: None,
+                terminate_streamed_response: false,
+                on_diff: None,
+                on_event: Some(&sink),
+                on_observation: None,
+                steer: None,
+                tool_errors_as_results: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, StageOutcome::Final("done".to_string()));
+
+        // The delegation's checkpointed answer was recovered — no synthetic
+        // INTERRUPTED result, no re-run of the subagent's model calls.
+        let requests = adapter.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "only the parent's follow-up request");
+        let tool_content = requests[0]
+            .iter()
+            .find_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tool_content, "the sub answer");
+        // The resumed-and-already-finished delegation emitted no new
+        // subagent events.
+        assert!(
+            !recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentLoopEvent::Subagent { .. })),
+        );
     }
 
     #[test]

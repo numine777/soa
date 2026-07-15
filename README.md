@@ -60,7 +60,9 @@ usage/budgets. While a stage is active, each event is appended to a compact
 JSONL sidecar instead of rewriting the growing snapshot. The log records the
 exact starting conversation, every model tool-call response, each completed
 tool result (including results as parallel calls finish), context shedding,
-and the final outcome; it is folded into the next boundary snapshot. Every
+subagent delegations (each delegation's own loop is mirrored into the log,
+tagged by call), and the final outcome; it is folded into the next boundary
+snapshot. Every
 snapshot and event append is fsynced (file and directory entry), so recorded
 progress survives power loss, not just process death.
 `soa run --resume` replays that log and continues with only the unfinished
@@ -743,6 +745,14 @@ Semantics:
   `agent__<name>` tool call with its final answer; the agent's internal
   tool calls go to the log file (`$TMPDIR/soa-chat.log`). File edits made
   by a subagent aren't captured by the diff viewer yet.
+- Delegations are checkpointed: during pipeline runs, a subagent's own
+  event log is recorded alongside the stage's, so `soa run --resume`
+  continues an interrupted delegation mid-run — completed subagent model
+  requests and tool calls are not repeated, a delegation that finished
+  just before the interruption recovers its answer without any model
+  call, and a subagent's own mutating calls get the same
+  interrupted-intent protection as the stage's. Nested delegations
+  checkpoint recursively.
 
 ## Reprompting: stages sending work back
 

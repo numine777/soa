@@ -386,7 +386,7 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
 }
 
 /// Where lessons live: `SOA.md` next to the config file.
-fn lessons_file(config: &Config) -> PathBuf {
+pub(crate) fn lessons_file(config: &Config) -> PathBuf {
     config.base_dir.join("SOA.md")
 }
 
@@ -497,7 +497,7 @@ fn parse_proposal(text: &str) -> Result<Proposal> {
 }
 
 /// Clamp the lesson list: drop empties, cap lengths and count.
-fn validate_lessons(lessons: Vec<String>) -> Vec<String> {
+pub(crate) fn validate_lessons(lessons: Vec<String>) -> Vec<String> {
     lessons
         .into_iter()
         .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -534,7 +534,7 @@ fn slug(name: &str) -> Option<String> {
 }
 
 /// The lessons currently in the managed block of the given file.
-fn read_lessons(path: &std::path::Path) -> Vec<String> {
+pub(crate) fn read_lessons(path: &std::path::Path) -> Vec<String> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -565,7 +565,7 @@ fn split_lessons_block(content: &str) -> Option<(&str, &str, &str)> {
 /// Rewrite (or append) the managed lessons block, leaving user content
 /// intact. An empty lesson list writes an empty block, keeping the markers
 /// so hand-placement survives.
-fn replace_lessons_block(content: &str, lessons: &[String]) -> String {
+pub(crate) fn replace_lessons_block(content: &str, lessons: &[String]) -> String {
     let bullets: String = lessons.iter().map(|l| format!("- {l}\n")).collect();
     let block =
         format!("{LESSONS_START}\n## Lessons (from `soa reflect`)\n\n{bullets}{LESSONS_END}");
@@ -585,7 +585,7 @@ fn print_lessons_diff(before: &[String], after: &[String]) {
     }
 }
 
-fn excerpt(text: &str, max_chars: usize) -> String {
+pub(crate) fn excerpt(text: &str, max_chars: usize) -> String {
     let squashed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if squashed.chars().count() <= max_chars {
         squashed

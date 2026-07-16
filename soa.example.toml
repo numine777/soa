@@ -276,3 +276,22 @@ stages = ["research", "implement", "review"]
 [workflows.quickfix]
 description = "skip research for small, well-understood changes"
 stages = ["implement", "review"]
+
+# ---------------------------------------------------------------------------
+# Evals: scored tasks for `soa evolve`, which runs the suite, has a model
+# propose one edit to a prompt file or the SOA.md lessons block, re-runs the
+# suite, and keeps the change only on strict improvement (held-out evals
+# included). The check command gets the run's final answer in $SOA_OUTPUT.
+# ---------------------------------------------------------------------------
+
+# [[eval]]
+# name = "tests-pass"
+# task = "fix the failing widget test"
+# check = "cargo test --quiet"
+# workflow = "quickfix"
+
+# [[eval]]
+# name = "explains-retry"
+# task = "what does the retry policy do on a 429 response?"
+# check = "echo \"$SOA_OUTPUT\" | grep -qi backoff"
+# holdout = true      # validated against, never shown to the proposer

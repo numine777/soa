@@ -1,6 +1,7 @@
 mod approval;
 mod config;
 mod diff;
+mod evolve;
 mod files;
 mod git;
 mod hooks;
@@ -84,6 +85,22 @@ enum Command {
     Sessions,
     /// List discoverable skills.
     Skills,
+    /// Closed-loop input improvement: run the [[eval]] suite, have a model
+    /// propose one edit to a prompt file or the lessons block, re-run the
+    /// suite, and keep the change only if it strictly improves (held-out
+    /// evals included). Review adopted changes with git.
+    Evolve {
+        /// Propose-validate cycles to run.
+        #[arg(long, default_value_t = 1)]
+        iterations: u32,
+        /// Run the baseline and print the first proposal without applying it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Model to propose with (default: settings.evolve_model, then
+        /// reflect_model, then the first stage's model).
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Distill recent sessions into lessons (SOA.md) and skills: failure
     /// signals (denied calls, tool errors, rollbacks) become durable
     /// instructions that reach every stage. Review the result with git.
@@ -377,6 +394,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Evolve {
+            iterations,
+            dry_run,
+            model,
+        } => evolve::run(&config, iterations, dry_run, model.as_deref()).await,
         Command::Reflect { dry_run, model } => {
             reflect::run(&config, model.as_deref(), dry_run).await
         }

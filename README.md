@@ -52,6 +52,8 @@ soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
 soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
+soa evolve             # closed-loop input improvement against the [[eval]] suite
+                       #   (--iterations N, --dry-run, --model M)
 soa -c other.toml …    # explicit config (default: ./soa.toml, then
                        #   ~/.config/soa/soa.toml — see Configuration)
 ```
@@ -209,6 +211,50 @@ order — so a shared `AGENTS.md` can be combined with soa-specific
 instructions. Missing and blank files are skipped, absolute paths are read
 as-is, and `soa check` reports what was found. Files are read once at
 startup — restart `soa chat` to pick up edits.
+
+## Evolution (`soa evolve`)
+
+Where `reflect` proposes once and never learns whether it helped, `evolve`
+closes the loop: **mine → propose → validate → adopt or revert**, iterated.
+
+Define scored tasks in the config:
+
+```toml
+[[eval]]
+name = "widget-fix"
+task = "fix the widget rendering bug and make the tests pass"
+check = "cargo test --quiet"       # exit 0 = pass; gets $SOA_OUTPUT and $SOA_EVAL
+workflow = "quickfix"              # optional; default workflow otherwise
+
+[[eval]]
+name = "api-question"
+task = "what does the retry policy do on a 429?"
+check = "echo \"$SOA_OUTPUT\" | grep -qi retry-after"
+holdout = true                     # validated against, never shown to the proposer
+```
+
+Each `soa evolve` iteration runs the whole suite, shows a proposer model
+(`settings.evolve_model`, falling back to `reflect_model`) the failures —
+check output, the run's final answer, and trace signals mined from the
+event logs (tool errors, denials, review-stage reprompt bounces, turns
+used) — and asks for **one targeted edit** to an evolvable input: a stage
+or agent `system_prompt_file`, or the `SOA.md` lessons block. Nothing else
+is ever touched (never the config itself). The candidate is applied, the
+suite re-runs, and the change is kept only on strict improvement: nothing
+that passed may regress — **held-out evals included**, which is what stops
+the proposer from hardcoding answers it was shown — and either a failing
+eval must newly pass or, on an already-green suite, total tokens must drop
+by ≥10% (prompt economy). Rejected proposals are reverted.
+
+Every verdict is appended to `<data dir>/evolve_history.jsonl` and shown
+to future proposals, so the loop doesn't retry what already failed.
+Adopted changes are plain file edits: review with `git diff`, revert with
+`git checkout`. Evals run non-interactively (approval-gated calls are
+denied, as with piped `soa run`), so mutating stages need `auto_approve`
+patterns — and checks should be idempotent, since the suite runs
+repeatedly against the same working directory. Inline `system_prompt`
+strings aren't evolvable; move prompts to `system_prompt_file` to widen
+the surface. `--dry-run` prints the first proposal without applying it.
 
 ## Reflection (`soa reflect`)
 

@@ -27,6 +27,10 @@ pub struct Config {
     pub workflows: BTreeMap<String, Workflow>,
     #[serde(default, rename = "stage")]
     pub stages: Vec<Stage>,
+    /// Scored tasks for `soa evolve`: each runs a workflow and passes when
+    /// its `check` command exits 0.
+    #[serde(default, rename = "eval")]
+    pub evals: Vec<Eval>,
     /// Shell commands bound to tool-call events (see [`Hook`]).
     #[serde(default)]
     pub hooks: Vec<Hook>,
@@ -127,6 +131,9 @@ pub struct Settings {
     /// Model used by `soa reflect` to distill sessions into lessons and
     /// skills (default: the first stage's model).
     pub reflect_model: Option<String>,
+    /// Model used by `soa evolve` to propose input improvements (default:
+    /// `reflect_model`, then the first stage's model).
+    pub evolve_model: Option<String>,
 }
 
 /// A named pipeline over the stage library.
@@ -137,6 +144,47 @@ pub struct Workflow {
     pub description: String,
     /// Stage names in execution order (each stage may appear once).
     pub stages: Vec<String>,
+}
+
+/// One scored task for `soa evolve`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Eval {
+    pub name: String,
+    /// The task text. Mutually exclusive with `task_file`.
+    pub task: Option<String>,
+    /// Path to a file holding the task, relative to the config file.
+    pub task_file: Option<PathBuf>,
+    /// Shell command that grades the run: exit 0 = pass. It receives the
+    /// final stage output in $SOA_OUTPUT and the eval name in $SOA_EVAL.
+    pub check: String,
+    /// Workflow to run (default: the same resolution as `soa run`).
+    pub workflow: Option<String>,
+    /// Held-out evals guard against overfitting: proposals are validated
+    /// against them but their failures are never shown to the proposer.
+    #[serde(default)]
+    pub holdout: bool,
+    /// Seconds the check command may run (default:
+    /// `settings.shell_timeout_secs`).
+    pub timeout_secs: Option<u64>,
+}
+
+impl Eval {
+    pub fn resolve_task(&self, base_dir: &Path) -> Result<String> {
+        match (&self.task, &self.task_file) {
+            (Some(task), None) => Ok(task.clone()),
+            (None, Some(path)) => {
+                let full = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    base_dir.join(path)
+                };
+                std::fs::read_to_string(&full)
+                    .with_context(|| format!("eval `{}`: cannot read {}", self.name, full.display()))
+            }
+            _ => bail!("eval `{}` needs exactly one of task or task_file", self.name),
+        }
+    }
 }
 
 // A hand-written Default keeps the "[settings] table absent" case in sync
@@ -163,6 +211,7 @@ impl Default for Settings {
             default_workflow: None,
             context_files: default_context_files(),
             reflect_model: None,
+            evolve_model: None,
         }
     }
 }
@@ -1050,6 +1099,40 @@ impl Config {
                 "settings.reflect_model references unknown model `{model}`"
             ));
         }
+        if let Some(model) = &self.settings.evolve_model
+            && !self.models.contains_key(model)
+        {
+            errors.push(format!(
+                "settings.evolve_model references unknown model `{model}`"
+            ));
+        }
+        let mut eval_names: Vec<&str> = Vec::new();
+        for eval in &self.evals {
+            if eval.name.trim().is_empty() {
+                errors.push("an eval has an empty name".to_string());
+            }
+            if eval_names.contains(&eval.name.as_str()) {
+                errors.push(format!("duplicate eval name `{}`", eval.name));
+            }
+            eval_names.push(&eval.name);
+            if eval.task.is_some() == eval.task_file.is_some() {
+                errors.push(format!(
+                    "eval `{}` needs exactly one of task or task_file",
+                    eval.name
+                ));
+            }
+            if eval.check.trim().is_empty() {
+                errors.push(format!("eval `{}` has an empty check command", eval.name));
+            }
+            if let Some(workflow) = &eval.workflow
+                && !self.workflows.contains_key(workflow)
+            {
+                errors.push(format!(
+                    "eval `{}` references unknown workflow `{workflow}`",
+                    eval.name
+                ));
+            }
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -1533,6 +1616,38 @@ mod tests {
         let error = parse(&toml_str).unwrap_err().to_string();
         assert!(error.contains("both output_schema and output_schema_file"), "{error}");
         assert!(error.contains("empty tool_choice"), "{error}");
+    }
+
+    #[test]
+    fn eval_entries_validate() {
+        // A valid eval parses and resolves its task.
+        let toml_str = format!(
+            "{MINIMAL}\n[[eval]]\nname = \"smoke\"\ntask = \"say hi\"\ncheck = \"true\"\nholdout = true\n"
+        );
+        let config = parse(&toml_str).unwrap();
+        assert_eq!(config.evals.len(), 1);
+        assert!(config.evals[0].holdout);
+        assert_eq!(
+            config.evals[0].resolve_task(Path::new(".")).unwrap(),
+            "say hi"
+        );
+
+        // Duplicates, task XOR task_file, empty check, unknown workflow.
+        let toml_str = format!(
+            "{MINIMAL}\n\
+             [[eval]]\nname = \"a\"\ntask = \"x\"\ntask_file = \"t.md\"\ncheck = \" \"\nworkflow = \"ghost\"\n\
+             [[eval]]\nname = \"a\"\ncheck = \"true\"\n"
+        );
+        let error = parse(&toml_str).unwrap_err().to_string();
+        assert!(error.contains("duplicate eval name `a`"), "{error}");
+        assert!(error.contains("exactly one of task or task_file"), "{error}");
+        assert!(error.contains("empty check command"), "{error}");
+        assert!(error.contains("unknown workflow `ghost`"), "{error}");
+
+        // evolve_model must exist.
+        let toml_str = format!("{MINIMAL}\n[settings]\nevolve_model = \"ghost\"\n");
+        let error = parse(&toml_str).unwrap_err().to_string();
+        assert!(error.contains("evolve_model references unknown model"), "{error}");
     }
 
     #[test]

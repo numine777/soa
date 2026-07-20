@@ -356,12 +356,40 @@ pub struct ModelUsage {
     pub latency_ms: u64,
 }
 
+/// Aggregate for one attribution scope (a stage or agent), keyed
+/// `stage:<name>` / `agent:<name>`. Turns are successful model responses;
+/// tool calls are the calls those responses requested. Together they explain
+/// a token delta mechanically: fewer turns and calls, or shorter transcripts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScopeUsage {
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
 /// Serializable run ledger. Checkpoints persist it so resume continues the
 /// original token, cost, and active-time budgets.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     #[serde(default)]
     pub models: BTreeMap<String, ModelUsage>,
+    /// Per-stage/agent breakdown of the same requests counted in `models`.
+    /// Older checkpoints deserialize with this empty.
+    #[serde(default)]
+    pub scopes: BTreeMap<String, ScopeUsage>,
     #[serde(default)]
     pub elapsed_ms: u64,
 }
@@ -549,9 +577,11 @@ impl UsageTracker {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_attempt(
         &self,
         label: &str,
+        scope: Option<&str>,
         adapter: &str,
         external: bool,
         elapsed: Duration,
@@ -566,6 +596,7 @@ impl UsageTracker {
         entry.latency_ms = entry
             .latency_ms
             .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        let mut scope_delta = None;
         match response {
             None => entry.failures += 1,
             Some(usage) => {
@@ -583,19 +614,53 @@ impl UsageTracker {
                         entry.reasoning_tokens = entry
                             .reasoning_tokens
                             .saturating_add(usage.reasoning_tokens);
-                        if let Some(cost) = pricing.cost(usage) {
+                        let cost = pricing.cost(usage);
+                        if let Some(cost) = cost {
                             entry.cost_usd += cost;
                         } else {
                             entry.unpriced_requests += 1;
                         }
+                        scope_delta = Some((usage, cost));
                     }
                     None => {
                         entry.unreported_requests += 1;
                         entry.unpriced_requests += 1;
+                        scope_delta = Some((Usage::default(), None));
                     }
                 }
             }
         }
+        // A successful response is one turn of its owning loop; attribute
+        // its usage to the stage/agent that made the request.
+        if let (Some(scope), Some((usage, cost))) = (scope, scope_delta) {
+            let entry = state.scopes.entry(scope.to_string()).or_default();
+            entry.turns += 1;
+            entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt_tokens);
+            entry.completion_tokens = entry
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            entry.cache_read_tokens = entry
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_tokens);
+            entry.reasoning_tokens = entry
+                .reasoning_tokens
+                .saturating_add(usage.reasoning_tokens);
+            entry.cost_usd += cost.unwrap_or(0.0);
+            entry.latency_ms = entry
+                .latency_ms
+                .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+
+    /// Attribute tool calls requested by a scope's model responses; the
+    /// agent loop reports them as each fresh response arrives.
+    pub fn record_tool_calls(&self, scope: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.inner.state.lock().unwrap();
+        let entry = state.scopes.entry(scope.to_string()).or_default();
+        entry.tool_calls = entry.tool_calls.saturating_add(count);
     }
 
     /// Run an operation under the remaining wall-clock budget. This wraps
@@ -685,6 +750,21 @@ impl UsageTracker {
                 details.push("external".to_string());
             }
             lines.push(format!("{label}: {}", details.join(" · ")));
+        }
+        for (scope, usage) in &snapshot.scopes {
+            lines.push(format!(
+                "{scope}: {} turn(s) · {} tool call(s) · {} in{} + {} out · {}",
+                usage.turns,
+                usage.tool_calls,
+                fmt_tokens(usage.prompt_tokens),
+                if usage.cache_read_tokens > 0 {
+                    format!(" ({} cached)", fmt_tokens(usage.cache_read_tokens))
+                } else {
+                    String::new()
+                },
+                fmt_tokens(usage.completion_tokens),
+                fmt_cost(usage.cost_usd),
+            ));
         }
         let mut total_line = format!(
             "total: {} request(s)/{} attempt(s) · {} in + {} out · {} · {} provider time · {} elapsed",
@@ -785,6 +865,9 @@ pub struct ModelClient {
     /// Additional attempts per target after a transient failure.
     retries: u32,
     usage: UsageTracker,
+    /// Attribution scope (`stage:<name>` / `agent:<name>`) for the ledger's
+    /// per-scope breakdown; None records against models only.
+    scope: Option<String>,
 }
 
 /// Exponential backoff: 500ms doubling per attempt, capped at 10s.
@@ -807,7 +890,12 @@ fn novel_suffix(fragment: &str, cumulative_before: usize, emitted: usize) -> Opt
 }
 
 impl ModelClient {
-    pub fn new(targets: Vec<ModelTarget>, retries: u32, usage: UsageTracker) -> Self {
+    pub fn new(
+        targets: Vec<ModelTarget>,
+        retries: u32,
+        usage: UsageTracker,
+        scope: Option<String>,
+    ) -> Self {
         assert!(
             !targets.is_empty(),
             "a ModelClient needs at least one target"
@@ -816,6 +904,7 @@ impl ModelClient {
             targets,
             retries,
             usage,
+            scope,
         }
     }
 
@@ -898,6 +987,7 @@ impl ModelClient {
                         Err(_) => {
                             self.usage.record_attempt(
                                 &target.label,
+                                self.scope.as_deref(),
                                 target.adapter.name(),
                                 target.external,
                                 request_started.elapsed(),
@@ -917,6 +1007,7 @@ impl ModelClient {
                     Ok(response) => {
                         self.usage.record_attempt(
                             &target.label,
+                            self.scope.as_deref(),
                             target.adapter.name(),
                             target.external,
                             request_started.elapsed(),
@@ -937,6 +1028,7 @@ impl ModelClient {
                     Err(error) if error.retryable && attempt < self.retries => {
                         self.usage.record_attempt(
                             &target.label,
+                            self.scope.as_deref(),
                             target.adapter.name(),
                             target.external,
                             request_started.elapsed(),
@@ -965,6 +1057,7 @@ impl ModelClient {
                     Err(error) => {
                         self.usage.record_attempt(
                             &target.label,
+                            self.scope.as_deref(),
                             target.adapter.name(),
                             target.external,
                             request_started.elapsed(),
@@ -1218,6 +1311,7 @@ mod tests {
             }],
             0,
             UsageTracker::unlimited(),
+            None,
         );
         let messages = [Message::User {
             content: "work".into(),
@@ -1247,6 +1341,7 @@ mod tests {
         };
         tracker.record_attempt(
             "model-a",
+            Some("stage:test"),
             "adapter-a",
             true,
             Duration::from_millis(50),
@@ -1259,6 +1354,7 @@ mod tests {
         );
         tracker.record_attempt(
             "model-a",
+            Some("stage:test"),
             "adapter-a",
             true,
             Duration::from_millis(20),
@@ -1267,12 +1363,14 @@ mod tests {
         );
         tracker.record_attempt(
             "model-b",
+            None,
             "adapter-b",
             false,
             Duration::from_millis(10),
             Some(None),
             ModelPricing::default(),
         );
+        tracker.record_tool_calls("stage:test", 3);
 
         let snapshot = tracker.snapshot();
         let model_a = &snapshot.models["model-a"];
@@ -1290,6 +1388,21 @@ mod tests {
         assert!((model_a.cost_usd - 0.0028).abs() < f64::EPSILON);
         assert_eq!(snapshot.models["model-b"].unreported_requests, 1);
 
+        // The scope breakdown counts turns (successful responses only) and
+        // tool calls, and carries the same token/cost attribution.
+        let scope = &snapshot.scopes["stage:test"];
+        assert_eq!(
+            (
+                scope.turns,
+                scope.tool_calls,
+                scope.prompt_tokens,
+                scope.completion_tokens,
+            ),
+            (1, 3, 1_000, 100)
+        );
+        assert!((scope.cost_usd - 0.0028).abs() < f64::EPSILON);
+        assert!(!snapshot.scopes.contains_key("model-b"));
+
         let report = tracker.report_lines().join("\n");
         assert!(
             report.contains("model-a: 1 request(s)/2 attempt(s)"),
@@ -1298,6 +1411,10 @@ mod tests {
         assert!(report.contains("1 failed"), "{report}");
         assert!(report.contains("1 without usage"), "{report}");
         assert!(report.contains("external"), "{report}");
+        assert!(
+            report.contains("stage:test: 1 turn(s) · 3 tool call(s)"),
+            "{report}"
+        );
     }
 
     #[tokio::test]
@@ -1324,6 +1441,7 @@ mod tests {
             }],
             0,
             tracker.clone(),
+            None,
         );
         let error = client
             .complete(
@@ -1366,6 +1484,7 @@ mod tests {
             }],
             0,
             cost_tracker.clone(),
+            None,
         );
         let error = priced
             .complete(
@@ -1399,6 +1518,7 @@ mod tests {
             }],
             0,
             time_tracker.clone(),
+            None,
         );
         let error = slow
             .complete(
@@ -1433,6 +1553,7 @@ mod tests {
             }],
             1,
             retry_tracker,
+            None,
         );
         let error = retrying
             .complete(

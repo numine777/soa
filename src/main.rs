@@ -1,6 +1,7 @@
 mod approval;
 mod config;
 mod diff;
+mod evals;
 mod evolve;
 mod files;
 mod git;
@@ -37,6 +38,14 @@ struct Cli {
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
 
+    /// Override one config value for this invocation (repeatable), e.g.
+    /// --set 'stage.plan.skills=[]' or --set settings.default_max_turns=8.
+    /// Paths mirror the TOML file; array-of-table segments select by name.
+    /// Made for A/B measurement: run `soa eval` with and without an input
+    /// and diff the reports.
+    #[arg(long, global = true, value_name = "PATH=VALUE")]
+    set: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -65,6 +74,11 @@ enum Command {
         /// for a specific one (see `soa runs`).
         #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "latest")]
         resume: Option<String>,
+        /// Also write the run's machine-readable usage record (tokens, cost,
+        /// per-stage breakdown) to this path. A copy is always kept under
+        /// the data directory regardless.
+        #[arg(long, value_name = "PATH")]
+        usage_json: Option<PathBuf>,
     },
     /// List interrupted pipeline runs that can be resumed.
     Runs,
@@ -85,6 +99,20 @@ enum Command {
     Sessions,
     /// List discoverable skills.
     Skills,
+    /// Run the [[eval]] suite as a measurement: score every eval, repeat
+    /// with --runs for stable numbers, and print a JSON metrics report
+    /// (pass rate, tokens, cost, turns, tool calls, wall time, per-stage
+    /// breakdown) to stdout. Use it before and after changing an input —
+    /// a skill, a rules edit, a new tool — to quantify the difference.
+    Eval {
+        /// Only run the named evals (repeat the flag, or omit for all).
+        #[arg(long = "eval", value_name = "NAME")]
+        evals: Vec<String>,
+        /// Repetitions of the whole suite; aggregates report mean/min/max
+        /// across runs. Agentic runs are noisy — use 3+ for comparisons.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+    },
     /// Closed-loop input improvement: run the [[eval]] suite, have a model
     /// propose one edit to a prompt file or the lessons block, re-run the
     /// suite, and keep the change only if it strictly improves (held-out
@@ -93,6 +121,11 @@ enum Command {
         /// Propose-validate cycles to run.
         #[arg(long, default_value_t = 1)]
         iterations: u32,
+        /// Suite repetitions per verdict (baseline and each candidate).
+        /// More runs let the token criterion separate real savings from
+        /// run-to-run noise.
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
         /// Run the baseline and print the first proposal without applying it.
         #[arg(long)]
         dry_run: bool,
@@ -144,7 +177,7 @@ async fn main() -> Result<()> {
     }
 
     let config_path = config::resolve_config_path(cli.config.as_deref())?;
-    let config = Config::load(&config_path)?;
+    let config = Config::load_with_overrides(&config_path, &cli.set)?;
 
     match cli.command {
         Command::Check => {
@@ -302,6 +335,7 @@ async fn main() -> Result<()> {
             stage,
             workflow,
             resume,
+            usage_json,
         } => {
             if let Some(resume) = resume {
                 if !task.is_empty() || stage.is_some() || workflow.is_some() {
@@ -317,7 +351,7 @@ async fn main() -> Result<()> {
                 } else {
                     runs::load_run(&resume)?
                 };
-                return resume_pipeline(&config, state).await;
+                return resume_pipeline(&config, state, usage_json.as_deref()).await;
             }
             let task = if task.is_empty() {
                 let mut buffer = String::new();
@@ -338,7 +372,14 @@ async fn main() -> Result<()> {
             for report in &reports {
                 eprintln!("• {}", report.describe());
             }
-            run_pipeline(&config, &task, stage.as_deref(), workflow.as_deref()).await
+            run_pipeline(
+                &config,
+                &task,
+                stage.as_deref(),
+                workflow.as_deref(),
+                usage_json.as_deref(),
+            )
+            .await
         }
         Command::Runs => {
             let states = runs::list_runs()?;
@@ -394,11 +435,13 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Eval { evals, runs } => evals::run(&config, &config_path, runs, &evals).await,
         Command::Evolve {
             iterations,
+            runs,
             dry_run,
             model,
-        } => evolve::run(&config, iterations, dry_run, model.as_deref()).await,
+        } => evolve::run(&config, iterations, dry_run, model.as_deref(), runs).await,
         Command::Reflect { dry_run, model } => {
             reflect::run(&config, model.as_deref(), dry_run).await
         }
@@ -528,6 +571,7 @@ async fn run_pipeline(
     task: &str,
     only_stage: Option<&str>,
     workflow: Option<&str>,
+    usage_json: Option<&std::path::Path>,
 ) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.settings.request_timeout_secs))
@@ -536,6 +580,7 @@ async fn run_pipeline(
 
     // Single-stage mode: one run, no reprompting.
     if let Some(name) = only_stage {
+        let started_at = tui::store::now_epoch();
         let usage = model::UsageTracker::new(
             config.settings.run_limits(),
             model::UsageSnapshot::default(),
@@ -588,6 +633,19 @@ async fn run_pipeline(
         manager.shutdown().await;
         diffs.print_summary();
         print_usage_summary(&usage);
+        write_usage_record(
+            &format!(
+                "{}-stage-{}",
+                tui::store::timestamp_id(tui::store::now_epoch()),
+                stage.name
+            ),
+            task,
+            std::slice::from_ref(&stage.name),
+            started_at,
+            result.as_ref().err(),
+            &usage,
+            usage_json,
+        );
         return match result? {
             stage::StageOutcome::Final(output) => {
                 eprintln!();
@@ -608,11 +666,15 @@ async fn run_pipeline(
         .map(|&i| config.stages[i].name.clone())
         .collect();
     let state = runs::RunState::new(task, stage_names);
-    run_workflow(config, &http, order, state).await
+    run_workflow(config, &http, order, state, usage_json).await
 }
 
 /// Continue a checkpointed pipeline run from its first incomplete stage.
-async fn resume_pipeline(config: &Config, state: runs::RunState) -> Result<()> {
+async fn resume_pipeline(
+    config: &Config,
+    state: runs::RunState,
+    usage_json: Option<&std::path::Path>,
+) -> Result<()> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.settings.request_timeout_secs))
         .build()
@@ -648,7 +710,7 @@ async fn resume_pipeline(config: &Config, state: runs::RunState) -> Result<()> {
         state.stage_names.len(),
         state.runs,
     );
-    run_workflow(config, &http, order, state).await
+    run_workflow(config, &http, order, state, usage_json).await
 }
 
 /// Execute a workflow from the point described by `state`, checkpointing
@@ -659,6 +721,7 @@ async fn run_workflow(
     http: &reqwest::Client,
     order: Vec<usize>,
     mut state: runs::RunState,
+    usage_json: Option<&std::path::Path>,
 ) -> Result<()> {
     let usage = model::UsageTracker::new(config.settings.run_limits(), state.usage.clone());
     if let Some(active) = &state.active_stage {
@@ -853,6 +916,15 @@ async fn run_workflow(
 
     diffs.print_summary();
     print_usage_summary(&usage);
+    write_usage_record(
+        &state.id,
+        &state.task,
+        &state.stage_names,
+        state.started_at,
+        result.as_ref().err(),
+        &usage,
+        usage_json,
+    );
     if result.is_ok()
         && let Some(output) = last_output
     {
@@ -928,6 +1000,39 @@ impl DiffLedger {
         for line in lines {
             eprintln!("{line}");
         }
+    }
+}
+
+/// Persist the run's machine-readable usage record: always under the data
+/// directory, and additionally at `explicit` when `--usage-json` was given.
+/// A failed write warns; metrics must never kill a finished run.
+fn write_usage_record(
+    id: &str,
+    task: &str,
+    stage_names: &[String],
+    started_at: u64,
+    error: Option<&anyhow::Error>,
+    usage: &model::UsageTracker,
+    explicit: Option<&std::path::Path>,
+) {
+    let record = runs::UsageRecord {
+        id: id.to_string(),
+        task: reflect::excerpt(task, 500),
+        cwd: tui::store::current_cwd(),
+        stage_names: stage_names.to_vec(),
+        outcome: if error.is_none() {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        },
+        error: error.map(|e| format!("{e:#}")),
+        started_at,
+        finished_at: tui::store::now_epoch(),
+        usage: usage.snapshot(),
+    };
+    match runs::save_usage_record(&record, explicit) {
+        Ok(path) => eprintln!("usage record: {}", path.display()),
+        Err(error) => eprintln!("⚠ cannot write usage record: {error:#}"),
     }
 }
 

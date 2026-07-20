@@ -35,8 +35,14 @@ so a resumed run reports the whole picture. Every run
 (including failed ones) also ends with a `── usage ──` summary on stderr:
 per-model successful requests and attempts, failures, input/output tokens,
 known cost, provider latency, adapter/data-boundary attribution, wall time,
-and configured budget progress. Stage loops, subagents, retries, and fallback
-targets all report through the same run ledger.
+and configured budget progress — plus a per-stage/agent breakdown
+(`stage:plan: 3 turn(s) · 12 tool call(s) · …`) that attributes the same
+requests to the loop that made them. Stage loops, subagents, retries, and
+fallback targets all report through the same run ledger. When the run ends,
+the full ledger is also written as a JSON **usage record** under
+`<data dir>/usage/<run id>.json` (and to `--usage-json <path>` if given),
+so token economics can be scripted over past runs — unlike checkpoints,
+usage records are not deleted when a run completes.
 
 ## Commands
 
@@ -51,12 +57,29 @@ soa run --resume       # continue this directory's interrupted run (--resume <id
 soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
+soa eval               # run the [[eval]] suite as a measurement; JSON metrics on stdout
+                       #   (--runs N to repeat for stable numbers, --eval <name> to filter)
 soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
 soa evolve             # closed-loop input improvement against the [[eval]] suite
-                       #   (--iterations N, --dry-run, --model M)
+                       #   (--iterations N, --runs N, --dry-run, --model M)
 soa -c other.toml …    # explicit config (default: ./soa.toml, then
                        #   ~/.config/soa/soa.toml — see Configuration)
+soa --set 'stage.plan.skills=[]' …   # overlay one config value for this invocation
+                       #   (repeatable; array-of-table segments select by name)
 ```
+
+**Measuring token economics.** `soa eval` runs every `[[eval]]` and prints a
+JSON report to stdout: per eval and per run, pass/fail, prompt/completion/
+cached/reasoning tokens, known cost, model turns, tool calls, wall time, and
+a per-stage/agent breakdown; aggregates carry pass rate and mean/min/max
+tokens. Combined with `--set`, an A/B for any input is two commands:
+
+```sh
+soa eval --runs 3 > with-skill.json
+soa --set 'stage.plan.skills=[]' eval --runs 3 > without-skill.json
+```
+
+Agentic runs are noisy — use `--runs 3` or more before trusting a delta.
 
 Set `RUST_LOG=soa=debug` to see tool outputs in the logs.
 
@@ -240,11 +263,15 @@ event logs (tool errors, denials, review-stage reprompt bounces, turns
 used) — and asks for **one targeted edit** to an evolvable input: a stage
 or agent `system_prompt_file`, or the `SOA.md` lessons block. Nothing else
 is ever touched (never the config itself). The candidate is applied, the
-suite re-runs, and the change is kept only on strict improvement: nothing
-that passed may regress — **held-out evals included**, which is what stops
+suite re-runs, and the change is kept only on strict improvement: no eval's
+pass rate may drop — **held-out evals included**, which is what stops
 the proposer from hardcoding answers it was shown — and either a failing
-eval must newly pass or, on an already-green suite, total tokens must drop
-by ≥10% (prompt economy). Rejected proposals are reverted.
+eval must newly pass or, on an already-green suite, mean suite tokens must
+drop by ≥10% (prompt economy). With `--runs N` the baseline and every
+candidate run the suite N times; pass rates replace single pass/fail bits,
+and the token cut must also clear a one-sided 95% bound on the measured
+run-to-run noise, so a lucky sample can't masquerade as an economy win.
+Rejected proposals are reverted.
 
 Every verdict is appended to `<data dir>/evolve_history.jsonl` and shown
 to future proposals, so the loop doesn't retry what already failed.

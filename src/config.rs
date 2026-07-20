@@ -36,13 +36,18 @@ pub struct Config {
     pub hooks: Vec<Hook>,
 
     /// Directory containing the config file; relative paths (e.g.
-    /// `system_prompt_file`) resolve against it. Set by [`Config::load`].
+    /// `system_prompt_file`) resolve against it. Set by [`Config::load_with_overrides`].
     #[serde(skip)]
     pub base_dir: PathBuf,
 
+    /// The `--set path=value` overlays applied on top of the file, kept so
+    /// a config reload re-applies them. Set by [`Config::load_with_overrides`].
+    #[serde(skip)]
+    pub overrides: Vec<String>,
+
     /// Project instructions (`settings.context_files`, default `SOA.md`)
     /// appended to every stage and agent system prompt, in order. Set by
-    /// [`Config::load`].
+    /// [`Config::load_with_overrides`].
     #[serde(skip)]
     pub project_contexts: Vec<ProjectContext>,
 }
@@ -533,6 +538,88 @@ pub fn user_config_path() -> PathBuf {
     base.join("soa").join("soa.toml")
 }
 
+/// Apply one `path=value` overlay to a parsed TOML document.
+fn apply_override(document: &mut toml::Value, spec: &str) -> Result<()> {
+    let (path, raw_value) = spec
+        .split_once('=')
+        .context("expected `path=value` (e.g. `stage.plan.skills=[]`)")?;
+    let segments = split_override_path(path.trim())?;
+    if segments.is_empty() {
+        bail!("the path before `=` is empty");
+    }
+    // The value is TOML when it parses as TOML, a bare string otherwise —
+    // so `[]`, `true`, and `3` keep their types without shell-quoting pain.
+    let value = toml::from_str::<toml::Table>(&format!("v = {}", raw_value.trim()))
+        .ok()
+        .and_then(|mut table| table.remove("v"))
+        .unwrap_or_else(|| toml::Value::String(raw_value.trim().to_string()));
+    assign_override(document, &segments, value, path.trim())
+}
+
+/// Split a dotted path, honoring double-quoted segments so keys that
+/// contain dots (`models."gpt-4.1".max_tokens`) stay addressable.
+fn split_override_path(path: &str) -> Result<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in path.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            '.' if !quoted => {
+                segments.push(std::mem::take(&mut current));
+                current.clear();
+            }
+            other => current.push(other),
+        }
+    }
+    if quoted {
+        bail!("unbalanced quotes in `{path}`");
+    }
+    segments.push(current);
+    if segments.iter().any(String::is_empty) {
+        bail!("`{path}` has an empty segment");
+    }
+    Ok(segments)
+}
+
+fn assign_override(
+    value: &mut toml::Value,
+    segments: &[String],
+    new: toml::Value,
+    full_path: &str,
+) -> Result<()> {
+    let Some((head, rest)) = segments.split_first() else {
+        *value = new;
+        return Ok(());
+    };
+    match value {
+        toml::Value::Table(table) => {
+            let slot = table
+                .entry(head.clone())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            assign_override(slot, rest, new, full_path)
+        }
+        toml::Value::Array(array) => {
+            let element = if let Ok(index) = head.parse::<usize>() {
+                array
+                    .get_mut(index)
+                    .with_context(|| format!("`{full_path}`: index {head} is out of range"))?
+            } else {
+                array
+                    .iter_mut()
+                    .find(|element| {
+                        element.get("name").and_then(toml::Value::as_str) == Some(head.as_str())
+                    })
+                    .with_context(|| {
+                        format!("`{full_path}`: no entry named `{head}` in this array")
+                    })?
+            };
+            assign_override(element, rest, new, full_path)
+        }
+        _ => bail!("`{full_path}`: `{head}` traverses a value that is neither table nor array"),
+    }
+}
+
 /// Which config file to load: an explicit `-c` path wins, then a
 /// project-local `./soa.toml`, then the user-level config.
 pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -733,11 +820,31 @@ impl Stage {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Config> {
+    /// Load the config file, then apply `--set path=value` overlays before
+    /// validation. Paths mirror the TOML structure (`settings.default_max_turns`,
+    /// `models.fast.max_tokens`); a segment under an array of tables selects
+    /// the element whose `name` matches (or a 0-based index), so
+    /// `stage.plan.skills=[]` rewrites the `plan` stage. Values parse as
+    /// TOML (`[]`, `true`, `3`, `"text"`); anything unparsable is a string.
+    /// This is what makes one-command A/B comparisons possible:
+    /// `soa eval --runs 3` vs `soa --set 'stage.plan.skills=[]' eval --runs 3`.
+    pub fn load_with_overrides(path: &Path, overrides: &[String]) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config file {}", path.display()))?;
-        let mut config: Config = toml::from_str(&raw)
-            .with_context(|| format!("invalid config in {}", path.display()))?;
+        let mut config: Config = if overrides.is_empty() {
+            toml::from_str(&raw).with_context(|| format!("invalid config in {}", path.display()))?
+        } else {
+            let mut document: toml::Value = toml::from_str(&raw)
+                .with_context(|| format!("invalid config in {}", path.display()))?;
+            for spec in overrides {
+                apply_override(&mut document, spec)
+                    .with_context(|| format!("cannot apply --set `{spec}`"))?;
+            }
+            document.try_into().with_context(|| {
+                format!("invalid config in {} after --set overlays", path.display())
+            })?
+        };
+        config.overrides = overrides.to_vec();
         config.base_dir = path
             .canonicalize()
             .with_context(|| format!("cannot resolve path {}", path.display()))?
@@ -1268,6 +1375,64 @@ mod tests {
         model = "default"
     "#;
 
+    /// Parse with `--set` overlays, mirroring `load_with_overrides` minus
+    /// the filesystem.
+    fn parse_with_overrides(toml_str: &str, overrides: &[&str]) -> Result<Config> {
+        let mut document: toml::Value = toml::from_str(toml_str)?;
+        for spec in overrides {
+            apply_override(&mut document, spec).with_context(|| format!("--set `{spec}`"))?;
+        }
+        let mut config: Config = document.try_into()?;
+        config.expand_env()?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn set_overlays_rewrite_values_arrays_and_named_entries() {
+        let with_skills = MINIMAL.replace(
+            "model = \"default\"",
+            "model = \"default\"\nskills = [\"tricks\"]\nmax_turns = 4",
+        );
+
+        // Typed scalar into a table, array replacement addressed through an
+        // array-of-tables element selected by name.
+        let config = parse_with_overrides(
+            &with_skills,
+            &[
+                "settings.default_max_turns=8",
+                "stage.answer.skills=[]",
+                "stage.0.max_turns=2",
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.settings.default_max_turns, 8);
+        assert!(config.stages[0].skills.is_empty());
+        assert_eq!(config.stages[0].max_turns, Some(2));
+
+        // Bare strings stay strings; quoted path segments keep dotted keys
+        // addressable.
+        let config = parse_with_overrides(
+            MINIMAL,
+            &[
+                "models.default.model=llama3.1:8b",
+                "models.\"default\".provider=local",
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.models["default"].model, "llama3.1:8b");
+
+        // Errors: unknown array entry, missing `=`, and unknown fields
+        // (deny_unknown_fields still applies after the overlay).
+        let error = format!(
+            "{:#}",
+            parse_with_overrides(MINIMAL, &["stage.missing.max_turns=2"]).unwrap_err()
+        );
+        assert!(error.contains("no entry named `missing`"), "{error}");
+        assert!(parse_with_overrides(MINIMAL, &["nonsense"]).is_err());
+        assert!(parse_with_overrides(MINIMAL, &["settings.not_a_field=1"]).is_err());
+    }
+
     #[test]
     fn minimal_config_parses() {
         let config = parse(MINIMAL).unwrap();
@@ -1640,14 +1805,20 @@ mod tests {
         );
         let error = parse(&toml_str).unwrap_err().to_string();
         assert!(error.contains("duplicate eval name `a`"), "{error}");
-        assert!(error.contains("exactly one of task or task_file"), "{error}");
+        assert!(
+            error.contains("exactly one of task or task_file"),
+            "{error}"
+        );
         assert!(error.contains("empty check command"), "{error}");
         assert!(error.contains("unknown workflow `ghost`"), "{error}");
 
         // evolve_model must exist.
         let toml_str = format!("{MINIMAL}\n[settings]\nevolve_model = \"ghost\"\n");
         let error = parse(&toml_str).unwrap_err().to_string();
-        assert!(error.contains("evolve_model references unknown model"), "{error}");
+        assert!(
+            error.contains("evolve_model references unknown model"),
+            "{error}"
+        );
     }
 
     #[test]

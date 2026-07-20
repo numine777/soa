@@ -19,6 +19,45 @@ fn runs_dir() -> PathBuf {
     store::data_dir().join("runs")
 }
 
+fn usage_dir() -> PathBuf {
+    store::data_dir().join("usage")
+}
+
+/// Machine-readable token/cost record for one `soa run`, written when the
+/// run ends (completed or failed). Unlike checkpoints — which are deleted
+/// once a run finishes — these persist, so token-economics comparisons can
+/// be scripted over past runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub id: String,
+    /// First 500 chars of the task, to identify the run.
+    pub task: String,
+    pub cwd: String,
+    pub stage_names: Vec<String>,
+    /// "completed" or "failed".
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: u64,
+    pub finished_at: u64,
+    pub usage: UsageSnapshot,
+}
+
+/// Persist a usage record under `<data dir>/usage/<id>.json` and, when
+/// given, at an explicit path too. Returns the automatic path.
+pub fn save_usage_record(
+    record: &UsageRecord,
+    explicit: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    let bytes = serde_json::to_vec_pretty(record)?;
+    let path = usage_dir().join(format!("{}.json", record.id));
+    crate::persistence::atomic_write(&path, &bytes)?;
+    if let Some(explicit) = explicit {
+        crate::persistence::atomic_write(explicit, &bytes)?;
+    }
+    Ok(path)
+}
+
 fn event_log_path(id: &str) -> PathBuf {
     runs_dir().join(format!("{id}.events.jsonl"))
 }

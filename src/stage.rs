@@ -1692,6 +1692,10 @@ pub async fn run_agent_loop(
             continue;
         }
 
+        usage.record_tool_calls(
+            &format!("{}:{}", options.owner_kind, options.owner),
+            reply.tool_calls.len() as u64,
+        );
         record_loop_event(
             &mut events,
             options.on_event,
@@ -1732,6 +1736,7 @@ pub fn run_agent<'a>(
             agent.max_tokens,
             http,
             usage,
+            Some(&format!("agent:{agent_name}")),
         )?;
 
         let agent_tools = assemble_tools(&agent.tool_profile(agent_name), config, mcp, depth)?;
@@ -1847,6 +1852,7 @@ pub fn build_model_client(
     max_tokens: Option<u32>,
     http: &reqwest::Client,
     usage: &UsageTracker,
+    scope: Option<&str>,
 ) -> Result<ModelClient> {
     let mut targets = Vec::new();
     let mut adapters: BTreeMap<String, Arc<dyn ProviderAdapter>> = BTreeMap::new();
@@ -1894,6 +1900,7 @@ pub fn build_model_client(
         targets,
         config.settings.provider_retries,
         usage.clone(),
+        scope.map(str::to_string),
     ))
 }
 
@@ -1929,6 +1936,7 @@ pub async fn run_stage(
         stage.max_tokens,
         http,
         usage,
+        Some(&format!("stage:{}", stage.name)),
     )?;
 
     let stage_tools = assemble_tools(&stage.tool_profile(), config, mcp, 0)?;
@@ -2252,6 +2260,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         let choice = crate::model::ToolChoice::Any;
         let schema = serde_json::json!({"type": "object"});
@@ -2449,6 +2458,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         let delegation_tool = StageTool {
             definition: crate::model::ToolDefinition {
@@ -2582,6 +2592,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         // A write-capable delegation, so the intent rule would previously
         // have synthesized an INTERRUPTED result instead of resuming.
@@ -2778,6 +2789,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         // The last measured context (900) plus a 6000-char tool result
         // estimates far beyond 80% of the 1000-token window.
@@ -2976,6 +2988,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         let events = vec![
             AgentLoopEvent::Started {
@@ -3093,6 +3106,7 @@ mod tests {
             }],
             0,
             usage.clone(),
+            None,
         );
         let shell_tool = StageTool {
             definition: tools::shell_definition(5, &[]),
@@ -3339,11 +3353,11 @@ mod tests {
         .unwrap();
         let http = reqwest::Client::new();
         let usage = UsageTracker::unlimited();
-        let client = build_model_client(&config, "a", None, None, &http, &usage).unwrap();
+        let client = build_model_client(&config, "a", None, None, &http, &usage, None).unwrap();
         // a's own fallbacks first, then theirs; the cycle back to `a` is cut.
         assert_eq!(client.target_labels(), vec!["a", "b", "c", "d"]);
         // A model with no fallbacks yields a single target.
-        let solo = build_model_client(&config, "c", None, None, &http, &usage).unwrap();
+        let solo = build_model_client(&config, "c", None, None, &http, &usage, None).unwrap();
         assert_eq!(solo.target_labels(), vec!["c"]);
     }
 

@@ -264,7 +264,7 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         .build()
         .context("failed to build HTTP client")?;
     let usage = crate::model::UsageTracker::unlimited();
-    let client = crate::stage::build_model_client(config, &model, None, None, &http, &usage)?;
+    let client = crate::stage::build_model_client(config, &model, None, None, &http, &usage, None)?;
     let messages = vec![
         Message::System {
             content: SYSTEM_PROMPT.to_string(),

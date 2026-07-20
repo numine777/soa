@@ -68,6 +68,10 @@ pub struct EvalOutcome {
     pub passed: bool,
     pub error: Option<String>,
     pub tokens: u64,
+    /// The eval run's full ledger (per-model and per-stage breakdowns),
+    /// for `soa eval`'s metrics report.
+    pub usage: crate::model::UsageSnapshot,
+    pub wall_ms: u64,
     pub check_excerpt: String,
     pub output_excerpt: String,
     pub signals: Vec<String>,
@@ -87,14 +91,104 @@ impl SuiteScore {
     pub fn tokens(&self) -> u64 {
         self.outcomes.iter().map(|o| o.tokens).sum()
     }
+}
 
-    fn describe(&self) -> String {
-        format!(
-            "{}/{} passing · {}",
-            self.passed(),
-            self.outcomes.len(),
-            crate::model::fmt_tokens(self.tokens()),
-        )
+/// One or more repetitions of the whole suite. Agentic runs are noisy;
+/// comparing repeated runs keeps a lucky (or unlucky) single sample from
+/// deciding a verdict.
+#[derive(Debug, Clone, Default)]
+pub struct SuiteStats {
+    pub runs: Vec<SuiteScore>,
+}
+
+impl SuiteStats {
+    #[cfg(test)]
+    pub fn single(score: SuiteScore) -> Self {
+        SuiteStats { runs: vec![score] }
+    }
+
+    fn eval_count(&self) -> usize {
+        self.runs.first().map_or(0, |run| run.outcomes.len())
+    }
+
+    /// How many of the repetitions passed the eval at `index`.
+    fn passes(&self, index: usize) -> usize {
+        self.runs
+            .iter()
+            .filter(|run| run.outcomes.get(index).is_some_and(|o| o.passed))
+            .count()
+    }
+
+    fn pass_rate(&self, index: usize) -> f64 {
+        self.passes(index) as f64 / self.runs.len().max(1) as f64
+    }
+
+    /// Every eval passed in every repetition.
+    fn all_green(&self) -> bool {
+        !self.runs.is_empty()
+            && self
+                .runs
+                .iter()
+                .all(|run| run.passed() == run.outcomes.len())
+    }
+
+    fn mean_tokens(&self) -> f64 {
+        if self.runs.is_empty() {
+            return 0.0;
+        }
+        self.runs.iter().map(|run| run.tokens() as f64).sum::<f64>() / self.runs.len() as f64
+    }
+
+    /// Sample variance of per-repetition suite tokens (0 with one run).
+    fn tokens_variance(&self) -> f64 {
+        if self.runs.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.mean_tokens();
+        self.runs
+            .iter()
+            .map(|run| (run.tokens() as f64 - mean).powi(2))
+            .sum::<f64>()
+            / (self.runs.len() - 1) as f64
+    }
+
+    /// A merged view for the proposer prompt: per eval, the first failing
+    /// repetition's evidence when any repetition failed (flaky failures are
+    /// the interesting signal), otherwise the last repetition's outcome.
+    pub fn representative(&self) -> SuiteScore {
+        let mut outcomes = Vec::new();
+        for index in 0..self.eval_count() {
+            let failing = self
+                .runs
+                .iter()
+                .filter_map(|run| run.outcomes.get(index))
+                .find(|o| !o.passed);
+            let outcome =
+                failing.or_else(|| self.runs.last().and_then(|run| run.outcomes.get(index)));
+            if let Some(outcome) = outcome {
+                outcomes.push(outcome.clone());
+            }
+        }
+        SuiteScore { outcomes }
+    }
+
+    pub fn describe(&self) -> String {
+        let evals = self.eval_count();
+        let fully_passing = (0..evals)
+            .filter(|&index| self.passes(index) == self.runs.len())
+            .count();
+        if self.runs.len() == 1 {
+            format!(
+                "{fully_passing}/{evals} passing · {}",
+                crate::model::fmt_tokens(self.mean_tokens().round() as u64),
+            )
+        } else {
+            format!(
+                "{fully_passing}/{evals} passing in all {} run(s) · mean {}",
+                self.runs.len(),
+                crate::model::fmt_tokens(self.mean_tokens().round() as u64),
+            )
+        }
     }
 }
 
@@ -105,39 +199,54 @@ pub enum Verdict {
     Reject(String),
 }
 
-/// Strict improvement: nothing that passed may regress (held-out evals
-/// included), and the candidate must either fix a failure or — when the
-/// suite was already green — cut total tokens meaningfully.
-pub fn compare(baseline: &SuiteScore, candidate: &SuiteScore) -> Verdict {
-    for (before, after) in baseline.outcomes.iter().zip(&candidate.outcomes) {
-        if before.passed && !after.passed {
+/// Strict improvement: no eval's pass rate may drop (held-out evals
+/// included), and the candidate must either raise a pass rate or — when the
+/// suite was already green — cut mean suite tokens meaningfully. With
+/// repeated runs the token cut must also clear the measured run-to-run
+/// noise, so a lucky sample cannot masquerade as an economy win; with one
+/// run per side this reduces to the plain 10% threshold.
+pub fn compare(baseline: &SuiteStats, candidate: &SuiteStats) -> Verdict {
+    let evals = baseline.eval_count().min(candidate.eval_count());
+    let name = |index: usize| -> (&str, bool) {
+        let outcome = &baseline.runs[0].outcomes[index];
+        (outcome.name.as_str(), outcome.holdout)
+    };
+    for index in 0..evals {
+        if candidate.pass_rate(index) < baseline.pass_rate(index) {
+            let (name, holdout) = name(index);
             return Verdict::Reject(format!(
-                "regressed `{}`{}",
-                after.name,
-                if after.holdout { " (holdout)" } else { "" }
+                "regressed `{name}`{} (passed {}/{} → {}/{})",
+                if holdout { " (holdout)" } else { "" },
+                baseline.passes(index),
+                baseline.runs.len(),
+                candidate.passes(index),
+                candidate.runs.len(),
             ));
         }
     }
-    let newly_passing: Vec<&str> = baseline
-        .outcomes
-        .iter()
-        .zip(&candidate.outcomes)
-        .filter(|(before, after)| !before.passed && after.passed)
-        .map(|(_, after)| after.name.as_str())
+    let improved: Vec<&str> = (0..evals)
+        .filter(|&index| candidate.pass_rate(index) > baseline.pass_rate(index))
+        .map(|index| name(index).0)
         .collect();
-    if !newly_passing.is_empty() {
-        return Verdict::Adopt(format!("newly passing: {}", newly_passing.join(", ")));
+    if !improved.is_empty() {
+        return Verdict::Adopt(format!("newly passing: {}", improved.join(", ")));
     }
-    let (base, cand) = (baseline.tokens(), candidate.tokens());
-    if baseline.passed() == baseline.outcomes.len()
-        && base > 0
-        && (cand as f64) < (base as f64) * (1.0 - TOKEN_IMPROVEMENT)
-    {
-        return Verdict::Adopt(format!(
-            "same passes, tokens {} → {}",
-            crate::model::fmt_tokens(base),
-            crate::model::fmt_tokens(cand),
-        ));
+    let (base, cand) = (baseline.mean_tokens(), candidate.mean_tokens());
+    if baseline.all_green() && base > 0.0 {
+        // The drop must clear both the 10% floor and (with repetitions) a
+        // one-sided 95% bound on the difference of means.
+        let noise = 1.645
+            * (baseline.tokens_variance() / baseline.runs.len().max(1) as f64
+                + candidate.tokens_variance() / candidate.runs.len().max(1) as f64)
+                .sqrt();
+        let required = (base * TOKEN_IMPROVEMENT).max(noise);
+        if cand < base - required {
+            return Verdict::Adopt(format!(
+                "same passes, mean tokens {} → {}",
+                crate::model::fmt_tokens(base.round() as u64),
+                crate::model::fmt_tokens(cand.round() as u64),
+            ));
+        }
     }
     Verdict::Reject("no eval newly passes and tokens did not improve".to_string())
 }
@@ -353,6 +462,7 @@ async fn run_eval(
     http: &reqwest::Client,
     approvals: &Approvals,
 ) -> Result<EvalOutcome> {
+    let started = std::time::Instant::now();
     let task = eval.resolve_task(&config.base_dir)?;
     let order = config.resolve_workflow(eval.workflow.as_deref())?;
     if order.is_empty() {
@@ -440,19 +550,19 @@ async fn run_eval(
         run_check(config, eval, &last_output).await
     };
     let events = events.into_inner().unwrap();
+    let snapshot = usage.snapshot();
     Ok(EvalOutcome {
         name: eval.name.clone(),
         holdout: eval.holdout,
         passed: error.is_none() && check_passed,
         error,
-        tokens: {
-            let snapshot = usage.snapshot();
-            snapshot
-                .models
-                .values()
-                .map(|m| m.prompt_tokens + m.completion_tokens)
-                .sum()
-        },
+        tokens: snapshot
+            .models
+            .values()
+            .map(|m| m.prompt_tokens + m.completion_tokens)
+            .sum(),
+        usage: snapshot,
+        wall_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         check_excerpt,
         output_excerpt: reflect::excerpt(&last_output, MAX_OUTPUT_EXCERPT),
         signals: mine_signals(&events, reprompts),
@@ -493,14 +603,38 @@ async fn run_check(config: &Config, eval: &Eval, output: &str) -> (bool, String)
     }
 }
 
-async fn run_suite(
+/// Repeat the whole suite `repetitions` times for a noise-aware verdict.
+async fn run_suite_repeated(
     config: &Config,
+    mcp: &McpManager,
+    http: &reqwest::Client,
+    approvals: &Approvals,
+    repetitions: u32,
+) -> Result<SuiteStats> {
+    let mut runs = Vec::new();
+    for round in 1..=repetitions.max(1) {
+        if repetitions > 1 {
+            eprintln!("  (suite run {round}/{repetitions})");
+        }
+        runs.push(run_suite(config, &[], mcp, http, approvals).await?);
+    }
+    Ok(SuiteStats { runs })
+}
+
+/// Run the configured evals (all of them, or just the names in `filter`)
+/// and score each one. Shared by `soa evolve` and `soa eval`.
+pub(crate) async fn run_suite(
+    config: &Config,
+    filter: &[String],
     mcp: &McpManager,
     http: &reqwest::Client,
     approvals: &Approvals,
 ) -> Result<SuiteScore> {
     let mut outcomes = Vec::new();
     for eval in &config.evals {
+        if !filter.is_empty() && !filter.contains(&eval.name) {
+            continue;
+        }
         eprint!("  eval `{}` … ", eval.name);
         let outcome = run_eval(config, eval, mcp, http, approvals).await?;
         eprintln!(
@@ -601,6 +735,7 @@ pub async fn run(
     iterations: u32,
     dry_run: bool,
     model_override: Option<&str>,
+    suite_runs: u32,
 ) -> Result<()> {
     if config.evals.is_empty() {
         bail!(
@@ -650,18 +785,19 @@ pub async fn run(
     let approvals = Approvals::non_interactive();
 
     eprintln!("── evolve baseline ──");
-    let mut baseline = run_suite(config, &mcp, &http, &approvals).await?;
+    let mut baseline = run_suite_repeated(config, &mcp, &http, &approvals, suite_runs).await?;
     eprintln!("baseline: {}", baseline.describe());
 
     let proposer_usage = crate::model::UsageTracker::unlimited();
     let client =
-        crate::stage::build_model_client(config, &model, None, None, &http, &proposer_usage)?;
+        crate::stage::build_model_client(config, &model, None, None, &http, &proposer_usage, None)?;
 
     let mut adopted: Vec<String> = Vec::new();
     for iteration in 1..=iterations {
         eprintln!("\n── evolve iteration {iteration}/{iterations} ──");
         let history = load_history();
-        let prompt = build_proposer_prompt(config, &targets, &baseline, &history)?;
+        let representative = baseline.representative();
+        let prompt = build_proposer_prompt(config, &targets, &representative, &history)?;
         let messages = vec![
             Message::System {
                 content: SYSTEM_PROMPT.to_string(),
@@ -691,7 +827,7 @@ pub async fn run(
         }
 
         let backup = apply_target(config, target, &proposal.content)?;
-        let candidate = run_suite(config, &mcp, &http, &approvals).await?;
+        let candidate = run_suite_repeated(config, &mcp, &http, &approvals, suite_runs).await?;
         eprintln!("candidate: {}", candidate.describe());
         let verdict = compare(&baseline, &candidate);
         let (was_adopted, reason) = match &verdict {
@@ -748,14 +884,16 @@ mod tests {
             passed,
             error: None,
             tokens,
+            usage: crate::model::UsageSnapshot::default(),
+            wall_ms: 0,
             check_excerpt: String::new(),
             output_excerpt: String::new(),
             signals: Vec::new(),
         }
     }
 
-    fn suite(outcomes: Vec<EvalOutcome>) -> SuiteScore {
-        SuiteScore { outcomes }
+    fn suite(outcomes: Vec<EvalOutcome>) -> SuiteStats {
+        SuiteStats::single(SuiteScore { outcomes })
     }
 
     #[test]
@@ -792,6 +930,44 @@ mod tests {
         let baseline = suite(vec![outcome("a", false, false, 1000)]);
         let candidate = suite(vec![outcome("a", false, false, 100)]);
         assert!(matches!(compare(&baseline, &candidate), Verdict::Reject(_)));
+    }
+
+    #[test]
+    fn repeated_runs_gate_verdicts_on_pass_rate_and_noise() {
+        let stats = |runs: Vec<(bool, u64)>| SuiteStats {
+            runs: runs
+                .into_iter()
+                .map(|(passed, tokens)| SuiteScore {
+                    outcomes: vec![outcome("a", passed, false, tokens)],
+                })
+                .collect(),
+        };
+
+        // A pass-rate drop (2/2 → 1/2) rejects even though no single run
+        // pair shows a clean regression.
+        let baseline = stats(vec![(true, 1000), (true, 1000)]);
+        let flaky = stats(vec![(true, 900), (false, 900)]);
+        match compare(&baseline, &flaky) {
+            Verdict::Reject(reason) => assert!(reason.contains("2/2 → 1/2"), "{reason}"),
+            verdict => panic!("expected reject, got {verdict:?}"),
+        }
+
+        // A pass-rate improvement adopts.
+        let baseline = stats(vec![(false, 1000), (true, 1000)]);
+        let better = stats(vec![(true, 1000), (true, 1000)]);
+        assert!(matches!(compare(&baseline, &better), Verdict::Adopt(_)));
+
+        // Noisy baseline (1000 vs 2000): a drop that beats the 10% floor
+        // but sits inside the measured noise band is rejected…
+        let baseline = stats(vec![(true, 1000), (true, 2000)]);
+        let inside_noise = stats(vec![(true, 1300), (true, 1300)]);
+        assert!(matches!(
+            compare(&baseline, &inside_noise),
+            Verdict::Reject(_)
+        ));
+        // …while a drop that clears the noise band is adopted.
+        let clear_win = stats(vec![(true, 500), (true, 500)]);
+        assert!(matches!(compare(&baseline, &clear_win), Verdict::Adopt(_)));
     }
 
     #[test]

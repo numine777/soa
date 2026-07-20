@@ -1163,7 +1163,7 @@ impl App {
             return self.error("busy — wait for the current turn to finish");
         }
         let stage_name = self.stage().name.clone();
-        match Config::load(&self.config_path) {
+        match Config::load_with_overrides(&self.config_path, &self.config.overrides) {
             Ok(config) => {
                 self.config = Arc::new(config);
                 self.stage_index = self
@@ -1281,6 +1281,7 @@ impl App {
             stage.max_tokens,
             &self.http,
             &self.usage,
+            Some(&format!("stage:{}", stage.name)),
         ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),
@@ -1430,6 +1431,7 @@ impl App {
             stage.max_tokens,
             &self.http,
             &self.usage,
+            None,
         ) {
             Ok(client) => client,
             Err(e) => return self.error(format!("{e:#}")),

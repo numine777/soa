@@ -62,6 +62,11 @@ enum Command {
     Run {
         /// The task to perform.
         task: Vec<String>,
+        /// Read the task from a file instead of arguments or stdin, so
+        /// large prompts don't need repeated copy/paste. `@file` mentions
+        /// inside it are expanded as usual.
+        #[arg(long, value_name = "PATH", conflicts_with = "resume")]
+        task_file: Option<PathBuf>,
         /// Run only this stage instead of the whole pipeline.
         #[arg(long)]
         stage: Option<String>,
@@ -332,6 +337,7 @@ async fn main() -> Result<()> {
         }
         Command::Run {
             task,
+            task_file,
             stage,
             workflow,
             resume,
@@ -353,7 +359,15 @@ async fn main() -> Result<()> {
                 };
                 return resume_pipeline(&config, state, usage_json.as_deref()).await;
             }
-            let task = if task.is_empty() {
+            let task = if let Some(path) = task_file {
+                if !task.is_empty() {
+                    bail!("--task-file cannot be combined with a task argument");
+                }
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("cannot read task file {}", path.display()))?
+                    .trim()
+                    .to_string()
+            } else if task.is_empty() {
                 let mut buffer = String::new();
                 std::io::stdin()
                     .read_to_string(&mut buffer)
@@ -363,7 +377,7 @@ async fn main() -> Result<()> {
                 task.join(" ")
             };
             if task.is_empty() {
-                bail!("no task given (pass it as an argument or on stdin)");
+                bail!("no task given (pass it as an argument, on stdin, or via --task-file)");
             }
             // Expand @file mentions relative to the current directory.
             let cwd = std::env::current_dir().context("cannot determine working directory")?;

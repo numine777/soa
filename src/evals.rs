@@ -37,6 +37,9 @@ struct RunMetrics {
     unreported_requests: u64,
     turns: u64,
     tool_calls: u64,
+    /// Calls by tool name, merged across scopes — proves *which* tools ran
+    /// (e.g. that a CLI rule actually shifted calls into your CLI).
+    tools: BTreeMap<String, u64>,
     wall_ms: u64,
     /// Per-stage/agent breakdown — where the tokens actually went.
     scopes: BTreeMap<String, ScopeUsage>,
@@ -69,6 +72,15 @@ impl RunMetrics {
             unreported_requests: unreported,
             turns: outcome.usage.scopes.values().map(|s| s.turns).sum(),
             tool_calls: outcome.usage.scopes.values().map(|s| s.tool_calls).sum(),
+            tools: {
+                let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+                for scope in outcome.usage.scopes.values() {
+                    for (name, count) in &scope.tools {
+                        *merged.entry(name.clone()).or_insert(0) += count;
+                    }
+                }
+                merged
+            },
             wall_ms: outcome.wall_ms,
             scopes: outcome.usage.scopes.clone(),
         }
@@ -86,6 +98,8 @@ struct Aggregate {
     mean_cost_usd: f64,
     mean_turns: f64,
     mean_tool_calls: f64,
+    /// Mean calls per execution by tool name (absent runs count as 0).
+    mean_tool_calls_by_name: BTreeMap<String, f64>,
     mean_wall_ms: f64,
 }
 
@@ -102,6 +116,16 @@ impl Aggregate {
             mean_cost_usd: mean(&|m| m.cost_usd),
             mean_turns: mean(&|m| m.turns as f64),
             mean_tool_calls: mean(&|m| m.tool_calls as f64),
+            mean_tool_calls_by_name: {
+                let mut totals: BTreeMap<String, f64> = BTreeMap::new();
+                for metric in metrics {
+                    for (name, count) in &metric.tools {
+                        *totals.entry(name.clone()).or_insert(0.0) += *count as f64;
+                    }
+                }
+                totals.values_mut().for_each(|total| *total /= n);
+                totals
+            },
             mean_wall_ms: mean(&|m| m.wall_ms as f64),
         }
     }
@@ -261,6 +285,7 @@ mod tests {
             ScopeUsage {
                 turns: 3,
                 tool_calls: 7,
+                tools: BTreeMap::from([("shell".into(), 5), ("read_file".into(), 2)]),
                 ..ScopeUsage::default()
             },
         );
@@ -269,6 +294,7 @@ mod tests {
             ScopeUsage {
                 turns: 2,
                 tool_calls: 4,
+                tools: BTreeMap::from([("shell".into(), 4)]),
                 ..ScopeUsage::default()
             },
         );
@@ -291,6 +317,8 @@ mod tests {
         assert_eq!(metrics.cache_read_tokens, 400);
         assert_eq!(metrics.unpriced_requests, 1);
         assert_eq!((metrics.turns, metrics.tool_calls), (5, 11));
+        assert_eq!(metrics.tools["shell"], 9);
+        assert_eq!(metrics.tools["read_file"], 2);
         assert_eq!(metrics.wall_ms, 1_234);
         assert_eq!(metrics.scopes.len(), 2);
     }
@@ -310,6 +338,7 @@ mod tests {
             unreported_requests: 0,
             turns: 4,
             tool_calls: 6,
+            tools: BTreeMap::from([("shell".into(), 6)]),
             wall_ms: 100,
             scopes: BTreeMap::new(),
         };
@@ -324,5 +353,6 @@ mod tests {
         );
         assert!((aggregate.mean_turns - 4.0).abs() < f64::EPSILON);
         assert!((aggregate.mean_cost_usd - 0.02).abs() < f64::EPSILON);
+        assert!((aggregate.mean_tool_calls_by_name["shell"] - 6.0).abs() < f64::EPSILON);
     }
 }

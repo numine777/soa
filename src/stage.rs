@@ -1694,7 +1694,7 @@ pub async fn run_agent_loop(
 
         usage.record_tool_calls(
             &format!("{}:{}", options.owner_kind, options.owner),
-            reply.tool_calls.len() as u64,
+            reply.tool_calls.iter().map(|call| call.function.name.as_str()),
         );
         record_loop_event(
             &mut events,

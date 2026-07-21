@@ -51,6 +51,7 @@ soa check              # validate the config (cross-references, templates, promp
 soa stages             # list the configured pipeline
 soa tools              # connect to every MCP server, list tools with ro/rw markers
 soa run "task"         # run the default workflow (or: echo "task" | soa run)
+soa run --task-file prompt.md # read the task from a file (no copy/paste for large prompts)
 soa run -w quickfix "task"    # run a named workflow
 soa run --stage plan "task"   # run a single stage
 soa run --resume       # continue this directory's interrupted run (--resume <id> for a specific one)
@@ -70,9 +71,11 @@ soa --set 'stage.plan.skills=[]' …   # overlay one config value for this invoc
 
 **Measuring token economics.** `soa eval` runs every `[[eval]]` and prints a
 JSON report to stdout: per eval and per run, pass/fail, prompt/completion/
-cached/reasoning tokens, known cost, model turns, tool calls, wall time, and
-a per-stage/agent breakdown; aggregates carry pass rate and mean/min/max
-tokens. Combined with `--set`, an A/B for any input is two commands:
+cached/reasoning tokens, known cost, model turns, tool calls (in total and
+by tool name — so a rule ablation shows *which* tools the model reached
+for, not just how often), wall time, and a per-stage/agent breakdown;
+aggregates carry pass rate, mean/min/max tokens, and mean calls per tool.
+Combined with `--set`, an A/B for any input is two commands:
 
 ```sh
 soa eval --runs 3 > with-skill.json

@@ -366,6 +366,11 @@ pub struct ScopeUsage {
     pub turns: u64,
     #[serde(default)]
     pub tool_calls: u64,
+    /// Calls broken down by tool name — the evidence that a rule or skill
+    /// actually changed *which* tools a stage reaches for, not just how
+    /// many times it reached.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, u64>,
     #[serde(default)]
     pub prompt_tokens: u64,
     #[serde(default)]
@@ -653,14 +658,19 @@ impl UsageTracker {
     }
 
     /// Attribute tool calls requested by a scope's model responses; the
-    /// agent loop reports them as each fresh response arrives.
-    pub fn record_tool_calls(&self, scope: &str, count: u64) {
-        if count == 0 {
+    /// agent loop reports them (by tool name) as each fresh response
+    /// arrives.
+    pub fn record_tool_calls<'a>(&self, scope: &str, names: impl IntoIterator<Item = &'a str>) {
+        let mut names = names.into_iter().peekable();
+        if names.peek().is_none() {
             return;
         }
         let mut state = self.inner.state.lock().unwrap();
         let entry = state.scopes.entry(scope.to_string()).or_default();
-        entry.tool_calls = entry.tool_calls.saturating_add(count);
+        for name in names {
+            entry.tool_calls = entry.tool_calls.saturating_add(1);
+            *entry.tools.entry(name.to_string()).or_insert(0) += 1;
+        }
     }
 
     /// Run an operation under the remaining wall-clock budget. This wraps
@@ -752,8 +762,22 @@ impl UsageTracker {
             lines.push(format!("{label}: {}", details.join(" · ")));
         }
         for (scope, usage) in &snapshot.scopes {
+            let by_tool = if usage.tools.is_empty() {
+                String::new()
+            } else {
+                let mut counts: Vec<(&String, &u64)> = usage.tools.iter().collect();
+                counts.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                format!(
+                    " ({})",
+                    counts
+                        .iter()
+                        .map(|(name, count)| format!("{name} ×{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             lines.push(format!(
-                "{scope}: {} turn(s) · {} tool call(s) · {} in{} + {} out · {}",
+                "{scope}: {} turn(s) · {} tool call(s){by_tool} · {} in{} + {} out · {}",
                 usage.turns,
                 usage.tool_calls,
                 fmt_tokens(usage.prompt_tokens),
@@ -1370,7 +1394,7 @@ mod tests {
             Some(None),
             ModelPricing::default(),
         );
-        tracker.record_tool_calls("stage:test", 3);
+        tracker.record_tool_calls("stage:test", ["shell", "read_file", "shell"]);
 
         let snapshot = tracker.snapshot();
         let model_a = &snapshot.models["model-a"];
@@ -1401,6 +1425,8 @@ mod tests {
             (1, 3, 1_000, 100)
         );
         assert!((scope.cost_usd - 0.0028).abs() < f64::EPSILON);
+        assert_eq!(scope.tools["shell"], 2);
+        assert_eq!(scope.tools["read_file"], 1);
         assert!(!snapshot.scopes.contains_key("model-b"));
 
         let report = tracker.report_lines().join("\n");
@@ -1412,7 +1438,7 @@ mod tests {
         assert!(report.contains("1 without usage"), "{report}");
         assert!(report.contains("external"), "{report}");
         assert!(
-            report.contains("stage:test: 1 turn(s) · 3 tool call(s)"),
+            report.contains("stage:test: 1 turn(s) · 3 tool call(s) (shell ×2, read_file ×1)"),
             "{report}"
         );
     }

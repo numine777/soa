@@ -569,6 +569,19 @@ async fn run_eval(
     })
 }
 
+/// Like [`reflect::excerpt`] but keeps the END of the text — build and
+/// test logs put the verdict last, so the tail is the diagnostic part.
+fn tail_excerpt(text: &str, max_chars: usize) -> String {
+    let squashed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = squashed.chars().count();
+    if count <= max_chars {
+        squashed
+    } else {
+        let kept: String = squashed.chars().skip(count - max_chars).collect();
+        format!("…{kept}")
+    }
+}
+
 async fn run_check(config: &Config, eval: &Eval, output: &str) -> (bool, String) {
     let timeout = std::time::Duration::from_secs(
         eval.timeout_secs.unwrap_or(config.settings.shell_timeout_secs),
@@ -597,7 +610,7 @@ async fn run_check(config: &Config, eval: &Eval, output: &str) -> (bool, String)
             }
             (
                 result.status.success(),
-                reflect::excerpt(&text, MAX_CHECK_EXCERPT),
+                tail_excerpt(&text, MAX_CHECK_EXCERPT),
             )
         }
     }
@@ -646,6 +659,11 @@ pub(crate) async fn run_suite(
                 .map(|e| format!(" ({})", reflect::excerpt(e, 120)))
                 .unwrap_or_default(),
         );
+        // A check failure without the check's own words is undebuggable —
+        // show the tail of its output right where the FAIL is reported.
+        if !outcome.passed && outcome.error.is_none() && !outcome.check_excerpt.is_empty() {
+            eprintln!("    check: {}", tail_excerpt(&outcome.check_excerpt, 400));
+        }
         outcomes.push(outcome);
     }
     Ok(SuiteScore { outcomes })
@@ -968,6 +986,15 @@ mod tests {
         // …while a drop that clears the noise band is adopted.
         let clear_win = stats(vec![(true, 500), (true, 500)]);
         assert!(matches!(compare(&baseline, &clear_win), Verdict::Adopt(_)));
+    }
+
+    #[test]
+    fn tail_excerpt_keeps_the_end_of_long_output() {
+        assert_eq!(tail_excerpt("short output", 100), "short output");
+        let long = format!("{} FAILED: bazel test //x:y", "noise ".repeat(200));
+        let tail = tail_excerpt(&long, 40);
+        assert!(tail.starts_with('…'), "{tail}");
+        assert!(tail.ends_with("FAILED: bazel test //x:y"), "{tail}");
     }
 
     #[test]

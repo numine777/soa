@@ -25,6 +25,11 @@ struct RunMetrics {
     passed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Tail of the check command's stdout+stderr, present only when the
+    /// check failed (including "check timed out after Ns") — so a failing
+    /// arm is diagnosable from the report alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_output: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -62,6 +67,8 @@ impl RunMetrics {
         RunMetrics {
             passed: outcome.passed,
             error: outcome.error.clone(),
+            check_output: (!outcome.passed && !outcome.check_excerpt.is_empty())
+                .then(|| outcome.check_excerpt.clone()),
             prompt_tokens: prompt,
             completion_tokens: completion,
             cache_read_tokens: cached,
@@ -311,6 +318,18 @@ mod tests {
             signals: Vec::new(),
         };
         let metrics = RunMetrics::from_outcome(&outcome);
+        assert!(metrics.check_output.is_none());
+
+        // A failed check's output travels into the report.
+        let failed = EvalOutcome {
+            passed: false,
+            check_excerpt: "…FAILED: bazel build".to_string(),
+            ..outcome.clone()
+        };
+        assert_eq!(
+            RunMetrics::from_outcome(&failed).check_output.as_deref(),
+            Some("…FAILED: bazel build")
+        );
         assert_eq!(metrics.prompt_tokens, 1_500);
         assert_eq!(metrics.completion_tokens, 150);
         assert_eq!(metrics.total_tokens, 1_650);
@@ -328,6 +347,7 @@ mod tests {
         let run = |passed: bool, tokens: u64| RunMetrics {
             passed,
             error: None,
+            check_output: None,
             prompt_tokens: tokens,
             completion_tokens: 0,
             cache_read_tokens: 0,

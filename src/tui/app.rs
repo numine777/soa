@@ -1294,6 +1294,7 @@ impl App {
                     &format!("stage `{}`", stage.name),
                     system,
                     &stage.skills,
+                    stage.brain,
                 )
             }) {
             Ok(system) => system,

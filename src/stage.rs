@@ -82,6 +82,10 @@ pub enum ToolBinding {
     File {
         op: crate::files::FileOp,
     },
+    /// A brain tool: persistent memory in the brain directory.
+    Brain {
+        op: crate::brain::BrainOp,
+    },
 }
 
 /// Compact set of observable effects attached to a tool. Keeping this
@@ -162,6 +166,7 @@ pub struct ToolProfile<'a> {
     pub shell: bool,
     pub shell_allow: &'a [String],
     pub files: bool,
+    pub brain: bool,
 }
 
 impl crate::config::Stage {
@@ -176,6 +181,7 @@ impl crate::config::Stage {
             shell: self.shell,
             shell_allow: &self.shell_allow,
             files: self.files,
+            brain: self.brain,
         }
     }
 }
@@ -192,6 +198,7 @@ impl crate::config::Agent {
             shell: self.shell,
             shell_allow: &self.shell_allow,
             files: self.files,
+            brain: self.brain,
         }
     }
 }
@@ -446,6 +453,26 @@ pub fn assemble_tools(
         }
     }
 
+    // `brain = true` exposes the persistent-memory tools. Like `shell`,
+    // this is an explicit grant independent of `mode` — a read_only review
+    // stage can record a lesson it learned — but the write tools carry the
+    // filesystem_write effect, so approvals still gate them and a
+    // brain-writing agent is not offered through a read-only delegation
+    // boundary.
+    if profile.brain {
+        for (definition, op) in crate::brain::definitions() {
+            stage_tools.push(StageTool {
+                definition,
+                binding: ToolBinding::Brain { op },
+                effects: ToolEffects::one(if op.mutating() {
+                    ToolEffect::FilesystemWrite
+                } else {
+                    ToolEffect::FilesystemRead
+                }),
+            });
+        }
+    }
+
     if depth < config.settings.max_agent_depth {
         for agent_name in profile.subagents {
             let agent = config
@@ -669,6 +696,15 @@ pub fn call_descriptor(binding: &ToolBinding, arguments: &Value) -> CallDescript
             let path = args.get("path").and_then(Value::as_str).unwrap_or("?");
             CallDescriptor {
                 descriptor: format!("{} {}", op.tool_name(), truncate(path, 160)),
+                detail: truncate(&detail_json, 200),
+                always_pattern: format!("{} *", op.tool_name()),
+                pattern_safe: true,
+            }
+        }
+        ToolBinding::Brain { op } => {
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("?");
+            CallDescriptor {
+                descriptor: format!("{} {}", op.tool_name(), truncate(name, 160)),
                 detail: truncate(&detail_json, 200),
                 always_pattern: format!("{} *", op.tool_name()),
                 pattern_safe: true,
@@ -923,6 +959,14 @@ async fn dispatch_tool_call_inner(
                 "file tool"
             );
             Ok(crate::files::dispatch(*op, arguments))
+        }
+        ToolBinding::Brain { op } => {
+            tracing::info!(
+                tool = op.tool_name(),
+                args = %truncate(&arguments_preview(arguments), 200),
+                "brain tool"
+            );
+            Ok(crate::brain::dispatch(config, *op, arguments))
         }
     }
 }
@@ -1231,13 +1275,17 @@ async fn execute_agent_loop_tool(
     let output = match bindings.get(call.function.name.as_str()) {
         None => format!("ERROR: unknown tool `{}`", call.function.name),
         Some(tool) => {
-            let snapshots = if options.on_diff.is_some()
-                && tool.effects.mutating_or_process()
-                && matches!(
-                    tool.binding,
-                    ToolBinding::Mcp { .. } | ToolBinding::File { .. }
-                ) {
-                crate::diff::snapshot(&crate::diff::extract_paths(&call.function.arguments))
+            let snapshots = if options.on_diff.is_some() && tool.effects.mutating_or_process() {
+                let paths = match &tool.binding {
+                    ToolBinding::Mcp { .. } | ToolBinding::File { .. } => {
+                        crate::diff::extract_paths(&call.function.arguments)
+                    }
+                    ToolBinding::Brain { op } => {
+                        crate::brain::affected_paths(config, *op, &call.function.arguments)
+                    }
+                    _ => Vec::new(),
+                };
+                crate::diff::snapshot(&paths)
             } else {
                 Vec::new()
             };
@@ -1745,6 +1793,7 @@ pub fn run_agent<'a>(
             &format!("agent `{agent_name}`"),
             agent.resolve_system_prompt(&config.base_dir)?,
             &agent.skills,
+            agent.brain,
         )?;
         let max_turns = agent.max_turns.unwrap_or(config.settings.default_max_turns);
         let tool_choice = agent.parsed_tool_choice();
@@ -1952,6 +2001,7 @@ pub async fn run_stage(
         &format!("stage `{}`", stage.name),
         stage.resolve_system_prompt(&config.base_dir)?,
         &stage.skills,
+        stage.brain,
     )?;
     let max_turns = stage.max_turns.unwrap_or(config.settings.default_max_turns);
     let tool_choice = stage.parsed_tool_choice();
@@ -3318,6 +3368,58 @@ mod tests {
         );
         assert_eq!(descriptor.descriptor, "web_fetch https://example.com/doc");
         assert_eq!(descriptor.always_pattern, "web_fetch *");
+    }
+
+    #[test]
+    fn brain_tools_are_assembled_from_the_profile_flag() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            brain = true
+
+            [agents.learner]
+            model = "m"
+            brain = true
+            description = "remembers"
+            "#,
+        )
+        .unwrap();
+        let mcp = McpManager::default();
+        // Like shell, `brain = true` is an explicit grant independent of
+        // mode: even this read_only stage gets all three tools.
+        let tools = assemble_tools(&config.stages[0].tool_profile(), &config, &mcp, 0).unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["brain_read", "brain_write", "brain_forget"]);
+        assert!(!tools[0].effects.mutating_or_process()); // read: parallel-safe
+        assert!(tools[1].effects.contains(ToolEffect::FilesystemWrite));
+        assert!(tools[2].effects.contains(ToolEffect::FilesystemWrite));
+
+        // The write effect makes a brain-granted agent unavailable through
+        // a read-only delegation boundary, exactly like a shell grant.
+        let agent = &config.agents["learner"];
+        let agent_tools = assemble_tools(&agent.tool_profile("learner"), &config, &mcp, 1).unwrap();
+        let agent_effects = agent_tools
+            .iter()
+            .fold(ToolEffects::NONE, |all, tool| all.union(tool.effects));
+        assert!(!agent_effects.read_only_safe());
+
+        let descriptor = call_descriptor(
+            &ToolBinding::Brain {
+                op: crate::brain::BrainOp::Write,
+            },
+            &serde_json::json!({"name": "api-retry-policy", "description": "d", "content": "c"}),
+        );
+        assert_eq!(descriptor.descriptor, "brain_write api-retry-policy");
+        assert_eq!(descriptor.always_pattern, "brain_write *");
     }
 
     #[test]

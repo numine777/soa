@@ -520,18 +520,8 @@ fn guard_lesson_wipe(existing: &[String], proposed: Vec<String>) -> (Vec<String>
 }
 
 /// A safe skill filename: lowercase kebab-case, or None if nothing usable
-/// remains.
-fn slug(name: &str) -> Option<String> {
-    let cleaned: String = name
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let parts: Vec<&str> = cleaned.split('-').filter(|p| !p.is_empty()).collect();
-    let slug = parts.join("-");
-    (!slug.is_empty() && slug.len() <= 64).then_some(slug)
-}
+/// remains (shared with brain memory names).
+use crate::brain::slug;
 
 /// The lessons currently in the managed block of the given file.
 pub(crate) fn read_lessons(path: &std::path::Path) -> Vec<String> {

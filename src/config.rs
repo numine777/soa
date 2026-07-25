@@ -124,6 +124,10 @@ pub struct Settings {
     /// Directory holding skills, relative to the config file (default
     /// `skills/`). The global `~/.local/share/soa/skills` is also searched.
     pub skills_dir: Option<PathBuf>,
+    /// Directory holding the brain — `BRAIN.md` plus one file per stored
+    /// memory — relative to the config file (default `brain/`). See
+    /// [`crate::brain`].
+    pub brain_dir: Option<PathBuf>,
     /// Workflow used by `soa run` when none is passed. Falls back to a
     /// workflow literally named `default`, then to the [[stage]] order.
     pub default_workflow: Option<String>,
@@ -213,6 +217,7 @@ impl Default for Settings {
             shell_timeout_secs: default_shell_timeout(),
             mcp_timeout_secs: default_mcp_timeout(),
             skills_dir: None,
+            brain_dir: None,
             default_workflow: None,
             context_files: default_context_files(),
             reflect_model: None,
@@ -491,6 +496,9 @@ pub struct Agent {
     /// (write tools only in read_write mode).
     #[serde(default)]
     pub files: bool,
+    /// Offer the brain tools (see the stage field of the same name).
+    #[serde(default)]
+    pub brain: bool,
     /// Pause mutation/process effects, plus `approval_effects`, for
     /// interactive approval.
     #[serde(default)]
@@ -774,6 +782,13 @@ pub struct Stage {
     /// working directory.
     #[serde(default)]
     pub files: bool,
+    /// Offer the brain tools (brain_read, brain_write, brain_forget):
+    /// persistent memory the model can consult and add lessons to. Like
+    /// `shell`, an explicit grant independent of `mode` — writes are
+    /// confined to the brain directory but still carry the
+    /// `filesystem_write` effect for approvals and delegation safety.
+    #[serde(default)]
+    pub brain: bool,
     /// Pause mutation/process effects, plus `approval_effects`, for
     /// interactive approval (y/n/always).
     /// Without an interactive approver (piped runs), gated calls are denied.

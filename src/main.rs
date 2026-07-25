@@ -1,4 +1,5 @@
 mod approval;
+mod brain;
 mod config;
 mod diff;
 mod evals;
@@ -104,6 +105,8 @@ enum Command {
     Sessions,
     /// List discoverable skills.
     Skills,
+    /// List the brain's stored memories (persistent agent memory).
+    Brain,
     /// Run the [[eval]] suite as a measurement: score every eval, repeat
     /// with --runs for stable numbers, and print a JSON metrics report
     /// (pass rate, tokens, cost, turns, tool calls, wall time, per-stage
@@ -195,12 +198,19 @@ async fn main() -> Result<()> {
                     &format!("stage `{}`", stage.name),
                     system,
                     &stage.skills,
+                    stage.brain,
                 )?;
                 stage.resolve_output_schema(&config.base_dir)?;
             }
             for (name, agent) in &config.agents {
                 let system = agent.resolve_system_prompt(&config.base_dir)?;
-                skills::compose_system(&config, &format!("agent `{name}`"), system, &agent.skills)?;
+                skills::compose_system(
+                    &config,
+                    &format!("agent `{name}`"),
+                    system,
+                    &agent.skills,
+                    agent.brain,
+                )?;
                 agent.resolve_output_schema(&config.base_dir)?;
             }
             println!("config: {}", config_path.display());
@@ -231,6 +241,26 @@ async fn main() -> Result<()> {
                     "project instructions: {} ({} chars)",
                     context.path.display(),
                     context.content.len()
+                );
+            }
+            let memories = brain::list_memories(&config);
+            let brain_users: Vec<&str> = config
+                .stages
+                .iter()
+                .filter(|s| s.brain)
+                .map(|s| s.name.as_str())
+                .chain(config.agents.iter().filter(|(_, a)| a.brain).map(|(n, _)| n.as_str()))
+                .collect();
+            if !memories.is_empty() || !brain_users.is_empty() {
+                println!(
+                    "brain: {} ({} memory file(s); tools granted to: {})",
+                    brain::brain_dir(&config).display(),
+                    memories.len(),
+                    if brain_users.is_empty() {
+                        "nobody — set brain = true on a stage or agent".to_string()
+                    } else {
+                        brain_users.join(", ")
+                    }
                 );
             }
             Ok(())
@@ -305,6 +335,30 @@ async fn main() -> Result<()> {
                         &skill.description
                     },
                     skill.path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Brain => {
+            let memories = brain::list_memories(&config);
+            if memories.is_empty() {
+                println!(
+                    "the brain is empty ({}) — grant a stage `brain = true` and it \
+                     will save memories as it learns",
+                    brain::brain_dir(&config).display()
+                );
+                return Ok(());
+            }
+            for memory in memories {
+                println!(
+                    "{}  {}  ({})",
+                    memory.name,
+                    if memory.description.is_empty() {
+                        "-"
+                    } else {
+                        &memory.description
+                    },
+                    memory.path.display()
                 );
             }
             Ok(())

@@ -58,6 +58,7 @@ soa run --resume       # continue this directory's interrupted run (--resume <id
 soa runs               # list interrupted runs that can be resumed
 soa chat               # interactive TUI (--stage <name> to pick, default first stage)
 soa skills             # list discoverable skills
+soa brain              # list the brain's stored memories
 soa eval               # run the [[eval]] suite as a measurement; JSON metrics on stdout
                        #   (--runs N to repeat for stable numbers, --eval <name> to filter)
 soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
@@ -238,6 +239,68 @@ instructions. Missing and blank files are skipped, absolute paths are read
 as-is, and `soa check` reports what was found. Files are read once at
 startup — restart `soa chat` to pick up edits.
 
+## The brain (`BRAIN.md`): persistent memory
+
+The brain is how a running agent learns lessons that survive the run. It
+follows a two-tier layout so accumulated knowledge never blows out the
+context window:
+
+- **`BRAIN.md`** (in `settings.brain_dir`, default `brain/` next to the
+  config) is appended to every stage and agent system prompt, like project
+  instructions. It holds hand-written core notes plus a managed **memory
+  index**: one line per stored memory (`name — description`), regenerated
+  from the memory files themselves so the in-context view can never drift
+  from what's on disk — even after hand edits or a git revert.
+- **`brain/<name>.md`** files each hold one full memory behind
+  `name`/`description` frontmatter. Only the index line costs context;
+  the body is fetched on demand.
+
+A stage or agent opts into the tools with `brain = true`:
+
+```toml
+[[stage]]
+name = "implement"
+mode = "read_write"
+brain = true
+```
+
+- `brain_read <name>` — fetch a memory's full content. The system prompt
+  tells the model to consult the index before working in an area a memory
+  covers.
+- `brain_write <name> <description> <content>` — save or update a memory
+  (kebab-case name; writing an existing name replaces it). The index block
+  in `BRAIN.md` is regenerated in the same call.
+- `brain_forget <name>` — delete a memory that proved wrong.
+
+Like `shell`, the grant is independent of `mode` — a read-only review
+stage can record the lesson it just learned — but writes are confined to
+the brain directory and carry the `filesystem_write` effect, so
+`require_approval` gates them (`auto_approve = ["brain_write *"]` to wave
+them through) and a brain-writing subagent is not offered across a
+read-only delegation boundary. Contexts *without* the grant still receive
+the index in their system prompt (with file paths instead of tool
+instructions) whenever the brain is non-empty, so lessons reach every
+model.
+
+Everything is plain files: review what the agent learned with `git diff`,
+prune or edit memories by hand (the index self-heals on the next write),
+and keep core, always-in-context rules in `BRAIN.md` outside the managed
+block. Brain calls are ordinary tools, so they show up in `── usage ──`
+summaries and `soa eval`'s per-tool call counts — and because `brain` is a
+config flag, an A/B measuring what the accumulated memory is worth is two
+commands:
+
+```sh
+soa eval --runs 3 > with-brain.json
+soa --set 'stage.implement.brain=false' eval --runs 3 > without-brain.json
+```
+
+The division of labor with the other memory surfaces: `SOA.md` lessons
+(via `soa reflect`) are short rules distilled *between* runs from failure
+signals; skills are curated procedures you attach explicitly; the brain is
+what the agent itself chooses to remember *during* runs, with cheap
+always-on pointers and full recall on demand.
+
 ## Evolution (`soa evolve`)
 
 Where `reflect` proposes once and never learns whether it helped, `evolve`
@@ -368,6 +431,7 @@ Project-local `soa.toml` files are gitignored in this repository.
 | `shell_timeout_secs` | 120 | shell-tool commands are killed after this many seconds |
 | `mcp_timeout_secs` | 60 | MCP handshakes and individual tool calls are abandoned after this many seconds, so a wedged (but not crashed) server can't hang a stage; an abandoned call triggers the usual reconnect-and-retry |
 | `skills_dir` | `skills/` | directory of skills, relative to the config file |
+| `brain_dir` | `brain/` | the brain's directory (`BRAIN.md` + one file per memory), relative to the config file — see [The brain](#the-brain-brainmd-persistent-memory) |
 | `context_files` | `["SOA.md"]` | project-instruction files, each discovered by walking up from the working directory and sourced into every system prompt in the listed order (see below) |
 | `default_workflow` | – | workflow `soa run` uses when `-w` isn't passed (falls back to a workflow named `default`, then the `[[stage]]` order) |
 | `parallel_tools` | true | when a model emits several effect-safe tool calls in one round and none requires approval, dispatch them concurrently. Mutation, process execution, approval-gated calls, and `reprompt_stage` always stay sequential. Results are recorded in call order either way. |
@@ -569,6 +633,7 @@ model = "planner"            # key into [models]
 mode = "read_only"           # or "read_write" (default: read_only)
 mcp = ["filesystem"]         # keys into [mcp]
 files = true                 # built-in file tools (see "File tools")
+brain = true                 # persistent-memory tools (see "The brain")
 web_search = true            # expose the SearXNG web_search tool
 web_fetch = true             # expose the built-in URL-fetching tool
 system_prompt = "..."        # or system_prompt_file = "prompts/research.md"

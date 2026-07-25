@@ -47,6 +47,10 @@ provider_retries = 3
 # tool errors, rolled-back changes) into a lessons block in SOA.md and,
 # occasionally, new skill files. Defaults to the first stage's model.
 # reflect_model = "planner"
+# The brain — persistent agent memory — lives here, relative to this file:
+# BRAIN.md (always in context) plus one markdown file per stored memory
+# (fetched on demand with brain_read). See the `brain = true` stage flag.
+# brain_dir = "brain"
 
 # ---------------------------------------------------------------------------
 # Providers: model endpoints plus their wire adapters. The default adapter is
@@ -190,6 +194,12 @@ mcp = ["filesystem"]
 subagents = ["researcher"]
 skills = ["careful-editing"]     # from skills/ next to this file (settings.skills_dir)
 shell = true                     # unrestricted shell (stage is read_write anyway)
+# Persistent memory: BRAIN.md's memory index reaches every system prompt;
+# this grant adds brain_read (fetch a memory's full content) and
+# brain_write/brain_forget (save durable lessons for future runs). Like
+# shell, the grant is independent of mode, but writes carry the
+# filesystem_write effect, so require_approval gates them.
+brain = true
 # Pause writes and non-cargo shell commands for interactive y/n/always
 # approval; cargo builds and researcher delegations run unprompted.
 # Broad shell approvals cover only simple commands, never compound shell

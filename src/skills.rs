@@ -91,37 +91,51 @@ pub fn list_skills(config: &Config) -> Vec<Skill> {
 
 /// Split optional `---` frontmatter (name/description) from the body.
 fn parse_skill(name: &str, raw: &str, path: PathBuf) -> Skill {
-    let mut skill = Skill {
-        name: name.to_string(),
-        description: String::new(),
-        body: raw.trim().to_string(),
+    let (name, description, body) = parse_frontmatter(name, raw);
+    Skill {
+        name,
+        description,
+        body,
         path,
+    }
+}
+
+/// Shared frontmatter parsing for skills and brain memories: returns
+/// (name, description, body), with `fallback_name` when the frontmatter
+/// doesn't override it.
+pub(crate) fn parse_frontmatter(fallback_name: &str, raw: &str) -> (String, String, String) {
+    let mut name = fallback_name.to_string();
+    let mut description = String::new();
+    let Some(rest) = raw.strip_prefix("---") else {
+        return (name, description, raw.trim().to_string());
     };
-    let Some(rest) = raw.strip_prefix("---") else { return skill };
-    let Some(end) = rest.find("\n---") else { return skill };
-    let frontmatter = &rest[..end];
-    skill.body = rest[end + 4..].trim().to_string();
-    for line in frontmatter.lines() {
+    let Some(end) = rest.find("\n---") else {
+        return (name, description, raw.trim().to_string());
+    };
+    for line in rest[..end].lines() {
         if let Some((key, value)) = line.split_once(':') {
             match key.trim() {
-                "name" => skill.name = value.trim().to_string(),
-                "description" => skill.description = value.trim().to_string(),
+                "name" => name = value.trim().to_string(),
+                "description" => description = value.trim().to_string(),
                 _ => {}
             }
         }
     }
-    skill
+    (name, description, rest[end + 4..].trim().to_string())
 }
 
 /// Compose the final system prompt for a stage or agent: the base prompt,
 /// then the named skills, then any project-instruction files
-/// (`settings.context_files`) in their configured order. `owner` is used
-/// in errors.
+/// (`settings.context_files`) in their configured order, then the brain
+/// section (see [`crate::brain`]). `owner` is used in errors; `brain_tools`
+/// says whether this context exposes the brain tools, which selects the
+/// brain section's guidance.
 pub fn compose_system(
     config: &Config,
     owner: &str,
     system: Option<String>,
     skill_names: &[String],
+    brain_tools: bool,
 ) -> Result<Option<String>> {
     let mut composed = system.unwrap_or_default();
     let mut append = |section: String| {
@@ -138,6 +152,9 @@ pub fn compose_system(
     for context in &config.project_contexts {
         let name = context.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
         append(format!("# Project instructions ({name})\n\n{}", context.content.trim_end()));
+    }
+    if let Some(section) = crate::brain::compose_section(config, brain_tools) {
+        append(section);
     }
     Ok((!composed.is_empty()).then_some(composed))
 }
@@ -204,6 +221,7 @@ mod tests {
             "stage `s`",
             Some("Base prompt.".to_string()),
             &["flat".to_string(), "nested".to_string()],
+            false,
         )
         .unwrap()
         .unwrap();
@@ -212,7 +230,7 @@ mod tests {
         assert!(composed.contains("# Skill: nested\n\nNESTED BODY"));
 
         // Missing skill errors with the owner named.
-        let err = compose_system(&config, "stage `s`", None, &["ghost".to_string()])
+        let err = compose_system(&config, "stage `s`", None, &["ghost".to_string()], false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("stage `s`"), "{err}");
@@ -229,7 +247,7 @@ mod tests {
             },
         ];
         let with_context =
-            compose_system(&config, "stage `s`", Some("Base.".to_string()), &["flat".to_string()])
+            compose_system(&config, "stage `s`", Some("Base.".to_string()), &["flat".to_string()], false)
                 .unwrap()
                 .unwrap();
         assert!(with_context.starts_with("Base.\n\n# Skill: flat"));
@@ -238,10 +256,10 @@ mod tests {
              # Project instructions (SOA.md)\n\nUse rebase, not merge."
         ));
         // Context alone still yields a system prompt; nothing at all yields None.
-        let alone = compose_system(&config, "stage `s`", None, &[]).unwrap().unwrap();
+        let alone = compose_system(&config, "stage `s`", None, &[], false).unwrap().unwrap();
         assert!(alone.starts_with("# Project instructions"));
         config.project_contexts = Vec::new();
-        assert!(compose_system(&config, "stage `s`", None, &[]).unwrap().is_none());
+        assert!(compose_system(&config, "stage `s`", None, &[], false).unwrap().is_none());
 
         let listed = list_skills(&config);
         assert_eq!(

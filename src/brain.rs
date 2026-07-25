@@ -330,6 +330,64 @@ pub fn affected_paths(config: &Config, op: BrainOp, arguments: &Value) -> Vec<St
     ]
 }
 
+/// A successful [`save_memory`] result.
+pub(crate) struct SavedMemory {
+    pub slug: String,
+    pub path: PathBuf,
+    /// True when an existing memory was replaced rather than created.
+    pub existed: bool,
+}
+
+/// One memory file's full contents.
+pub(crate) fn memory_file(name: &str, description: &str, body: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {description}\n---\n\n{}\n",
+        body.trim()
+    )
+}
+
+/// Validate and write one memory, regenerating the index. The single write
+/// path shared by the `brain_write` tool and `soa reflect`; failures are
+/// `ERROR: …` strings suitable for both models and humans.
+pub(crate) fn save_memory(
+    config: &Config,
+    name: &str,
+    description: &str,
+    content: &str,
+) -> Result<SavedMemory, String> {
+    if name.trim().is_empty() {
+        return Err("ERROR: a memory needs a non-empty `name`".to_string());
+    }
+    let slug = memory_slug(name)?;
+    let description = one_line(description);
+    let content = content.trim();
+    if description.is_empty() {
+        return Err("ERROR: a memory needs a one-line `description`".to_string());
+    }
+    if content.is_empty() {
+        return Err("ERROR: a memory needs non-empty `content`".to_string());
+    }
+    if content.chars().count() > MAX_CONTENT_CHARS {
+        return Err(format!(
+            "ERROR: memory content is too large ({} characters, max \
+             {MAX_CONTENT_CHARS}); distill it or split it into several memories",
+            content.chars().count()
+        ));
+    }
+    let path = memory_path(config, &slug);
+    let existed = path.exists();
+    std::fs::create_dir_all(brain_dir(config))
+        .and_then(|()| std::fs::write(&path, memory_file(&slug, &description, content)))
+        .map_err(|e| format!("ERROR: cannot write {}: {e}", path.display()))?;
+    regenerate_index(config)
+        .map_err(|e| format!("ERROR: memory saved but the index update failed: {e}"))?;
+    Ok(SavedMemory {
+        slug,
+        path,
+        existed,
+    })
+}
+
 /// Execute a brain tool call. All failures are `ERROR: …` strings so the
 /// model can react without killing the stage.
 pub fn dispatch(config: &Config, op: BrainOp, arguments: &Value) -> String {
@@ -363,45 +421,23 @@ pub fn dispatch(config: &Config, op: BrainOp, arguments: &Value) -> String {
             ),
         },
         BrainOp::Write => {
-            let description = one_line(
-                arguments
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            );
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let content = arguments
                 .get("content")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim();
-            if description.is_empty() {
-                return "ERROR: brain_write requires a one-line `description`".to_string();
+                .unwrap_or_default();
+            match save_memory(config, name, description, content) {
+                Ok(saved) => format!(
+                    "{} memory `{}` ({}); the index is updated",
+                    if saved.existed { "updated" } else { "saved" },
+                    saved.slug,
+                    saved.path.display()
+                ),
+                Err(error) => error,
             }
-            if content.is_empty() {
-                return "ERROR: brain_write requires non-empty `content`".to_string();
-            }
-            if content.chars().count() > MAX_CONTENT_CHARS {
-                return format!(
-                    "ERROR: memory content is too large ({} characters, max \
-                     {MAX_CONTENT_CHARS}); distill it or split it into several memories",
-                    content.chars().count()
-                );
-            }
-            let existed = path.exists();
-            let file = format!("---\nname: {slug}\ndescription: {description}\n---\n\n{content}\n");
-            if let Err(e) = std::fs::create_dir_all(brain_dir(config))
-                .and_then(|()| std::fs::write(&path, file))
-            {
-                return format!("ERROR: cannot write {}: {e}", path.display());
-            }
-            if let Err(e) = regenerate_index(config) {
-                return format!("ERROR: memory saved but the index update failed: {e}");
-            }
-            format!(
-                "{} memory `{slug}` ({}); the index is updated",
-                if existed { "updated" } else { "saved" },
-                path.display()
-            )
         }
         BrainOp::Forget => {
             if !path.is_file() {

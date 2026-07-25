@@ -61,7 +61,7 @@ soa skills             # list discoverable skills
 soa brain              # list the brain's stored memories
 soa eval               # run the [[eval]] suite as a measurement; JSON metrics on stdout
                        #   (--runs N to repeat for stable numbers, --eval <name> to filter)
-soa reflect            # distill saved sessions into lessons/skills (--dry-run to preview)
+soa reflect            # distill saved sessions into brain lessons/memories/skills (--dry-run to preview)
 soa evolve             # closed-loop input improvement against the [[eval]] suite
                        #   (--iterations N, --runs N, --dry-run, --model M)
 soa -c other.toml …    # explicit config (default: ./soa.toml, then
@@ -295,11 +295,13 @@ soa eval --runs 3 > with-brain.json
 soa --set 'stage.implement.brain=false' eval --runs 3 > without-brain.json
 ```
 
-The division of labor with the other memory surfaces: `SOA.md` lessons
-(via `soa reflect`) are short rules distilled *between* runs from failure
-signals; skills are curated procedures you attach explicitly; the brain is
-what the agent itself chooses to remember *during* runs, with cheap
-always-on pointers and full recall on demand.
+The brain is fed from three directions, all landing in the same files:
+agents save memories *during* runs with `brain_write`; `soa reflect`
+distills sessions and git history *between* runs into the lessons block of
+`BRAIN.md` and into full memories; and `soa evolve` measurably *improves*
+what's there — the lessons block and each memory's body are evolvable
+inputs, validated against the eval suite. Skills remain the curated
+procedures you attach explicitly.
 
 ## Evolution (`soa evolve`)
 
@@ -327,8 +329,9 @@ Each `soa evolve` iteration runs the whole suite, shows a proposer model
 check output, the run's final answer, and trace signals mined from the
 event logs (tool errors, denials, review-stage reprompt bounces, turns
 used) — and asks for **one targeted edit** to an evolvable input: a stage
-or agent `system_prompt_file`, or the `SOA.md` lessons block. Nothing else
-is ever touched (never the config itself). The candidate is applied, the
+or agent `system_prompt_file`, the `BRAIN.md` lessons block, or the body
+of a stored brain memory (its name, description, and index line are
+preserved). Nothing else is ever touched (never the config itself). The candidate is applied, the
 suite re-runs, and the change is kept only on strict improvement: no eval's
 pass rate may drop — **held-out evals included**, which is what stops
 the proposer from hardcoding answers it was shown — and either a failing
@@ -376,16 +379,23 @@ also changes because requirements changed), and lessons derived from
 commits cite the short hash so they stay auditable.
 
 A model (`settings.reflect_model`, default: the first stage's model) then
-rewrites two kinds of durable memory:
+rewrites three kinds of durable memory:
 
 - **Lessons** — short imperative rules kept in a marker-delimited block of
-  `SOA.md`, which reaches every stage and agent automatically via
-  `context_files`. The model returns the complete replacement list each
-  run, so lessons are consolidated and pruned instead of accreting
+  the brain's `BRAIN.md`, which reaches every stage and agent system
+  prompt automatically. The model returns the complete replacement list
+  each run, so lessons are consolidated and pruned instead of accreting
   forever; hand-written content outside the block is never touched. A
   proposal that would replace a non-empty list with nothing is refused —
   wiping all lessons is a human decision, made by editing the block
-  directly.
+  directly. (A lessons block written to `SOA.md` by older soa versions is
+  migrated into `BRAIN.md` — and removed from `SOA.md` — on the next
+  reflection that writes.)
+- **Memories** — knowledge too detailed for a one-line lesson (a root
+  cause and its fix, how a subsystem actually behaves) is written as a
+  full brain memory: the same store the `brain_write` tool feeds, so
+  between-run reflection and in-run learning accumulate in one place, and
+  only the one-line index entry costs context.
 - **Skills** — occasionally, a recurring multi-step procedure is written
   up as a skill file in the project skills directory, ready to attach with
   `skills = [...]`. Reflect only overwrites skill files it authored

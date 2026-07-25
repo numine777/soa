@@ -122,9 +122,10 @@ enum Command {
         runs: u32,
     },
     /// Closed-loop input improvement: run the [[eval]] suite, have a model
-    /// propose one edit to a prompt file or the lessons block, re-run the
-    /// suite, and keep the change only if it strictly improves (held-out
-    /// evals included). Review adopted changes with git.
+    /// propose one edit to a prompt file, the BRAIN.md lessons block, or a
+    /// stored brain memory, re-run the suite, and keep the change only if
+    /// it strictly improves (held-out evals included). Review adopted
+    /// changes with git.
     Evolve {
         /// Propose-validate cycles to run.
         #[arg(long, default_value_t = 1)]
@@ -142,9 +143,10 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Distill recent sessions into lessons (SOA.md) and skills: failure
-    /// signals (denied calls, tool errors, rollbacks) become durable
-    /// instructions that reach every stage. Review the result with git.
+    /// Distill recent sessions into the brain (BRAIN.md lessons, stored
+    /// memories) and skills: failure signals (denied calls, tool errors,
+    /// rollbacks) become durable instructions that reach every stage.
+    /// Review the result with git.
     Reflect {
         /// Print the proposal without writing any files.
         #[arg(long)]

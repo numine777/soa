@@ -2,14 +2,18 @@
 //!
 //! Reflection reads this directory's saved chat sessions (skipping ones
 //! already reflected on), extracts failure signals (see [`crate::insights`])
-//! and a digest of what was asked and answered, and has a model rewrite two
-//! kinds of durable memory:
+//! and a digest of what was asked and answered, and has a model rewrite
+//! three kinds of durable memory:
 //!
 //!  - **Lessons**: short imperative rules kept in a marker-delimited block
-//!    of the project's `SOA.md`, which `settings.context_files` already
-//!    appends to every stage and agent system prompt. The model returns the
-//!    complete replacement list each run, so lessons get consolidated and
-//!    pruned instead of accreting forever.
+//!    of the brain's `BRAIN.md` (see [`crate::brain`]), which reaches every
+//!    stage and agent system prompt. The model returns the complete
+//!    replacement list each run, so lessons get consolidated and pruned
+//!    instead of accreting forever. A lessons block left in `SOA.md` by
+//!    older soa versions is migrated to `BRAIN.md` on the next write.
+//!  - **Memories**: full brain memory files for knowledge too detailed for
+//!    a one-line lesson — the same store the `brain_write` tool feeds, so
+//!    between-run reflection and in-run learning accumulate in one place.
 //!  - **Skills**: full skill files under the project skills directory for
 //!    recurring multi-step procedures, loadable per-stage via
 //!    `skills = [...]`. Reflect only overwrites skill files it authored
@@ -35,6 +39,7 @@ const MAX_DIGEST_CHARS: usize = 24_000;
 const MAX_LESSONS: usize = 15;
 const MAX_LESSON_CHARS: usize = 300;
 const MAX_SKILLS_PER_RUN: usize = 3;
+const MAX_MEMORIES_PER_RUN: usize = 3;
 /// Git mining window and its share of the prompt.
 const MAX_GIT_COMMITS: usize = 20;
 const MAX_GIT_DIGEST_CHARS: usize = 12_000;
@@ -48,14 +53,15 @@ const LESSONS_END: &str = "<!-- soa:lessons:end -->";
 const GENERATED_MARKER: &str = "generated: soa reflect";
 
 const SYSTEM_PROMPT: &str = "\
-You maintain the persistent memory of `soa`, a staged coding agent. You are \
-given the current lesson list, the available skills, and digests of recent \
-chat sessions including failure signals (denied tool calls, tool errors, \
-rolled-back file changes).
+You maintain the persistent memory (the brain) of `soa`, a staged coding \
+agent. You are given the current lesson list, the stored memory index, the \
+available skills, and digests of recent chat sessions including failure \
+signals (denied tool calls, tool errors, rolled-back file changes).
 
 Reply with ONLY a JSON object, no prose or code fences, in this shape:
 {
   \"lessons\": [\"...\"],
+  \"memories\": [{\"name\": \"kebab-case-name\", \"description\": \"one line\", \"content\": \"markdown\"}],
   \"skills\": [{\"name\": \"kebab-case-name\", \"description\": \"one line\", \"body\": \"markdown\"}],
   \"note\": \"one short paragraph for the user summarizing what you changed and why\"
 }
@@ -64,8 +70,16 @@ lessons: the COMPLETE replacement list. Start from the current lessons: keep \
 the ones that still apply, merge duplicates, drop obsolete ones, and add new \
 ones justified by the digests. Each lesson is one short imperative sentence \
 naming the concrete situation it applies to (tool, file kind, or command). \
-Never invent lessons the digests do not support; fewer good lessons beat \
-many vague ones. An unchanged list is a valid answer.
+Lessons sit in every model's context on every run, so keep them few and \
+short. Never invent lessons the digests do not support; fewer good lessons \
+beat many vague ones. An unchanged list is a valid answer.
+
+memories: knowledge worth keeping but too detailed for a one-line lesson — \
+a root cause and its fix, how a subsystem actually behaves, a gotcha with \
+its context. Each becomes a brain memory file agents fetch on demand; only \
+its name and description stay in context. Reuse a name from the memory \
+index to update that memory. Return an empty array when the digests \
+support none.
 
 skills: rarely, when the digests show the same multi-step procedure \
 recurring, write it up as a skill (markdown body with concrete commands and \
@@ -85,9 +99,19 @@ struct Proposal {
     #[serde(default)]
     lessons: Vec<String>,
     #[serde(default)]
+    memories: Vec<MemoryProposal>,
+    #[serde(default)]
     skills: Vec<SkillProposal>,
     #[serde(default)]
     note: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MemoryProposal {
+    name: String,
+    #[serde(default)]
+    description: String,
+    content: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -157,7 +181,29 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     }
 
     let lessons_path = lessons_file(config);
-    let existing_lessons = read_lessons(&lessons_path);
+    let legacy_path = legacy_lessons_file(config);
+    // Older soa versions kept lessons in SOA.md; a block found there (and
+    // none in BRAIN.md yet) is the current list and moves on this write.
+    let migrate_lessons = !has_lessons_block(&lessons_path) && has_lessons_block(&legacy_path);
+    let existing_lessons = if migrate_lessons {
+        read_lessons(&legacy_path)
+    } else {
+        read_lessons(&lessons_path)
+    };
+    let memory_index: Vec<String> = crate::brain::list_memories(config)
+        .iter()
+        .map(|m| {
+            format!(
+                "{} — {}",
+                m.name,
+                if m.description.is_empty() {
+                    "(no description)"
+                } else {
+                    &m.description
+                }
+            )
+        })
+        .collect();
     let skill_summaries: Vec<String> = crate::skills::list_skills(config)
         .iter()
         .map(|s| {
@@ -228,7 +274,8 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         )
     };
     let user_prompt = format!(
-        "# Current lessons\n{}\n\n# Existing skills\n{}\n\n# Session digests\n{}{}",
+        "# Current lessons\n{}\n\n# Stored memories (name — description)\n{}\n\n\
+         # Existing skills\n{}\n\n# Session digests\n{}{}",
         if existing_lessons.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -237,6 +284,11 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
                 .map(|l| format!("- {l}"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        },
+        if memory_index.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            memory_index.join("\n")
         },
         if skill_summaries.is_empty() {
             "(none)".to_string()
@@ -287,6 +339,11 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
             existing_lessons.len()
         );
     }
+    let memories: Vec<MemoryProposal> = proposal
+        .memories
+        .into_iter()
+        .take(MAX_MEMORIES_PER_RUN)
+        .collect();
     let skills: Vec<(String, SkillProposal)> = proposal
         .skills
         .into_iter()
@@ -300,6 +357,9 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     print_lessons_diff(&existing_lessons, &lessons);
 
     if dry_run {
+        for memory in &memories {
+            println!("would write memory `{}`: {}", memory.name, memory.description);
+        }
         for (name, skill) in &skills {
             println!("would write skill `{name}`: {}", skill.description);
         }
@@ -307,28 +367,46 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
         return Ok(());
     }
 
-    // Lessons: rewrite the managed block, leaving the rest of the file
-    // untouched.
-    if lessons != existing_lessons {
+    // Lessons: rewrite the managed block in BRAIN.md, leaving the rest of
+    // the file (core notes, memory index) untouched. A migration writes
+    // even an unchanged list, then removes the legacy block.
+    if lessons != existing_lessons || migrate_lessons {
         let current = std::fs::read_to_string(&lessons_path).unwrap_or_default();
         let updated = replace_lessons_block(&current, &lessons);
+        if let Some(parent) = lessons_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
         std::fs::write(&lessons_path, updated)
             .with_context(|| format!("cannot write {}", lessons_path.display()))?;
         println!("updated {}", lessons_path.display());
-        let covered = config
-            .settings
-            .context_files
-            .iter()
-            .any(|f| f.file_name() == lessons_path.file_name());
-        if !covered {
-            eprintln!(
-                "⚠ {} is not in settings.context_files — lessons won't reach the models \
-                 until it is added",
+        if migrate_lessons {
+            let legacy = std::fs::read_to_string(&legacy_path).unwrap_or_default();
+            std::fs::write(&legacy_path, remove_lessons_block(&legacy))
+                .with_context(|| format!("cannot write {}", legacy_path.display()))?;
+            println!(
+                "migrated the lessons block from {} to {}",
+                legacy_path.display(),
                 lessons_path.display()
             );
         }
     } else {
         println!("lessons unchanged");
+    }
+
+    // Memories: full brain entries, through the same write path as the
+    // brain_write tool (validation and index regeneration included).
+    for memory in &memories {
+        match crate::brain::save_memory(config, &memory.name, &memory.description, &memory.content)
+        {
+            Ok(saved) => println!(
+                "{} memory `{}` ({})",
+                if saved.existed { "updated" } else { "wrote" },
+                saved.slug,
+                saved.path.display()
+            ),
+            Err(error) => eprintln!("⚠ skipped memory `{}`: {error}", memory.name),
+        }
     }
 
     // Skills: whole files in the project skills dir, overwriting only what
@@ -385,9 +463,50 @@ pub async fn run(config: &Config, model_override: Option<&str>, dry_run: bool) -
     Ok(())
 }
 
-/// Where lessons live: `SOA.md` next to the config file.
+/// Where lessons live: the managed block of the brain's `BRAIN.md`, which
+/// reaches every stage and agent system prompt via the brain section.
 pub(crate) fn lessons_file(config: &Config) -> PathBuf {
+    crate::brain::index_path(config)
+}
+
+/// Lessons' pre-brain home: `SOA.md` next to the config file. A managed
+/// block still found there (with none in `BRAIN.md` yet) seeds the current
+/// list and is removed once the block has been written to `BRAIN.md`.
+pub(crate) fn legacy_lessons_file(config: &Config) -> PathBuf {
     config.base_dir.join("SOA.md")
+}
+
+/// Whether the file contains a managed lessons block at all — distinct
+/// from an empty lesson list inside one.
+pub(crate) fn has_lessons_block(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|content| split_lessons_block(&content).is_some())
+}
+
+/// The current lessons, read from wherever the managed block lives:
+/// `BRAIN.md`, falling back to the legacy `SOA.md` location.
+pub(crate) fn current_lessons(config: &Config) -> Vec<String> {
+    let brain = lessons_file(config);
+    if has_lessons_block(&brain) {
+        read_lessons(&brain)
+    } else {
+        read_lessons(&legacy_lessons_file(config))
+    }
+}
+
+/// Drop the managed block, keeping everything around it.
+pub(crate) fn remove_lessons_block(content: &str) -> String {
+    match split_lessons_block(content) {
+        Some((before, _, after)) => {
+            let joined = format!("{}\n\n{}", before.trim_end(), after.trim_start());
+            let trimmed = joined.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{trimmed}\n")
+            }
+        }
+        None => content.to_string(),
+    }
 }
 
 /// Index of lines soa itself wrote (added lines from recorded session
@@ -610,6 +729,62 @@ mod tests {
                 .is_empty()
         );
         assert!(parse_proposal("no json here").is_err());
+
+        // Memory proposals parse alongside lessons and skills.
+        let with_memories = parse_proposal(
+            r#"{"lessons": [], "memories": [{"name": "api-gotcha", "description": "d", "content": "c"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(with_memories.memories.len(), 1);
+        assert_eq!(with_memories.memories[0].name, "api-gotcha");
+    }
+
+    #[test]
+    fn lessons_migrate_from_the_legacy_location() {
+        let dir = std::env::temp_dir().join(format!("soa-reflect-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_str = r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+        "#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.base_dir = dir.clone();
+
+        // Only a legacy SOA.md block exists: current_lessons falls back to it.
+        let legacy = legacy_lessons_file(&config);
+        std::fs::write(
+            &legacy,
+            replace_lessons_block("# Project\n\nNotes.\n", &["old rule".to_string()]),
+        )
+        .unwrap();
+        assert!(!has_lessons_block(&lessons_file(&config)));
+        assert!(has_lessons_block(&legacy));
+        assert_eq!(current_lessons(&config), vec!["old rule"]);
+
+        // Once BRAIN.md holds a block, it wins.
+        let brain = lessons_file(&config);
+        std::fs::create_dir_all(brain.parent().unwrap()).unwrap();
+        std::fs::write(&brain, replace_lessons_block("", &["new rule".to_string()])).unwrap();
+        assert_eq!(current_lessons(&config), vec!["new rule"]);
+
+        // Removing the legacy block keeps the hand-written content around it.
+        let cleaned = remove_lessons_block(&std::fs::read_to_string(&legacy).unwrap());
+        assert!(!cleaned.contains(LESSONS_START), "{cleaned}");
+        assert!(cleaned.contains("Notes."), "{cleaned}");
+        // A block-only file empties; a file without a block is untouched.
+        assert_eq!(remove_lessons_block(&replace_lessons_block("", &["x".to_string()])), "");
+        assert_eq!(remove_lessons_block("plain\n"), "plain\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

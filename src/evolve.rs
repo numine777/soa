@@ -4,9 +4,10 @@
 //! evolve runs the full loop from the self-improving-harness literature:
 //! **mine** weaknesses from eval execution traces, **propose** one targeted
 //! edit to an evolvable input (a stage's or agent's `system_prompt_file`,
-//! or the SOA.md lessons block), **validate** by re-running every eval —
-//! including held-out ones the proposer never sees — and **adopt** only on
-//! strict improvement, reverting otherwise. Each verdict is appended to a
+//! the BRAIN.md lessons block, or a stored brain memory's body),
+//! **validate** by re-running every eval — including held-out ones the
+//! proposer never sees — and **adopt** only on strict improvement,
+//! reverting otherwise. Each verdict is appended to a
 //! history log that future proposals read, so the loop does not retry what
 //! already failed.
 //!
@@ -39,7 +40,8 @@ const TOKEN_IMPROVEMENT: f64 = 0.10;
 
 const SYSTEM_PROMPT: &str = "\
 You improve the INPUTS of `soa`, a staged coding agent: stage and agent \
-system prompts, and a persistent lessons list. You are shown the current \
+system prompts, a persistent lessons list, and stored brain memories \
+(reference notes agents fetch on demand). You are shown the current \
 inputs, the results of a scored eval suite (which tasks passed, which \
 failed, and the failure evidence), and the history of previous proposals \
 with their verdicts.
@@ -56,9 +58,11 @@ fixes an observed failure. Address the failure PATTERN, not the specific \
 eval wording; a proposal that merely hardcodes an expected answer will be \
 rejected by held-out evals you cannot see. Do not retry proposals the \
 history shows were rejected. For the `lessons` target, content is plain \
-lines, one lesson per line. If every eval passes, propose an edit that \
-makes the inputs more economical (shorter prompts, fewer wasted turns) \
-without losing meaning.";
+lines, one lesson per line. For a `memory:<name>` target, content is the \
+complete replacement body of that stored memory (its name and one-line \
+description are kept as they are). If every eval passes, propose an edit \
+that makes the inputs more economical (shorter prompts, fewer wasted \
+turns) without losing meaning.";
 
 /// One eval's scored result.
 #[derive(Debug, Clone)]
@@ -255,23 +259,31 @@ pub fn compare(baseline: &SuiteStats, candidate: &SuiteStats) -> Verdict {
 /// touched — in particular, never the config file itself.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
-    /// The managed lessons block of the project instructions file.
+    /// The managed lessons block of the brain's `BRAIN.md` (a legacy block
+    /// in `SOA.md` is retired on apply, exactly as `soa reflect` migrates).
     Lessons,
     /// A `system_prompt_file` referenced by a stage or agent.
     PromptFile { id: String, path: PathBuf },
+    /// One stored brain memory's body; its frontmatter (name, description)
+    /// — and therefore its index line — is preserved.
+    Memory {
+        id: String,
+        name: String,
+        path: PathBuf,
+    },
 }
 
 impl Target {
     pub fn id(&self) -> &str {
         match self {
             Target::Lessons => "lessons",
-            Target::PromptFile { id, .. } => id,
+            Target::PromptFile { id, .. } | Target::Memory { id, .. } => id,
         }
     }
 }
 
 /// The evolvable surface: every file-based system prompt in the config,
-/// plus the lessons block.
+/// the lessons block, and every stored brain memory.
 pub fn evolvable_targets(config: &Config) -> Vec<Target> {
     let mut targets = vec![Target::Lessons];
     let resolve = |path: &PathBuf| {
@@ -296,6 +308,13 @@ pub fn evolvable_targets(config: &Config) -> Vec<Target> {
                 path: resolve(path),
             });
         }
+    }
+    for memory in crate::brain::list_memories(config) {
+        targets.push(Target::Memory {
+            id: format!("memory:{}", memory.name),
+            name: memory.name,
+            path: memory.path,
+        });
     }
     targets
 }
@@ -330,15 +349,26 @@ fn parse_proposal(text: &str) -> Result<Proposal> {
 
 /// The pre-application state of a target, for revert.
 enum Backup {
-    Lessons(Vec<String>),
+    /// Verbatim prior contents of `BRAIN.md` and, when a legacy block was
+    /// retired, of `SOA.md`. `None` for a file that did not exist — revert
+    /// removes what apply created instead of inventing content.
+    Lessons {
+        brain: Option<String>,
+        legacy: Option<String>,
+    },
     File { path: PathBuf, content: String },
 }
 
 fn read_target(config: &Config, target: &Target) -> Result<String> {
     match target {
-        Target::Lessons => Ok(reflect::read_lessons(&reflect::lessons_file(config)).join("\n")),
+        Target::Lessons => Ok(reflect::current_lessons(config).join("\n")),
         Target::PromptFile { path, .. } => std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display())),
+        Target::Memory { name, path, .. } => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            Ok(crate::skills::parse_frontmatter(name, &raw).2)
+        }
     }
 }
 
@@ -346,14 +376,32 @@ fn apply_target(config: &Config, target: &Target, content: &str) -> Result<Backu
     match target {
         Target::Lessons => {
             let path = reflect::lessons_file(config);
-            let previous = reflect::read_lessons(&path);
+            let brain_before = std::fs::read_to_string(&path).ok();
             let lessons = reflect::validate_lessons(
                 content.lines().map(|l| l.trim_start_matches("- ").to_string()).collect(),
             );
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
-            std::fs::write(&path, reflect::replace_lessons_block(&current, &lessons))
-                .with_context(|| format!("cannot write {}", path.display()))?;
-            Ok(Backup::Lessons(previous))
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            std::fs::write(
+                &path,
+                reflect::replace_lessons_block(brain_before.as_deref().unwrap_or(""), &lessons),
+            )
+            .with_context(|| format!("cannot write {}", path.display()))?;
+            // Retire a legacy SOA.md block so two conflicting lesson lists
+            // never reach the prompts at once (same migration as reflect).
+            let legacy_path = reflect::legacy_lessons_file(config);
+            let legacy_before = reflect::has_lessons_block(&legacy_path)
+                .then(|| std::fs::read_to_string(&legacy_path).unwrap_or_default());
+            if let Some(legacy) = &legacy_before {
+                std::fs::write(&legacy_path, reflect::remove_lessons_block(legacy))
+                    .with_context(|| format!("cannot write {}", legacy_path.display()))?;
+            }
+            Ok(Backup::Lessons {
+                brain: brain_before,
+                legacy: legacy_before,
+            })
         }
         Target::PromptFile { path, .. } => {
             let previous = std::fs::read_to_string(path)
@@ -365,16 +413,37 @@ fn apply_target(config: &Config, target: &Target, content: &str) -> Result<Backu
                 content: previous,
             })
         }
+        Target::Memory { name, path, .. } => {
+            let previous = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            let (kept_name, description, _) = crate::skills::parse_frontmatter(name, &previous);
+            std::fs::write(path, crate::brain::memory_file(&kept_name, &description, content))
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            Ok(Backup::File {
+                path: path.clone(),
+                content: previous,
+            })
+        }
     }
 }
 
 fn revert(config: &Config, backup: Backup) -> Result<()> {
     match backup {
-        Backup::Lessons(lessons) => {
+        Backup::Lessons { brain, legacy } => {
             let path = reflect::lessons_file(config);
-            let current = std::fs::read_to_string(&path).unwrap_or_default();
-            std::fs::write(&path, reflect::replace_lessons_block(&current, &lessons))
-                .with_context(|| format!("cannot write {}", path.display()))
+            match brain {
+                Some(content) => std::fs::write(&path, content)
+                    .with_context(|| format!("cannot write {}", path.display()))?,
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            if let Some(content) = legacy {
+                let legacy_path = reflect::legacy_lessons_file(config);
+                std::fs::write(&legacy_path, content)
+                    .with_context(|| format!("cannot write {}", legacy_path.display()))?;
+            }
+            Ok(())
         }
         Backup::File { path, content } => std::fs::write(&path, content)
             .with_context(|| format!("cannot write {}", path.display())),
@@ -1118,6 +1187,71 @@ mod tests {
             .unwrap();
         assert!(!outcome.passed);
         assert!(outcome.error.is_none(), "a failing check is not a run error");
+    }
+
+    #[test]
+    fn memory_targets_evolve_body_only_and_lessons_migrate_on_apply() {
+        let dir = std::env::temp_dir().join(format!("soa-evolve-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config: Config = toml::from_str(
+            r#"
+            [providers.p]
+            base_url = "http://localhost/v1"
+
+            [models.m]
+            provider = "p"
+            model = "x"
+
+            [[stage]]
+            name = "s"
+            model = "m"
+            "#,
+        )
+        .unwrap();
+        config.base_dir = dir.clone();
+
+        // A stored memory becomes a `memory:<name>` target.
+        crate::brain::save_memory(&config, "api-gotcha", "the 429 rule", "old body").unwrap();
+        let targets = evolvable_targets(&config);
+        let ids: Vec<&str> = targets.iter().map(Target::id).collect();
+        assert_eq!(ids, vec!["lessons", "memory:api-gotcha"]);
+        let memory = &targets[1];
+        assert_eq!(read_target(&config, memory).unwrap(), "old body");
+
+        // Applying replaces the body, keeps the frontmatter (and therefore
+        // the index line); reverting restores the file verbatim.
+        let memory_path = crate::brain::brain_dir(&config).join("api-gotcha.md");
+        let before = std::fs::read_to_string(&memory_path).unwrap();
+        let backup = apply_target(&config, memory, "new body").unwrap();
+        let after = std::fs::read_to_string(&memory_path).unwrap();
+        assert!(after.contains("description: the 429 rule"), "{after}");
+        assert!(after.contains("new body") && !after.contains("old body"), "{after}");
+        revert(&config, backup).unwrap();
+        assert_eq!(std::fs::read_to_string(&memory_path).unwrap(), before);
+
+        // Lessons apply writes BRAIN.md and retires a legacy SOA.md block;
+        // revert restores both files exactly.
+        let legacy_path = reflect::legacy_lessons_file(&config);
+        let legacy_before =
+            reflect::replace_lessons_block("# Project\n\nNotes.\n", &["old rule".to_string()]);
+        std::fs::write(&legacy_path, &legacy_before).unwrap();
+        let brain_path = reflect::lessons_file(&config);
+        let brain_before = std::fs::read_to_string(&brain_path).unwrap();
+
+        let backup = apply_target(&config, &Target::Lessons, "evolved rule").unwrap();
+        assert_eq!(reflect::current_lessons(&config), vec!["evolved rule"]);
+        assert!(!reflect::has_lessons_block(&legacy_path));
+        assert!(
+            std::fs::read_to_string(&legacy_path).unwrap().contains("Notes."),
+            "hand-written SOA.md content survives the retirement"
+        );
+        revert(&config, backup).unwrap();
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy_before);
+        assert_eq!(std::fs::read_to_string(&brain_path).unwrap(), brain_before);
+        assert_eq!(reflect::current_lessons(&config), vec!["old rule"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

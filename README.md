@@ -135,7 +135,7 @@ Slash commands:
 | `/rewind` | Open the checkpoint picker: every turn-starting message is a rewind target (newest first, plus a session-start row). Selecting one restores every file touched afterwards to its state at that moment, truncates the conversation back to before the message, and puts the message text back in the input for editing. File restores are recorded as `rewind` diff entries, so a rewind can be re-applied forward from the diff viewer. Compaction and `/clear` rewrite the history, so checkpoints from before them are dropped. |
 | `/run [workflow] <task>` | Run a stage pipeline without leaving the chat: `/run fix the tests` uses the default workflow, `/run quickfix fix the tests` picks one by name (first word only counts when it names a workflow). Stage banners and streamed output appear in the transcript, file edits are captured in the diff viewer, approval prompts use the normal modal, and Esc cancels. Run-wide token/cost/time budgets apply and a rich usage summary is recorded in the transcript. The final stage's output joins the conversation history as a normal exchange, so the chat model can discuss the result; intermediate stage outputs stay in the pipeline. `@file` mentions in the task are expanded, and the run is a rewind target like any message. |
 | `/stage <name>` | Switch the active stage (model, prompt, tools, mode). |
-| `/model <name>` | Override the model for every stage in this session; `/model default` reverts to the stage's own model. |
+| `/model <name>` | Select a configured alias or `provider/model-id` for chat; `provider/default` selects that provider's configured default. `/model default` reverts to the stage's own model. |
 | `/reload` | Re-read the config file in place: models, stages, prompts, settings, and project-instruction files. MCP server changes still need a restart. |
 | `/export [path]` | Write the transcript to a markdown file (default `soa-session-<id>.md`); refuses to overwrite. |
 | `/branch <name>` | Save a full copy of the conversation as a named branch and keep going. |
@@ -149,6 +149,22 @@ a trailing `/` and descend; names with spaces insert quoted; `/stage `
 completes stage names). `Up`/`Down` select, `Tab` accepts, `Enter` accepts
 — or submits when the input is already complete — and `Esc` closes the
 popup.
+
+**Model discovery.** `/model ` also lists models fetched from each provider's
+`/models` endpoint in the background at startup and on `/reload`. Type
+`/model ollama/` to filter to one provider, then use the same dropdown keys.
+Failed, unsupported, malformed, empty, or timed-out listings contribute no
+provider dropdown choices and do not interrupt chat. Configured model aliases
+and manually typed `provider/model-id` selections remain usable.
+
+Set `default_model = "qwen3:32b"` under `[providers.ollama]` to keep
+`/model ollama/default` available even when discovery fails or omits that ID.
+This value is a provider's model ID, not a `[models]` alias. Selecting a
+provider-qualified ID reuses a matching `[models]` entry's settings (the first
+alias alphabetically if several match); new IDs have no assumed pricing or
+context limit. Explicit aliases take precedence over provider-qualified names.
+Model overrides apply to chat and compaction; `/run` workflows retain their
+configured models.
 
 **Steering.** The input stays live while a turn runs: submitting a message
 queues it (the status bar shows the count) and it is delivered to the model
@@ -462,6 +478,7 @@ Each entry selects a provider wire adapter. Two adapters are built in:
 [providers.ollama]
 adapter = "open_ai_chat_completions" # default; may be omitted
 base_url = "http://localhost:11434/v1"
+default_model = "qwen3:32b"  # optional: /model ollama/default in chat
 api_key = "${SOME_KEY}"     # optional; ${VAR} expands from the environment
 stream = true               # default: stream responses over SSE; set false
                             # for servers that don't support it

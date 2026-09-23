@@ -649,8 +649,9 @@ fn draw_completion(frame: &mut Frame, app: &App, input_area: Rect) {
         .max()
         .unwrap_or(10);
 
-    let height = (completion.items.len() as u16).min(input_area.y);
-    let width = (line_width as u16 + 2).min(input_area.width.saturating_sub(2));
+    let height = completion.items.len().min(8).min(input_area.y as usize) as u16;
+    let width = line_width.saturating_add(2).min(input_area.width.saturating_sub(2) as usize) as u16;
+    let first = completion.selected.saturating_sub(height.saturating_sub(1) as usize);
     let popup = Rect {
         x: input_area.x + 1,
         y: input_area.y.saturating_sub(height),
@@ -663,6 +664,8 @@ fn draw_completion(frame: &mut Frame, app: &App, input_area: Rect) {
         .items
         .iter()
         .enumerate()
+        .skip(first)
+        .take(height as usize)
         .map(|(index, item)| {
             let (item_style, detail_style) = if index == completion.selected {
                 let selected = Style::default().bg(Color::DarkGray);

@@ -49,6 +49,11 @@ pub enum TranscriptItem {
 
 /// Events sent by the background worker back to the UI loop.
 pub enum AgentEvent {
+    ModelsListed {
+        generation: u64,
+        provider: String,
+        models: Vec<String>,
+    },
     /// A streamed fragment of the assistant's in-progress reply.
     Delta(String),
     ToolCall {
@@ -156,6 +161,9 @@ pub struct App {
     /// Session-level model override (`/model <name>`), applied to every
     /// stage until cleared with `/model default`.
     model_override: Option<String>,
+    discovered_models: std::collections::BTreeMap<String, Vec<String>>,
+    discovery_generation: u64,
+    discovery_tasks: Vec<JoinHandle<()>>,
     /// Real token usage from the most recent turn, when the server reports
     /// it; None falls back to the character estimate.
     pub last_usage: Option<Usage>,
@@ -251,6 +259,9 @@ impl App {
             completion: None,
             config_path,
             model_override: None,
+            discovered_models: Default::default(),
+            discovery_generation: 0,
+            discovery_tasks: Vec::new(),
             last_usage: None,
             usage: UsageTracker::unlimited(),
             quit: false,
@@ -416,8 +427,7 @@ impl App {
 
     pub fn context_capacity(&self) -> Option<u64> {
         self.config
-            .models
-            .get(self.active_model())
+            .resolve_model(self.active_model())
             .and_then(|m| m.context_tokens)
     }
 
@@ -769,7 +779,7 @@ impl App {
         let (row, col) = self.input.cursor();
         let line = self.input.lines().get(row).cloned().unwrap_or_default();
         let stage_names: Vec<String> = self.config.stages.iter().map(|s| s.name.clone()).collect();
-        let model_names: Vec<String> = self.config.models.keys().cloned().collect();
+        let model_names = self.model_choices();
         let workflow_names: Vec<String> = self.config.workflows.keys().cloned().collect();
         self.completion = completion::compute(
             &line,
@@ -780,6 +790,69 @@ impl App {
             &model_names,
             &workflow_names,
         );
+        if line.starts_with("/model ")
+            && let Some(completion) = &mut self.completion
+        {
+            for item in &mut completion.items {
+                item.detail = if item.insert == "default" {
+                    format!(
+                        "stage default: {}",
+                        self.config.stages[self.stage_index].model
+                    )
+                } else if let Some(model) = self.config.resolve_model(&item.insert) {
+                    format!("{} · {}", model.provider, model.model)
+                } else {
+                    String::new()
+                };
+            }
+        }
+    }
+
+    /// Only successful, non-empty listings contribute provider choices.
+    /// Configured aliases remain available even on servers without /models.
+    fn model_choices(&self) -> Vec<String> {
+        let mut choices: std::collections::BTreeSet<String> =
+            self.config.models.keys().cloned().collect();
+        for (provider, models) in &self.discovered_models {
+            if models.is_empty() {
+                continue;
+            }
+            if self.config.providers[provider].default_model.is_some() {
+                choices.insert(format!("{provider}/default"));
+            }
+            choices.extend(models.iter().map(|id| format!("{provider}/{id}")));
+        }
+        // The completion engine supplies this reserved stage-reset choice.
+        choices.remove("default");
+        choices.into_iter().collect()
+    }
+
+    pub fn refresh_model_catalog(&mut self) {
+        for task in self.discovery_tasks.drain(..) {
+            task.abort();
+        }
+        self.discovery_generation += 1;
+        self.discovered_models.clear();
+        self.refresh_completion();
+        for provider in self.config.providers.keys() {
+            let provider = provider.clone();
+            let config = Arc::clone(&self.config);
+            let http = self.http.clone();
+            let tx = self.tx.clone();
+            let generation = self.discovery_generation;
+            self.discovery_tasks.push(tokio::spawn(async move {
+                // Discovery errors are intentionally silent and never become
+                // agent errors or interfere with an active chat turn.
+                let models = crate::providers::list_models(&config.providers[&provider], &http)
+                    .await
+                    .unwrap_or_default();
+                let _ = tx.send(AgentEvent::ModelsListed {
+                    generation,
+                    provider,
+                    models,
+                });
+            }));
+        }
     }
 
     /// Whether applying the selected completion would alter the input.
@@ -1040,6 +1113,8 @@ impl App {
                  /compact        summarize the conversation and shrink context\n\
                  /clear          drop all conversation context and hide earlier\n\
                                  messages/diffs (kept in the session file)\n\
+                 /copy [prompt] [n] copy the last response (or prompt) to the\n\
+                                 clipboard; n reaches earlier ones (2 = one before)\n\
                  /usage          cumulative token usage per model since launch\n\
                  /diff           open the diff viewer (Ctrl+G)\n\
                  /rewind         pick a past message to rewind to (conversation + files)\n\
@@ -1049,7 +1124,7 @@ impl App {
                                  output joins this conversation (default workflow unless\n\
                                  the first word names one — see soa stages)\n\
                  /stage <name>   switch the active stage\n\
-                 /model <name>   override the model for this session (/model default reverts)\n\
+                 /model <name>   choose an alias or provider/id (provider/default selects its default; default reverts)\n\
                  /reload         re-read the config file (MCP changes need a restart)\n\
                  /export [path]  write the transcript to a markdown file\n\
                  /sessions       open the session picker (switch or start new)\n\
@@ -1101,6 +1176,7 @@ impl App {
                     lines.join("\n  "),
                 ));
             }
+            "copy" => self.copy_last(arg),
             "diff" => self.toggle_diff_view(),
             "run" => self.start_workflow(arg),
             "rewind" => self.open_rewind(),
@@ -1118,11 +1194,11 @@ impl App {
     fn switch_model(&mut self, name: &str) {
         match name {
             "" => {
-                let available: Vec<&str> = self.config.models.keys().map(String::as_str).collect();
+                let available = self.model_choices();
                 self.info(format!(
                     "model: `{}`{} (stage default `{}`)\n\
                      available: {}\n\
-                     usage: /model <name> · /model default",
+                     usage: /model <name> · /model <provider>/<id> · /model <provider>/default · /model default",
                     self.active_model(),
                     if self.model_override.is_some() {
                         " (override)"
@@ -1140,14 +1216,14 @@ impl App {
                     self.stage().model
                 ));
             }
-            _ if self.config.models.contains_key(name) => {
+            _ if self.config.resolve_model(name).is_some() => {
                 self.model_override = Some(name.to_string());
                 self.info(format!(
                     "model set to `{name}` for every stage in this session (/model default reverts)"
                 ));
             }
             _ => {
-                let available: Vec<&str> = self.config.models.keys().map(String::as_str).collect();
+                let available = self.model_choices();
                 self.error(format!(
                     "no model named `{name}` — available: {}",
                     available.join(", ")
@@ -1179,7 +1255,7 @@ impl App {
                         0
                     });
                 if let Some(model) = &self.model_override
-                    && !self.config.models.contains_key(model)
+                    && self.config.resolve_model(model).is_none()
                 {
                     self.info(format!(
                         "model override `{model}` no longer exists — cleared"
@@ -1187,6 +1263,7 @@ impl App {
                     self.model_override = None;
                 }
                 self.refresh_tool_count();
+                self.refresh_model_catalog();
                 self.info(format!(
                     "config reloaded: {} stage(s), {} model(s), {} project instruction file(s) \
                      — MCP server changes need a restart",
@@ -1197,6 +1274,55 @@ impl App {
             }
             Err(e) => self.error(format!("reload failed, config unchanged: {e:#}")),
         }
+    }
+
+    /// `/copy [prompt|response] [n]`: copy the nth-most-recent prompt or
+    /// response (default: the latest response) to the system clipboard.
+    fn copy_last(&mut self, arg: &str) {
+        let mut want_prompt = false;
+        let mut back = 1usize;
+        for word in arg.split_whitespace() {
+            match (word, word.parse::<usize>()) {
+                ("prompt" | "user", _) => want_prompt = true,
+                ("response" | "assistant", _) => want_prompt = false,
+                (_, Ok(n)) if n >= 1 => back = n,
+                _ => {
+                    return self.error(
+                        "usage: /copy [prompt|response] [n] — n counts back from the latest",
+                    );
+                }
+            }
+        }
+        let what = if want_prompt { "prompt" } else { "response" };
+        let Some(text) = self.nth_last_text(want_prompt, back) else {
+            return self.error(match back {
+                1 => format!("no {what} to copy yet"),
+                n => format!("fewer than {n} {what}s in this session"),
+            });
+        };
+        match super::clipboard::copy(&text) {
+            Ok(how) => self.info(format!(
+                "copied {what} ({} chars) {how}",
+                text.chars().count()
+            )),
+            Err(e) => self.error(format!("copy failed: {e}")),
+        }
+    }
+
+    /// The `back`th-most-recent prompt or response in the transcript
+    /// (1 = latest). Searches past `/clear` dividers: hidden messages are
+    /// still copyable, matching `/export`.
+    fn nth_last_text(&self, want_prompt: bool, back: usize) -> Option<String> {
+        self.transcript
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                TranscriptItem::User(text) if want_prompt => Some(text),
+                TranscriptItem::Assistant(text) if !want_prompt => Some(text),
+                _ => None,
+            })
+            .nth(back - 1)
+            .cloned()
     }
 
     /// Write the transcript as markdown; refuses to overwrite.
@@ -1887,6 +2013,25 @@ impl App {
                 | AgentEvent::WorkflowDone { .. }
         );
         match event {
+            AgentEvent::ModelsListed {
+                generation,
+                provider,
+                models,
+            } => {
+                if generation == self.discovery_generation
+                    && self.config.providers.contains_key(&provider)
+                {
+                    let selected = self.completion.as_ref()
+                        .map(|c| c.items[c.selected].insert.clone());
+                    self.discovered_models.insert(provider, models);
+                    self.refresh_completion();
+                    if let (Some(selected), Some(completion)) = (selected, &mut self.completion)
+                        && let Some(index) = completion.items.iter().position(|i| i.insert == selected)
+                    {
+                        completion.selected = index;
+                    }
+                }
+            }
             AgentEvent::Delta(fragment) => {
                 self.stream_buffer.push_str(&fragment);
             }
@@ -2036,6 +2181,14 @@ impl App {
         }
         if should_save {
             self.persist();
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        for task in &self.discovery_tasks {
+            task.abort();
         }
     }
 }
@@ -2311,6 +2464,126 @@ mod tests {
     }
 
     #[test]
+    fn model_discovery_populates_selectable_choices_and_keeps_defaults() {
+        let mut app = test_app();
+        let config = Arc::get_mut(&mut app.config).unwrap();
+        config.providers.get_mut("p").unwrap().default_model = Some("x".into());
+        config.models.get_mut("m").unwrap().context_tokens = Some(12345);
+        app.set_input_text("/model p/");
+        app.on_agent_event(AgentEvent::ModelsListed {
+            generation: 0,
+            provider: "p".into(),
+            models: vec!["new/id".into()],
+        });
+        let completion = app.completion.as_ref().unwrap();
+        assert_eq!(
+            completion
+                .items
+                .iter()
+                .map(|i| i.insert.as_str())
+                .collect::<Vec<_>>(),
+            ["p/default", "p/new/id"]
+        );
+        assert!(completion.items[0].detail.contains("x"));
+        app.on_chat_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_chat_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.lines(), &["/model p/new/id"]);
+        app.switch_model("p/new/id");
+        assert_eq!(app.active_model(), "p/new/id");
+        assert_eq!(app.context_capacity(), None);
+        app.switch_model("p/default");
+        assert_eq!(
+            app.config.resolve_model(app.active_model()).unwrap().model,
+            "x"
+        );
+        assert_eq!(app.context_capacity(), Some(12345));
+        app.switch_model("default");
+        assert_eq!(app.active_model(), "m");
+    }
+
+    #[test]
+    fn unavailable_catalog_has_no_provider_dropdown_and_does_not_interrupt_chat() {
+        let mut app = test_app();
+        Arc::get_mut(&mut app.config)
+            .unwrap()
+            .providers
+            .get_mut("p")
+            .unwrap()
+            .default_model = Some("offline-model".into());
+        app.set_input_text("/model p/");
+        app.stream_buffer = "in progress".into();
+        let transcript_len = app.transcript.len();
+        app.on_agent_event(AgentEvent::ModelsListed {
+            generation: 0,
+            provider: "p".into(),
+            models: Vec::new(),
+        });
+        assert!(app.completion.is_none());
+        assert_eq!(app.transcript.len(), transcript_len);
+        assert_eq!(app.stream_buffer, "in progress");
+        app.switch_model("p/default");
+        assert_eq!(
+            app.config.resolve_model(app.active_model()).unwrap().model,
+            "offline-model"
+        );
+        app.switch_model("p/manually-entered");
+        assert_eq!(app.active_model(), "p/manually-entered");
+        app.switch_model("m");
+        assert_eq!(app.active_model(), "m");
+        app.switch_model("missing/model");
+        assert_eq!(app.active_model(), "m");
+    }
+
+    #[test]
+    fn stale_model_listings_cannot_repopulate_a_reloaded_catalog() {
+        let mut app = test_app();
+        app.discovery_generation = 2;
+        app.set_input_text("/model p/");
+        app.on_agent_event(AgentEvent::ModelsListed {
+            generation: 1,
+            provider: "p".into(),
+            models: vec!["stale".into()],
+        });
+        assert!(app.completion.is_none());
+        assert!(app.discovered_models.is_empty());
+        app.on_agent_event(AgentEvent::ModelsListed {
+            generation: 2,
+            provider: "p".into(),
+            models: vec!["fresh".into()],
+        });
+        assert_eq!(app.completion.as_ref().unwrap().items[0].insert, "p/fresh");
+    }
+
+    #[test]
+    fn large_model_dropdown_keeps_the_selected_row_visible() {
+        let mut app = test_app();
+        app.set_input_text("/model p/");
+        app.on_agent_event(AgentEvent::ModelsListed {
+            generation: 0,
+            provider: "p".into(),
+            models: (0..30).map(|i| format!("model-{i:02}")).collect(),
+        });
+        // Up wraps to the last entry, which must scroll into view.
+        app.on_chat_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("p/model-29"));
+        assert!(!rendered.contains("p/model-00"));
+        app.on_chat_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.lines(), &["/model p/model-29"]);
+    }
+
+    #[test]
     fn clear_hides_but_preserves_conversation_and_diffs() {
         let mut app = test_app();
         let greeting_len = app.transcript.len();
@@ -2350,6 +2623,56 @@ mod tests {
         app.run_command("clear");
         assert!(app.visible_diffs().is_empty());
         assert_eq!(app.diffs.len(), 2);
+    }
+
+    #[test]
+    fn copy_targets_the_right_transcript_item() {
+        let mut app = test_app();
+        app.transcript.push(TranscriptItem::User("q1".to_string()));
+        app.transcript
+            .push(TranscriptItem::Assistant("a1".to_string()));
+        app.transcript
+            .push(TranscriptItem::Info("note".to_string()));
+        app.transcript.push(TranscriptItem::User("q2".to_string()));
+        app.transcript
+            .push(TranscriptItem::Assistant("a2".to_string()));
+
+        assert_eq!(app.nth_last_text(false, 1).as_deref(), Some("a2"));
+        assert_eq!(app.nth_last_text(false, 2).as_deref(), Some("a1"));
+        assert_eq!(app.nth_last_text(true, 1).as_deref(), Some("q2"));
+        assert_eq!(app.nth_last_text(true, 2).as_deref(), Some("q1"));
+        assert_eq!(app.nth_last_text(false, 3), None);
+
+        // Hidden-by-/clear messages stay reachable, matching /export.
+        app.run_command("clear");
+        assert_eq!(app.nth_last_text(false, 1).as_deref(), Some("a2"));
+    }
+
+    #[test]
+    fn copy_rejects_bad_args_and_empty_sessions() {
+        let mut app = test_app();
+        // No prompts/responses yet: both paths error without touching the
+        // clipboard (nth_last_text finds nothing).
+        app.run_command("copy");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(text)) if text == "no response to copy yet"
+        ));
+        app.run_command("copy prompt 3");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(text)) if text.contains("fewer than 3 prompts")
+        ));
+        app.run_command("copy nonsense");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(text)) if text.starts_with("usage: /copy")
+        ));
+        app.run_command("copy 0");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(text)) if text.starts_with("usage: /copy")
+        ));
     }
 
     #[test]

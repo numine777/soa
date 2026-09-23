@@ -62,6 +62,9 @@ provider_retries = 3
 [providers.ollama]
 adapter = "open_ai_chat_completions"
 base_url = "http://localhost:11434/v1"
+# Optional model ID for `/model ollama/default`, usable even if listing fails.
+# `/model ollama/` lists discovered models; `/model default` restores the stage.
+# default_model = "qwen3:32b"
 data_boundary = "local"            # mark hosted/proprietary APIs "external"
 
 [providers.vllm]

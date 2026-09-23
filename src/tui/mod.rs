@@ -7,6 +7,7 @@
 //! keyboard protocol, which tmux does not pass through.
 
 mod app;
+mod clipboard;
 mod completion;
 pub mod store;
 mod ui;
@@ -88,6 +89,8 @@ pub async fn run(
         approvals,
         resumed,
     );
+
+    app.refresh_model_catalog();
 
     setup_terminal(mouse)?;
     let original_hook = std::panic::take_hook();

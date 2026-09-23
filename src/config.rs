@@ -323,6 +323,9 @@ pub struct Provider {
     pub base_url: String,
     /// Optional bearer token. Supports `${ENV_VAR}` expansion.
     pub api_key: Option<String>,
+    /// Model ID selected by `/model <provider>/default` in chat. This is
+    /// independent of model discovery and the active stage's default.
+    pub default_model: Option<String>,
     /// Extra headers sent with every request to this provider (values
     /// support `${ENV_VAR}` expansion) — Azure's `api-key`, OpenRouter's
     /// `HTTP-Referer`, Anthropic's `anthropic-version`, org/beta headers.
@@ -361,7 +364,7 @@ pub enum DataBoundary {
 }
 
 /// A named model: a provider reference plus default sampling parameters.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
     /// Key into `[providers]`.
@@ -835,6 +838,38 @@ impl Stage {
 }
 
 impl Config {
+    /// Resolve a configured alias or a chat selection `<provider>/<model-id>`.
+    /// Explicit aliases win collisions. Reuse settings for an exact provider
+    /// and ID match; a newly discovered ID has no assumed pricing or limits.
+    pub fn resolve_model(&self, name: &str) -> Option<std::borrow::Cow<'_, Model>> {
+        use std::borrow::Cow;
+        if let Some(model) = self.models.get(name) {
+            return Some(Cow::Borrowed(model));
+        }
+        let (provider_name, id) = name.split_once('/')?;
+        let provider = self.providers.get(provider_name)?;
+        let id = if id == "default" {
+            provider.default_model.as_deref()?
+        } else {
+            id
+        };
+        if id.is_empty() || id.chars().any(char::is_whitespace) {
+            return None;
+        }
+        if let Some(model) = self
+            .models
+            .values()
+            .find(|model| model.provider == provider_name && model.model == id)
+        {
+            return Some(Cow::Borrowed(model));
+        }
+        Some(Cow::Owned(Model {
+            provider: provider_name.to_string(),
+            model: id.to_string(),
+            ..Model::default()
+        }))
+    }
+
     /// Load the config file, then apply `--set path=value` overlays before
     /// validation. Paths mirror the TOML structure (`settings.default_max_turns`,
     /// `models.fast.max_tokens`); a segment under an array of tables selects
@@ -918,6 +953,15 @@ impl Config {
         let mut errors: Vec<String> = Vec::new();
 
         for (name, provider) in &self.providers {
+            if provider
+                .default_model
+                .as_ref()
+                .is_some_and(|id| id.is_empty() || id.chars().any(char::is_whitespace))
+            {
+                errors.push(format!(
+                    "provider `{name}` default_model must be a non-empty model ID without whitespace"
+                ));
+            }
             for (key, value) in &provider.headers {
                 if key.parse::<http::HeaderName>().is_err() {
                     errors.push(format!("provider `{name}` has an invalid header name `{key}`"));
@@ -1478,6 +1522,37 @@ mod tests {
         let unknown = explicit.replace("open_ai_chat_completions", "mystery_protocol");
         let error = parse(&unknown).unwrap_err().to_string();
         assert!(error.contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn provider_model_defaults_resolve_without_discovery_and_preserve_model_settings() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.providers.get_mut("local").unwrap().default_model = Some("qwen3:8b".into());
+        config.models.get_mut("default").unwrap().temperature = Some(0.3);
+        for name in ["default", "local/default", "local/qwen3:8b"] {
+            let model = config.resolve_model(name).unwrap();
+            assert_eq!(model.model, "qwen3:8b");
+            assert_eq!(model.temperature, Some(0.3));
+        }
+        let fresh = config.resolve_model("local/org/new-model").unwrap();
+        assert_eq!(fresh.model, "org/new-model");
+        assert_eq!(fresh.temperature, None);
+        assert_eq!(fresh.input_cost_per_million, None);
+        assert!(fresh.fallback.is_empty());
+        assert!(config.resolve_model("unknown/model").is_none());
+        assert!(config.resolve_model("local/").is_none());
+        assert!(config.resolve_model("local/bad id").is_none());
+        config.providers.get_mut("local").unwrap().default_model = Some("unlisted".into());
+        assert_eq!(
+            config.resolve_model("local/default").unwrap().model,
+            "unlisted"
+        );
+        config.providers.get_mut("local").unwrap().default_model = None;
+        assert!(config.resolve_model("local/default").is_none());
+        for id in ["", " ", "bad id"] {
+            config.providers.get_mut("local").unwrap().default_model = Some(id.into());
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

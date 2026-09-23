@@ -549,7 +549,7 @@ fn model_chain_reaches_external(config: &Config, model_name: &str) -> bool {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(model) = config.models.get(&name) else {
+        let Some(model) = config.resolve_model(&name) else {
             continue;
         };
         if config
@@ -1912,8 +1912,7 @@ pub fn build_model_client(
             continue;
         }
         let model = config
-            .models
-            .get(&name)
+            .resolve_model(&name)
             .ok_or_else(|| anyhow!("unknown model `{name}`"))?;
         let provider = config
             .providers
@@ -2059,7 +2058,7 @@ fn declared_capacity(config: &Config, model_name: &str) -> Option<u64> {
     if config.settings.auto_compact_threshold <= 0.0 {
         return None;
     }
-    config.models.get(model_name)?.context_tokens
+    config.resolve_model(model_name)?.context_tokens
 }
 
 /// Size the request about to be sent. Provider-reported usage covers

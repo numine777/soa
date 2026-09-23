@@ -6,7 +6,8 @@
       "Bash(cargo build *)",
       "Bash(cargo test *)",
       "Bash(cargo clippy *)",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "WebSearch"
     ]
   }
 }

@@ -1,6 +1,7 @@
 //! Provider wire adapters for the canonical model API.
 
 mod anthropic_messages;
+mod models;
 mod openai_chat_completions;
 mod sse;
 
@@ -11,6 +12,8 @@ use anyhow::Result;
 
 use crate::config::{Provider, ProviderAdapterKind};
 use crate::model::ProviderAdapter;
+
+pub use models::list_models;
 
 /// Transient HTTP statuses shared by every adapter: server errors, rate
 /// limiting, and request timeouts (including Anthropic's 529 overloaded,

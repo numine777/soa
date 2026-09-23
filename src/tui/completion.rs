@@ -14,6 +14,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("branches", "switch between saved conversation lines"),
     ("clear", "drop all conversation context"),
     ("compact", "summarize the conversation and shrink context"),
+    ("copy", "copy the last response (or `prompt`) to the clipboard"),
     ("diff", "open the diff viewer"),
     ("export", "write the transcript to a markdown file"),
     ("help", "list commands and keys"),
@@ -205,7 +206,7 @@ mod tests {
         let c = compute_at("/c", &cwd).unwrap();
         assert_eq!(
             c.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-            vec!["clear", "compact"]
+            vec!["clear", "compact", "copy"]
         );
         assert_eq!(c.replace_from, 1);
 
